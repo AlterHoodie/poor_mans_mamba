@@ -1,9 +1,9 @@
-#include "config/config_parser.h"
+#include "io/config_parser.h"
 
 #include <fstream>
 
-#include "config/utils.h"
-#include "status.h"
+#include "io/utils.h"
+#include "core/status.h"
 
 StatusOr<Mamba2Config> Mamba2ConfigParser::parse(const std::string &model_dir) const {
     const std::string config_path = model_dir + "/config.json";

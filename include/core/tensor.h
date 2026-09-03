@@ -24,8 +24,12 @@ struct DeviceBuffer {
     // Move Constructor
     DeviceBuffer(DeviceBuffer&& other) noexcept;
 
-    // Move Assignmenet
+    // Move Assignment
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
+
+    // Free owned memory (malloc/free). Does not zero caller-held views.
+    void reset() noexcept;
+
     ~DeviceBuffer();
 };
 

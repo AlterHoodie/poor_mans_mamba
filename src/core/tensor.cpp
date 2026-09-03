@@ -11,7 +11,7 @@ DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept
 
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     if (this != &other) {
-        std::free(data);
+        reset();
         data = other.data;
         bytes = other.bytes;
         device_id = other.device_id;
@@ -22,8 +22,12 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     return *this;
 }
 
-DeviceBuffer::~DeviceBuffer() {
+void DeviceBuffer::reset() noexcept {
     std::free(data);
     data = nullptr;
     bytes = 0;
+    device_id = 0;
+    device = Device::CPU;
 }
+
+DeviceBuffer::~DeviceBuffer() { reset(); }

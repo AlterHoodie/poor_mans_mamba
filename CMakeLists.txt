@@ -31,16 +31,19 @@ add_library(mambaserve_common INTERFACE)
 target_include_directories(mambaserve_common INTERFACE ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(mambaserve_common INTERFACE cxx_std_20)
 
+# For Core library including tensors and status
 file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
     "src/core/*.cpp"
 )
 add_library(core ${CORE_SOURCES})
 target_link_libraries(core PUBLIC mambaserve_common)
 
-file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
+
+# For IO library for reading files, creating cfg and loading weights
+file(GLOB_RECURSE IO_SOURCES CONFIGURE_DEPENDS
     "src/io/*.cpp"
 )
-add_library(io ${CORE_SOURCES})
+add_library(io ${IO_SOURCES})
 target_link_libraries(io 
     PUBLIC 
         mambaserve_common
@@ -50,10 +53,12 @@ target_link_libraries(io
         
 )
 
-file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
+
+# Mamba2 Model specific library
+file(GLOB_RECURSE MODEL_SOURCES CONFIGURE_DEPENDS
     "src/model/*.cpp"
 )
-add_library(model ${CORE_SOURCES})
+add_library(model ${MODEL_SOURCES})
 target_link_libraries(model 
     PUBLIC 
         mambaserve_common
@@ -62,6 +67,29 @@ target_link_libraries(model
         safetensors-cpp::safetensors_cpp
 )
 target_compile_definitions(model PRIVATE SAFETENSORS_CPP_NO_IMPLEMENTATION)
+
+# Runtime Library holds actual logic to run the model across different runtimes - cpu, gpu, multi-gpu etc.
+file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
+    "src/runtime/*.cpp"
+)
+add_library(runtime ${RUNTIME_SOURCES})
+target_link_libraries(runtime
+    PUBLIC 
+        mambaserve_common
+        model
+        io
+        core
+    PRIVATE 
+        safetensors-cpp::safetensors_cpp
+)
+target_compile_definitions(model PRIVATE SAFETENSORS_CPP_NO_IMPLEMENTATION)
+
+option(BUILD_TESTING "Build unit tests" OFF)
+
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
 
 add_executable(app
     src/main.cpp
@@ -72,5 +100,6 @@ target_link_libraries(app
         core
         io
         model
+        runtime
         safetensors-cpp::safetensors_cpp
 )

@@ -26,6 +26,16 @@ set(SAFETENSORS_CPP_BUILD_C_API OFF CACHE BOOL "" FORCE)
 set(SAFETENSORS_CPP_CXX_EXCEPTIONS ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(safetensors_cpp)
 
+FetchContent_Declare(
+    eigen
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG 3.4.0
+)
+FetchContent_Populate(eigen)
+
+add_library(Eigen3::Eigen INTERFACE IMPORTED GLOBAL)
+target_include_directories(Eigen3::Eigen INTERFACE ${eigen_SOURCE_DIR})
+
 add_library(mambaserve_common INTERFACE)
 
 target_include_directories(mambaserve_common INTERFACE ${PROJECT_SOURCE_DIR}/include)
@@ -84,6 +94,21 @@ target_link_libraries(runtime
 )
 target_compile_definitions(model PRIVATE SAFETENSORS_CPP_NO_IMPLEMENTATION)
 
+file(GLOB_RECURSE OPS_CPU_SOURCES CONFIGURE_DEPENDS
+    "src/ops/cpu/*.cpp"
+)
+add_library(ops_cpu ${OPS_CPU_SOURCES})
+target_link_libraries(ops_cpu
+    PUBLIC
+        mambaserve_common
+        core
+        Eigen3::Eigen
+)
+
+## Umbrella facade for all the different ops implementation
+add_library(ops INTERFACE)
+target_link_libraries(ops INTERFACE ops_cpu)
+
 option(BUILD_TESTING "Build unit tests" OFF)
 
 if(BUILD_TESTING)
@@ -102,4 +127,5 @@ target_link_libraries(app
         model
         runtime
         safetensors-cpp::safetensors_cpp
+        ops
 )

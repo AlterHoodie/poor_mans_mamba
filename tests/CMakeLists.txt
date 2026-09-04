@@ -15,6 +15,7 @@ target_link_libraries(tests
     PRIVATE
         core
         runtime
+        ops
         GTest::gtest_main
 )
 

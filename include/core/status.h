@@ -62,5 +62,5 @@ class StatusOr {
         if (!_statusor.ok()) {                 \
             return Status(_statusor.status()); \
         }                                      \
-        lhs = std::move(_statusor).value();    \
+        lhs = std::move(_statusor.value());    \
     } while (0)

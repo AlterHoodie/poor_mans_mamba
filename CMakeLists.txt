@@ -89,6 +89,7 @@ target_link_libraries(runtime
         model
         io
         core
+        ops
     PRIVATE 
         safetensors-cpp::safetensors_cpp
 )

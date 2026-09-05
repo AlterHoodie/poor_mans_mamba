@@ -12,9 +12,10 @@ Mamba2Config make_valid_config() {
     cfg.hidden_size = 64;
     cfg.expand = 2;
     cfg.conv_kernel = 4;
-    cfg.num_heads = 4;
+    cfg.num_heads = 8;
     cfg.head_dim = 16;
     cfg.state_size = 16;
+    cfg.n_groups = 1;
     return cfg;
 }
 
@@ -30,7 +31,9 @@ TEST(CacheLayout, FromConfigPacksLayersContiguously) {
     ASSERT_EQ(layout.layers.size(), 2u);
 
     const size_t intermediate = static_cast<size_t>(cfg.hidden_size) * static_cast<size_t>(cfg.expand);
-    const size_t conv_bytes = intermediate * static_cast<size_t>(cfg.conv_kernel - 1) * sizeof(float);
+    const size_t conv_dim =
+        intermediate + 2 * static_cast<size_t>(cfg.n_groups) * static_cast<size_t>(cfg.state_size);
+    const size_t conv_bytes = conv_dim * static_cast<size_t>(cfg.conv_kernel - 1) * sizeof(float);
     const size_t ssm_bytes = static_cast<size_t>(cfg.num_heads) * static_cast<size_t>(cfg.head_dim) *
                              static_cast<size_t>(cfg.state_size) * sizeof(float);
     const size_t per_layer = conv_bytes + ssm_bytes;

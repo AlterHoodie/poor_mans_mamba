@@ -21,10 +21,22 @@ StatusOr<CacheLayout> CacheLayout::from_config(const Mamba2Config& cfg) {
     if (cfg.num_heads <= 0 || cfg.head_dim <= 0 || cfg.state_size <= 0) {
         return Status::InvalidArgument("num_heads, head_dim, and state_size must be positive");
     }
+    if (cfg.n_groups <= 0) {
+        return Status::InvalidArgument("n_groups must be positive");
+    }
+    if (cfg.num_heads % cfg.n_groups != 0) {
+        return Status::InvalidArgument("num_heads must be divisible by n_groups");
+    }
 
     const int64_t intermediate = static_cast<int64_t>(cfg.hidden_size) * cfg.expand;
+    if (intermediate != static_cast<int64_t>(cfg.num_heads) * cfg.head_dim) {
+        return Status::InvalidArgument("expand*hidden_size must equal num_heads*head_dim");
+    }
+
+    // HF: conv_dim = intermediate + 2 * n_groups * state_size
+    const int64_t conv_dim = intermediate + 2 * static_cast<int64_t>(cfg.n_groups) * cfg.state_size;
     const size_t conv_elems =
-        static_cast<size_t>(intermediate) * static_cast<size_t>(cfg.conv_kernel - 1);
+        static_cast<size_t>(conv_dim) * static_cast<size_t>(cfg.conv_kernel - 1);
     const size_t ssm_elems = static_cast<size_t>(cfg.num_heads) *
                              static_cast<size_t>(cfg.head_dim) *
                              static_cast<size_t>(cfg.state_size);

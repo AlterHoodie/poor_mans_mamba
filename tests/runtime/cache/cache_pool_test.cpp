@@ -13,9 +13,10 @@ Mamba2Config make_valid_config() {
     cfg.hidden_size = 64;
     cfg.expand = 2;
     cfg.conv_kernel = 4;
-    cfg.num_heads = 4;
+    cfg.num_heads = 8;
     cfg.head_dim = 16;
     cfg.state_size = 16;
+    cfg.n_groups = 1;
     return cfg;
 }
 

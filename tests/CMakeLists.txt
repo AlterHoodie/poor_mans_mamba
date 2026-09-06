@@ -18,6 +18,9 @@ target_link_libraries(tests
         ops
         GTest::gtest_main
 )
+target_compile_definitions(tests PRIVATE
+    MAMBA_TEST_MODEL_DIR="${PROJECT_SOURCE_DIR}/models/mamba2-130m-hf"
+)
 
 ## Cmake functions to discover gtest files in a particular directory
 include(GoogleTest)

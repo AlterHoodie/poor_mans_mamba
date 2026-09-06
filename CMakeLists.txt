@@ -36,6 +36,13 @@ FetchContent_Populate(eigen)
 add_library(Eigen3::Eigen INTERFACE IMPORTED GLOBAL)
 target_include_directories(Eigen3::Eigen INTERFACE ${eigen_SOURCE_DIR})
 
+FetchContent_Declare(
+    tokenizers_cpp
+    GIT_REPOSITORY https://github.com/mlc-ai/tokenizers-cpp.git
+    GIT_TAG main
+)
+FetchContent_MakeAvailable(tokenizers_cpp)
+
 add_library(mambaserve_common INTERFACE)
 
 target_include_directories(mambaserve_common INTERFACE ${PROJECT_SOURCE_DIR}/include)
@@ -90,6 +97,7 @@ target_link_libraries(runtime
         io
         core
         ops
+        tokenizers_cpp
     PRIVATE 
         safetensors-cpp::safetensors_cpp
 )

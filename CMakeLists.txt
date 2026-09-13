@@ -97,8 +97,8 @@ target_link_libraries(runtime
         io
         core
         ops
-        tokenizers_cpp
     PRIVATE 
+        tokenizers_cpp
         safetensors-cpp::safetensors_cpp
 )
 target_compile_definitions(model PRIVATE SAFETENSORS_CPP_NO_IMPLEMENTATION)

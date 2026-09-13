@@ -1,5 +1,6 @@
-#include <tokenizers_cpp.h>
+#pragma once
 
+#include <memory>
 #include <vector>
 
 #include "core/status.h"
@@ -7,11 +8,15 @@
 
 class Tokenizer {
    private:
-    int32_t eos_id_ = -1;
-    std::unique_ptr<tokenizers::Tokenizer> tok_;
+    struct Impl;  // incomplete declaration
+    std::unique_ptr<Impl> impl_;
 
    public:
     Tokenizer(const Mamba2Config& cfg, const std::string& model_dir);
+    ~Tokenizer();
+
+    Tokenizer(Tokenizer&&) noexcept;
+    Tokenizer& operator=(Tokenizer&&) noexcept;
 
     // tokenize
     StatusOr<std::vector<int32_t>> encode(const std::string& prompt);

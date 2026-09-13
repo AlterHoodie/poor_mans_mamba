@@ -1,9 +1,9 @@
 #include "runtime/tokenizer.h"
 
+#include <tokenizers_cpp.h>
+
 #include <fstream>
 #include <sstream>
-
-#include "tokenizers_cpp.h"
 
 namespace {
 std::string read_file(const std::string& path) {
@@ -15,25 +15,37 @@ std::string read_file(const std::string& path) {
 }
 }  // namespace
 
+struct Tokenizer::Impl {
+    int32_t eos_id = -1;
+    std::unique_ptr<tokenizers::Tokenizer> tok;
+};
+
 Tokenizer::Tokenizer(const Mamba2Config& cfg, const std::string& model_dir)
-    : eos_id_(cfg.eos_token_id) {
+    : impl_(std::make_unique<Impl>()) {
     auto blob = read_file(model_dir + "/tokenizer.json");
-    tok_ = tokenizers::Tokenizer::FromBlobJSON(blob);
+
+    impl_->eos_id = cfg.eos_token_id;
+    impl_->tok = tokenizers::Tokenizer::FromBlobJSON(blob);
 }
 
 StatusOr<std::vector<int32_t>> Tokenizer::encode(const std::string& prompt) {
-    if (!tok_) return Status::InvalidArgument("tokenizer not initialized");
-    if (eos_id_ == -1) return Status::InvalidArgument("eos token id not initialized");
+    if (!impl_ || !impl_->tok) return Status::InvalidArgument("tokenizer not initialized");
+    if (impl_->eos_id < 0) return Status::InvalidArgument("eos token id not initialized");
 
-    return tok_->Encode(prompt);
+    return impl_->tok->Encode(prompt);
 }
 
 StatusOr<std::string> Tokenizer::decode(const std::vector<int32_t>& tokens) {
+    if (!impl_ || !impl_->tok) return Status::InvalidArgument("tokenizer not initialized");
     if (tokens.empty()) return Status::InvalidArgument("Empty tokens list");
-    return tok_->Decode(tokens);
+    return impl_->tok->Decode(tokens);
 }
 
 StatusOr<int32_t> Tokenizer::eos_id() const {
-    if (eos_id_) return Status::InvalidArgument("eos token id not initialized");
-    return eos_id_;
+    if (impl_->eos_id < 0) return Status::InvalidArgument("eos token id not initialized");
+    return impl_->eos_id;
 }
+
+Tokenizer::~Tokenizer() = default;
+Tokenizer::Tokenizer(Tokenizer&&) noexcept = default;
+Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;

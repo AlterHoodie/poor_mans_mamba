@@ -101,7 +101,6 @@ target_link_libraries(runtime
         tokenizers_cpp
         safetensors-cpp::safetensors_cpp
 )
-target_compile_definitions(model PRIVATE SAFETENSORS_CPP_NO_IMPLEMENTATION)
 
 file(GLOB_RECURSE OPS_CPU_SOURCES CONFIGURE_DEPENDS
     "src/ops/cpu/*.cpp"

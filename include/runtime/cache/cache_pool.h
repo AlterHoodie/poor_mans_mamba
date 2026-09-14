@@ -2,7 +2,7 @@
 
 #include "core/status.h"
 #include "core/tensor.h"
-#include "io/config_parser.h"
+#include "io/config.h"
 #include "runtime/cache/cache_layout.h"
 
 // Opaque handle into CachePool. Pass this instead of raw pointers.

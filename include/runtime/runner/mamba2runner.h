@@ -3,7 +3,7 @@
 #include <memory>
 #include <span>
 
-#include "io/config_parser.h"
+#include "io/config.h"
 #include "model/mamba2_weights.h"
 #include "runner.h"
 #include "runtime/cache/cache_layout.h"

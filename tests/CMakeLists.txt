@@ -20,6 +20,7 @@ target_link_libraries(tests
 )
 target_compile_definitions(tests PRIVATE
     MAMBA_TEST_MODEL_DIR="${PROJECT_SOURCE_DIR}/models/mamba2-130m-hf"
+    MAMBA_TEST_FALCON_DIR="${PROJECT_SOURCE_DIR}/models/falcon-h1-0.5b-base"
 )
 
 ## Cmake functions to discover gtest files in a particular directory

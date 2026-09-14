@@ -20,7 +20,7 @@ struct Tokenizer::Impl {
     std::unique_ptr<tokenizers::Tokenizer> tok;
 };
 
-Tokenizer::Tokenizer(const Mamba2Config& cfg, const std::string& model_dir)
+Tokenizer::Tokenizer(const ModelConfig& cfg, const std::string& model_dir)
     : impl_(std::make_unique<Impl>()) {
     auto blob = read_file(model_dir + "/tokenizer.json");
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/status.h"
+#include "io/config.h"
 #include "io/model_loader.h"
 #include "model/mamba2_weights.h"
 

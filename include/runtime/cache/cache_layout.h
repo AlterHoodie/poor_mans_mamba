@@ -4,7 +4,7 @@
 #include <vector>
 
 #include "core/status.h"
-#include "io/config_parser.h"
+#include "io/config.h"
 
 struct MambaLayerLayout {
     int layer_idx = 0;

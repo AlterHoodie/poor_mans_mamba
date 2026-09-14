@@ -4,7 +4,7 @@
 #include <vector>
 
 #include "core/status.h"
-#include "io/config_parser.h"
+#include "io/config.h"
 
 class Tokenizer {
    private:
@@ -12,7 +12,7 @@ class Tokenizer {
     std::unique_ptr<Impl> impl_;
 
    public:
-    Tokenizer(const Mamba2Config& cfg, const std::string& model_dir);
+    Tokenizer(const ModelConfig& cfg, const std::string& model_dir);
     ~Tokenizer();
 
     Tokenizer(Tokenizer&&) noexcept;

@@ -5,7 +5,6 @@
 
 #include "core/status.h"
 #include "core/tensor.h"
-#include "io/config_parser.h"
 #include "safetensors.hh"
 
 // class loader will take in config and weights , will expose one function load which fills the

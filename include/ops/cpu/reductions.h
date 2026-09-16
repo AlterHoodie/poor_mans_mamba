@@ -1,9 +1,9 @@
 #pragma once
 
-#include <cstdint>
-
 #include "core/status.h"
 #include "core/tensor.h"
+
+#include <cstdint>
 
 StatusOr<int32_t> argmax(Tensor& T);
 

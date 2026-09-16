@@ -1,29 +1,41 @@
 #include "ops/cpu/rms_norm.h"
-#include "ops/cpu/map.h"
 
 #include <gtest/gtest.h>
 
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
+
+#include "core/device.h"
+#include "ops/cpu/map.h"
 
 namespace {
 
+class RmsNormTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        auto alloc_or = create_device_allocator(Device::CPU, 0);
+        ASSERT_TRUE(alloc_or.ok());
+        alloc_ = std::move(alloc_or.value());
+        scope_ = std::make_unique<AllocatorScope>(alloc_.get());
+    }
+
+    std::unique_ptr<DeviceAllocator> alloc_;
+    std::unique_ptr<AllocatorScope> scope_;
+};
+
 Tensor make_f32(std::vector<int64_t> shape, const std::vector<float>& values) {
-    Tensor t;
-    t.shape = std::move(shape);
-    t.dtype = Dtype::F32;
-    t.buffer.device = Device::CPU;
-    t.buffer.bytes = values.size() * sizeof(float);
-    t.buffer.data = std::malloc(t.buffer.bytes);
-    std::memcpy(t.buffer.data, values.data(), t.buffer.bytes);
+    StatusOr<Tensor> t_or = allocate_f32_tensor(std::move(shape));
+    EXPECT_TRUE(t_or.ok()) << t_or.status().message();
+    Tensor t = std::move(t_or.value());
+    std::memcpy(t.buffer.ptr, values.data(), values.size() * sizeof(float));
     return t;
 }
 
 }  // namespace
 
-TEST(RmsNorm, NormalizesRank1Vector) {
+TEST_F(RmsNormTest, NormalizesRank1Vector) {
     Tensor x = make_f32({2}, {3.f, 4.f});
     Tensor weight = make_f32({2}, {1.f, 1.f});
 
@@ -37,7 +49,7 @@ TEST(RmsNorm, NormalizesRank1Vector) {
     EXPECT_NEAR(y(1), 4.f * inv_rms, 1e-5f);
 }
 
-TEST(RmsNorm, AppliesWeightScale) {
+TEST_F(RmsNormTest, AppliesWeightScale) {
     Tensor x = make_f32({3}, {1.f, 0.f, 0.f});
     Tensor weight = make_f32({3}, {2.f, 2.f, 2.f});
 
@@ -51,7 +63,7 @@ TEST(RmsNorm, AppliesWeightScale) {
     EXPECT_FLOAT_EQ(y(2), 0.f);
 }
 
-TEST(RmsNorm, BatchedRowsShareLastDim) {
+TEST_F(RmsNormTest, BatchedRowsShareLastDim) {
     Tensor x = make_f32({2, 2}, {3.f, 4.f, 6.f, 8.f});
     Tensor weight = make_f32({2}, {1.f, 1.f});
 
@@ -66,7 +78,7 @@ TEST(RmsNorm, BatchedRowsShareLastDim) {
     EXPECT_NEAR(y(1, 1), 8.f * inv_rms_1, 1e-5f);
 }
 
-TEST(RmsNorm, InPlaceOverwritesInput) {
+TEST_F(RmsNormTest, InPlaceOverwritesInput) {
     Tensor x = make_f32({2}, {3.f, 4.f});
     Tensor weight = make_f32({2}, {1.f, 1.f});
 
@@ -78,7 +90,7 @@ TEST(RmsNorm, InPlaceOverwritesInput) {
     EXPECT_NEAR(y(1), 4.f * inv_rms, 1e-5f);
 }
 
-TEST(RmsNorm, WeightDimMismatchFails) {
+TEST_F(RmsNormTest, WeightDimMismatchFails) {
     Tensor x = make_f32({4}, {1.f, 2.f, 3.f, 4.f});
     Tensor weight = make_f32({2}, {1.f, 1.f});
 

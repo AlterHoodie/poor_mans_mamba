@@ -1,8 +1,8 @@
-#include <string>
-
 #include "runtime/tokenizer.h"
 
 #include <gtest/gtest.h>
+
+#include <string>
 
 namespace {
 

@@ -1,27 +1,26 @@
-#include "runtime/runner/mamba2runner.h"
-
-#include "ops/cpu/map.h"
-#include "ops/cpu/mamba2_mixer.h"
+#include "runtime/runner/mamba2_runner.h"
 
 #include <gtest/gtest.h>
 
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
+
+#include "core/device.h"
+#include "ops/cpu/mamba2_mixer.h"
+#include "ops/cpu/map.h"
+#include "runtime/cache/cache_layout.h"
+#include "runtime/cache/cache_pool.h"
 
 namespace {
 
 Tensor make_f32(std::vector<int64_t> shape, float fill = 0.f) {
-    Tensor t;
-    t.shape = std::move(shape);
-    t.dtype = Dtype::F32;
-    t.buffer.device = Device::CPU;
-    int64_t n = 1;
-    for (int64_t d : t.shape) n *= d;
-    t.buffer.bytes = static_cast<size_t>(n) * sizeof(float);
-    t.buffer.data = std::malloc(t.buffer.bytes);
-    auto* p = static_cast<float*>(t.buffer.data);
+    StatusOr<Tensor> t_or = allocate_f32_tensor(std::move(shape));
+    EXPECT_TRUE(t_or.ok()) << t_or.status().message();
+    Tensor t = std::move(t_or.value());
+    auto* p = static_cast<float*>(t.buffer.ptr);
+    const int64_t n = static_cast<int64_t>(t.buffer.bytes / sizeof(float));
     for (int64_t i = 0; i < n; ++i) p[i] = fill;
     return t;
 }
@@ -79,7 +78,6 @@ Mamba2Weights make_weights(const Mamba2Config& cfg) {
         layer.in_proj = make_f32({proj_size, D}, 0.01f);
         layer.out_proj = make_f32({D, I}, 0.01f);
         layer.conv1d = make_f32({conv_dim, cfg.conv_kernel}, 0.1f);
-        // Identity-ish newest tap
         {
             auto cw = as_mat_f32(layer.conv1d);
             cw.setZero();
@@ -97,15 +95,29 @@ Mamba2Weights make_weights(const Mamba2Config& cfg) {
     return w;
 }
 
+StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const Mamba2Config& cfg, int n_slots) {
+    std::unique_ptr<DeviceAllocator> alloc;
+    ASSIGN_OR_RETURN(alloc, create_device_allocator(Device::CPU, 0));
+
+    Mamba2Weights weights;
+    {
+        AllocatorScope scope(alloc.get());
+        weights = make_weights(cfg);
+    }
+
+    std::unique_ptr<CachePool> pool;
+    ASSIGN_OR_RETURN(pool, create_cache_pool(cfg, alloc.get(), n_slots, create_mamba2_layout));
+    return std::make_unique<Mamba2Runner>(cfg, std::move(weights), std::move(pool), std::move(alloc));
+}
+
 }  // namespace
 
 TEST(Mamba2Mixer, CausalConvUpdatesCacheAndAppliesSilu) {
     const int64_t C = 2;
     const int K = 3;
     const int64_t T = 2;
-    std::vector<float> x = {1.f, 2.f, 3.f, 4.f};  // t0:[1,2] t1:[3,4]
+    std::vector<float> x = {1.f, 2.f, 3.f, 4.f};
     std::vector<float> weight(static_cast<size_t>(C * K), 0.f);
-    // only newest tap = 1
     weight[0 * K + (K - 1)] = 1.f;
     weight[1 * K + (K - 1)] = 1.f;
     std::vector<float> bias = {0.f, 0.f};
@@ -120,7 +132,6 @@ TEST(Mamba2Mixer, CausalConvUpdatesCacheAndAppliesSilu) {
     EXPECT_FLOAT_EQ(y[1], 2.f);
     EXPECT_FLOAT_EQ(y[2], 3.f);
     EXPECT_FLOAT_EQ(y[3], 4.f);
-    // cache should hold last K-1 inputs: after t0 [0,1]/[0,2]; after t1 [1,3]/[2,4]
     EXPECT_FLOAT_EQ(cache[0 * (K - 1) + 0], 1.f);
     EXPECT_FLOAT_EQ(cache[0 * (K - 1) + 1], 3.f);
     EXPECT_FLOAT_EQ(cache[1 * (K - 1) + 0], 2.f);
@@ -129,8 +140,9 @@ TEST(Mamba2Mixer, CausalConvUpdatesCacheAndAppliesSilu) {
 
 TEST(Mamba2Runner, PrefillReturnsCacheAndVocabLogits) {
     Mamba2Config cfg = make_cfg();
-    Mamba2Weights weights = make_weights(cfg);
-    Mamba2Runner runner(cfg, std::move(weights), Device::CPU, 0, /*n_slots=*/2);
+    StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
+    ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
+    Mamba2Runner& runner = *runner_or.value();
 
     const int32_t tokens[] = {1, 2, 3};
     StatusOr<PrefillResult> result = runner.prefill(tokens);
@@ -146,8 +158,9 @@ TEST(Mamba2Runner, PrefillReturnsCacheAndVocabLogits) {
 
 TEST(Mamba2Runner, DecodeReusesHandleAndReturnsLogits) {
     Mamba2Config cfg = make_cfg();
-    Mamba2Weights weights = make_weights(cfg);
-    Mamba2Runner runner(cfg, std::move(weights), Device::CPU, 0, /*n_slots=*/2);
+    StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
+    ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
+    Mamba2Runner& runner = *runner_or.value();
 
     const int32_t prompt[] = {1, 2};
     StatusOr<PrefillResult> pref = runner.prefill(prompt);
@@ -164,19 +177,19 @@ TEST(Mamba2Runner, DecodeReusesHandleAndReturnsLogits) {
 
 TEST(Mamba2Runner, PrefillEmptyTokensFails) {
     Mamba2Config cfg = make_cfg();
-    Mamba2Weights weights = make_weights(cfg);
-    Mamba2Runner runner(cfg, std::move(weights), Device::CPU, 0, 1);
+    StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, 1);
+    ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
 
-    StatusOr<PrefillResult> result = runner.prefill({});
+    StatusOr<PrefillResult> result = runner_or.value()->prefill({});
     EXPECT_FALSE(result.ok());
 }
 
 TEST(Mamba2Runner, DecodeInvalidHandleFails) {
     Mamba2Config cfg = make_cfg();
-    Mamba2Weights weights = make_weights(cfg);
-    Mamba2Runner runner(cfg, std::move(weights), Device::CPU, 0, 1);
+    StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, 1);
+    ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
 
     CacheHandle bad;
-    StatusOr<DecodeResult> result = runner.decode(bad, 0);
+    StatusOr<DecodeResult> result = runner_or.value()->decode(bad, 0);
     EXPECT_FALSE(result.ok());
 }

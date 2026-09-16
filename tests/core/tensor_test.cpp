@@ -51,9 +51,12 @@ TEST(Tensor, EmptyWhenNoDataOrZeroDim) {
     t.shape = {2, 3};
     EXPECT_TRUE(t.empty());
 
-    t.buffer.data = std::malloc(6 * sizeof(float));
+    t.buffer.ptr = std::malloc(6 * sizeof(float));
     t.buffer.bytes = 6 * sizeof(float);
     EXPECT_FALSE(t.empty());
+
+    std::free(t.buffer.ptr);
+    t.buffer.ptr = nullptr;
 
     t.shape = {2, 0};
     EXPECT_TRUE(t.empty());

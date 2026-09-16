@@ -1,43 +1,29 @@
 #include "runtime/scheduler.h"
-#include "runtime/runner/mamba2runner.h"
-
-#include "ops/cpu/map.h"
-#include "ops/cpu/reductions.h"
 
 #include <gtest/gtest.h>
 
 #include <cassert>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <unordered_set>
 #include <vector>
 
+#include "core/device.h"
+#include "ops/cpu/map.h"
+#include "ops/cpu/reductions.h"
+#include "runtime/cache/cache_layout.h"
+#include "runtime/cache/cache_pool.h"
+#include "runtime/runner/mamba2_runner.h"
+
 namespace {
 
-Tensor make_logits_peak(int vocab, int32_t peak_id, float peak = 10.f) {
-    Tensor t;
-    t.shape = {vocab};
-    t.dtype = Dtype::F32;
-    t.buffer.device = Device::CPU;
-    t.buffer.bytes = static_cast<size_t>(vocab) * sizeof(float);
-    t.buffer.data = std::malloc(t.buffer.bytes);
-    auto* p = static_cast<float*>(t.buffer.data);
-    for (int i = 0; i < vocab; ++i) p[i] = 0.f;
-    p[peak_id] = peak;
-    return t;
-}
-
 Tensor make_f32(std::vector<int64_t> shape, float fill = 0.f) {
-    Tensor t;
-    t.shape = std::move(shape);
-    t.dtype = Dtype::F32;
-    t.buffer.device = Device::CPU;
-    int64_t n = 1;
-    for (int64_t d : t.shape) n *= d;
-    t.buffer.bytes = static_cast<size_t>(n) * sizeof(float);
-    t.buffer.data = std::malloc(t.buffer.bytes);
-    auto* p = static_cast<float*>(t.buffer.data);
+    StatusOr<Tensor> t_or = allocate_f32_tensor(std::move(shape));
+    EXPECT_TRUE(t_or.ok()) << t_or.status().message();
+    Tensor t = std::move(t_or.value());
+    auto* p = static_cast<float*>(t.buffer.ptr);
+    const int64_t n = static_cast<int64_t>(t.buffer.bytes / sizeof(float));
     for (int64_t i = 0; i < n; ++i) p[i] = fill;
     return t;
 }
@@ -112,23 +98,41 @@ Mamba2Weights make_weights(const Mamba2Config& cfg) {
     return w;
 }
 
+StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const Mamba2Config& cfg, int n_slots) {
+    std::unique_ptr<DeviceAllocator> alloc;
+    ASSIGN_OR_RETURN(alloc, create_device_allocator(Device::CPU, 0));
+
+    Mamba2Weights weights;
+    {
+        AllocatorScope scope(alloc.get());
+        weights = make_weights(cfg);
+    }
+
+    std::unique_ptr<CachePool> pool;
+    ASSIGN_OR_RETURN(pool, create_cache_pool(cfg, alloc.get(), n_slots, create_mamba2_layout));
+    return std::make_unique<Mamba2Runner>(cfg, std::move(weights), std::move(pool), std::move(alloc));
+}
+
 // Deterministic runner: peaks logits at successive entries of `token_seq_`.
 class FakeRunner : public Runner {
    public:
     FakeRunner(int vocab, std::vector<int32_t> token_seq)
         : vocab_(vocab), token_seq_(std::move(token_seq)) {
         assert(!token_seq_.empty());
+        auto alloc_or = create_device_allocator(Device::CPU, 0);
+        assert(alloc_or.ok());
+        alloc_ = std::move(alloc_or.value());
     }
 
-    // Convenience: always emit the same token.
-    FakeRunner(int vocab, int32_t next_token) : FakeRunner(vocab, std::vector<int32_t>{next_token}) {}
+    FakeRunner(int vocab, int32_t next_token)
+        : FakeRunner(vocab, std::vector<int32_t>{next_token}) {}
 
     StatusOr<PrefillResult> prefill(std::span<const int32_t> tokens) override {
         if (tokens.empty()) return Status::InvalidArgument("empty prompt");
         PrefillResult r;
         r.cache = CacheHandle(next_handle_++);
         live_.insert(r.cache.id());
-        r.logits = make_logits_peak(vocab_, peak_token_());
+        ASSIGN_OR_RETURN(r.logits, make_logits_peak_(vocab_, peak_token_()));
         ++step_;
         return r;
     }
@@ -138,7 +142,7 @@ class FakeRunner : public Runner {
             return Status::InvalidArgument("invalid cache");
         }
         DecodeResult r;
-        r.logits = make_logits_peak(vocab_, peak_token_());
+        ASSIGN_OR_RETURN(r.logits, make_logits_peak_(vocab_, peak_token_()));
         ++step_;
         return r;
     }
@@ -155,6 +159,17 @@ class FakeRunner : public Runner {
     bool has_live_caches() const { return !live_.empty(); }
 
    private:
+    StatusOr<Tensor> make_logits_peak_(int vocab, int32_t peak_id, float peak = 10.f) {
+        AllocatorScope scope(alloc_.get());
+        StatusOr<Tensor> t_or = allocate_f32_tensor({vocab});
+        if (!t_or.ok()) return t_or.status();
+        Tensor t = std::move(t_or.value());
+        auto* p = static_cast<float*>(t.buffer.ptr);
+        for (int i = 0; i < vocab; ++i) p[i] = 0.f;
+        p[peak_id] = peak;
+        return t;
+    }
+
     int32_t peak_token_() const {
         const size_t i = std::min(step_, token_seq_.size() - 1);
         return token_seq_[i];
@@ -165,6 +180,7 @@ class FakeRunner : public Runner {
     size_t step_ = 0;
     int next_handle_ = 0;
     std::unordered_set<int> live_;
+    std::unique_ptr<DeviceAllocator> alloc_;
 };
 
 }  // namespace
@@ -188,7 +204,7 @@ TEST(Scheduler, RejectsMissingEos) {
 }
 
 TEST(Scheduler, StopsAtMaxNewTokens) {
-    FakeRunner runner(/*vocab=*/8, /*next_token=*/3);  // never EOS
+    FakeRunner runner(/*vocab=*/8, /*next_token=*/3);
     Scheduler sched(runner);
     GenerateParams params{.max_new_tokens = 5, .eos_id = 0};
     std::vector<int32_t> prompt = {1, 2};
@@ -228,13 +244,13 @@ TEST(Scheduler, EmitsExactTokenSequence) {
 
 TEST(Scheduler, GenerateMatchesManualGreedyTokens) {
     Mamba2Config cfg = make_cfg();
-    Mamba2Weights weights = make_weights(cfg);
-    Mamba2Runner runner(cfg, std::move(weights), Device::CPU, 0, /*n_slots=*/2);
+    StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
+    ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
+    Mamba2Runner& runner = *runner_or.value();
 
     const std::vector<int32_t> prompt = {1, 2};
     const GenerateParams params{.max_new_tokens = 3, .eos_id = 0};
 
-    // Independent greedy path: must match Scheduler::generate token-for-token.
     StatusOr<PrefillResult> pref = runner.prefill(prompt);
     ASSERT_TRUE(pref.ok()) << pref.status().message();
 

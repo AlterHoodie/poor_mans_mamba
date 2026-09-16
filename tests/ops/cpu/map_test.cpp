@@ -1,4 +1,3 @@
-#include "core/tensor.h"
 #include "ops/cpu/map.h"
 
 #include <gtest/gtest.h>
@@ -6,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#include "core/tensor.h"
 
 namespace {
 
@@ -15,8 +16,8 @@ Tensor make_f32(std::vector<int64_t> shape, const std::vector<float>& values) {
     t.dtype = Dtype::F32;
     t.buffer.device = Device::CPU;
     t.buffer.bytes = values.size() * sizeof(float);
-    t.buffer.data = std::malloc(t.buffer.bytes);
-    std::memcpy(t.buffer.data, values.data(), t.buffer.bytes);
+    t.buffer.ptr = std::malloc(t.buffer.bytes);
+    std::memcpy(t.buffer.ptr, values.data(), t.buffer.bytes);
     return t;
 }
 
@@ -38,7 +39,7 @@ TEST(MapF32, MatIsRowMajorLeadingByLast) {
     EXPECT_FLOAT_EQ(m(0, 2), 3.f);
     EXPECT_FLOAT_EQ(m(1, 0), 4.f);
     m(0, 0) = 9.f;
-    EXPECT_FLOAT_EQ(static_cast<const float*>(t.buffer.data)[0], 9.f);
+    EXPECT_FLOAT_EQ(static_cast<const float*>(t.buffer.ptr)[0], 9.f);
 }
 
 TEST(MapF32, ConstOverloadMapsWithoutCopy) {

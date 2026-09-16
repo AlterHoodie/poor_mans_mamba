@@ -1,12 +1,12 @@
 #include "ops/cpu/reductions.h"
 
-#include "ops/cpu/map.h"
-
 #include <gtest/gtest.h>
 
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#include "ops/cpu/map.h"
 
 namespace {
 
@@ -16,8 +16,8 @@ Tensor make_f32(std::vector<int64_t> shape, const std::vector<float>& values) {
     t.dtype = Dtype::F32;
     t.buffer.device = Device::CPU;
     t.buffer.bytes = values.size() * sizeof(float);
-    t.buffer.data = std::malloc(t.buffer.bytes);
-    std::memcpy(t.buffer.data, values.data(), t.buffer.bytes);
+    t.buffer.ptr = std::malloc(t.buffer.bytes);
+    std::memcpy(t.buffer.ptr, values.data(), t.buffer.bytes);
     return t;
 }
 

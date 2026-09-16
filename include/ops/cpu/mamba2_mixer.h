@@ -26,4 +26,4 @@ Status rms_norm_gated_f32(Tensor& y, const Tensor& gate, const Tensor& weight, f
 // Full mixer block (pre-norm residual outside). Mutates cache views; writes mixer output into
 // `out`.
 Status mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2LayerWeights& w,
-                        const Mamba2Config& cfg, MambaLayerCacheView& cache, Tensor& out);
+                        const Mamba2Config& cfg, LayerCacheView& cache, Tensor& out);

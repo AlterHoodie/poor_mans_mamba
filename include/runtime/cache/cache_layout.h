@@ -1,33 +1,48 @@
 #pragma once
 
-#include <cstddef>
-#include <vector>
-
 #include "core/status.h"
 #include "io/config.h"
 
-struct MambaLayerLayout {
-    int layer_idx = 0;
-    size_t conv_offset = 0;
-    size_t conv_size = 0;
-    size_t ssm_offset = 0;
-    size_t ssm_size = 0;
+#include <cstddef>
+#include <vector>
+
+enum class LayerCacheKind { Mamba2, AttnKV, Hybrid };
+
+struct Region {
+  size_t offset = 0;
+  size_t bytes = 0;
 };
 
+struct View {
+  void* ptr = nullptr;
+  size_t bytes = 0;
+};
+
+struct LayerEntry {
+  int layer_idx = 0;
+  LayerCacheKind kind = LayerCacheKind::Mamba2;
+  Region conv;
+  Region ssm;
+  Region k;
+  Region v;
+};
+
+// Generic CacheLayout
 struct CacheLayout {
-    // one particular slot of mamba state ideally for one request
-    size_t slot_bytes = 0;
-    int num_layers = 0;
-    std::vector<MambaLayerLayout> layers;
-
-    // Build CacheLayout
-    static StatusOr<CacheLayout> from_config(const Mamba2Config& cfg);
+  // one particular slot of mamba state ideally for one request
+  size_t slot_bytes = 0;
+  int num_layers = 0;
+  std::vector<LayerEntry> layers;
 };
+
+// ideally should be factory classes but dont want to add too much complexity, so will be simple
+// functions that reads a particular config and spits out a usable CacheLayout
+StatusOr<CacheLayout> create_mamba2_layout(const Mamba2Config&);
+
+StatusOr<CacheLayout> create_falconh1_layout(const FalconH1Config&);
 
 // Non-owning view into a slot's DeviceBuffer. Valid for the slot lifetime.
-struct MambaLayerCacheView {
-    void* conv = nullptr;
-    size_t conv_bytes = 0;
-    void* ssm = nullptr;
-    size_t ssm_bytes = 0;
+struct LayerCacheView {
+  LayerCacheKind kind;
+  View conv, ssm, k, v;
 };

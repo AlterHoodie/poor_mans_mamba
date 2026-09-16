@@ -1,139 +1,160 @@
 #include "runtime/cache/cache_pool.h"
 
-#include <cstdlib>
-#include <cstring>
-#include <stdexcept>
+#include <limits>
 
-CachePool::CachePool(const Mamba2Config& cfg, Device device, int device_id, int n_slots)
-    : device_(device), device_id_(device_id) {
-    if (n_slots <= 0) {
-        throw std::runtime_error("n_slots must be positive");
+CachePool::CachePool(CacheLayout layout, DeviceAllocator* allocator)
+    : device_(allocator->kind()), device_id_(allocator->device_id()), allocator_(allocator),
+      layout_(std::move(layout)) {}
+
+// Static Method to create cachepool objects (Mini Factory thingy)
+StatusOr<std::unique_ptr<CachePool>> CachePool::create(CacheLayout layout,
+                                                       DeviceAllocator* allocator, int num_slots) {
+  if (allocator == nullptr) {
+    return Status::InvalidArgument("allocator cannot be null");
+  }
+  if (num_slots <= 0) {
+    return Status::InvalidArgument("num_slots must be positive");
+  }
+  if (layout.slot_bytes == 0) {
+    return Status::InvalidArgument("layout slot_bytes must be positive");
+  }
+  if (layout.num_layers <= 0 || layout.layers.size() != static_cast<size_t>(layout.num_layers)) {
+    return Status::InvalidArgument("layout layer count is inconsistent");
+  }
+
+  const size_t slot_count = static_cast<size_t>(num_slots);
+  if (layout.slot_bytes > std::numeric_limits<size_t>::max() / slot_count) {
+    return Status::OOM("cache pool slab size overflow");
+  }
+
+  auto pool = std::unique_ptr<CachePool>(new CachePool(std::move(layout), allocator));
+
+  auto slab = pool->allocator_->allocate(pool->layout_.slot_bytes * slot_count);
+  if (!slab.ok()) {
+    return slab.status();
+  }
+  pool->slab_ = std::move(slab.value());
+
+  Status zero_status = pool->allocator_->memset_zero(pool->slab_, 0, pool->slab_.bytes);
+  if (!zero_status.ok()) {
+    pool->allocator_->free(pool->slab_);
+    return zero_status;
+  }
+
+  pool->slots_.resize(slot_count);
+  pool->free_list_.reserve(slot_count);
+
+  auto* slab_base = static_cast<std::byte*>(pool->slab_.ptr);
+  for (int slot_id = 0; slot_id < num_slots; ++slot_id) {
+    Slot& slot = pool->slots_[static_cast<size_t>(slot_id)];
+    slot.views.resize(static_cast<size_t>(pool->layout_.num_layers));
+
+    auto* slot_base = slab_base + static_cast<size_t>(slot_id) * pool->layout_.slot_bytes;
+    for (int layer = 0; layer < pool->layout_.num_layers; ++layer) {
+      const LayerEntry& entry = pool->layout_.layers[static_cast<size_t>(layer)];
+
+      // Direct views into the Device Memory Slab
+      // Depending on the LayerEntry Kind I need to build different layer cache views
+      slot.views[static_cast<size_t>(layer)] = LayerCacheView{
+          .kind = entry.kind,
+          .conv = {.ptr = slot_base + entry.conv.offset, .bytes = entry.conv.bytes},
+          .ssm = {.ptr = slot_base + entry.ssm.offset, .bytes = entry.ssm.bytes},
+      };
     }
 
-    StatusOr<CacheLayout> layout_status = CacheLayout::from_config(cfg);
-    if (!layout_status.ok()) {
-        throw std::runtime_error(layout_status.status().message());
-    }
-    layout_ = std::move(layout_status).value();
+    pool->free_list_.push_back(slot_id);
+  }
 
-    slots_.resize(static_cast<size_t>(n_slots));
-    free_list_.reserve(static_cast<size_t>(n_slots));
-
-    for (int slot = 0; slot < n_slots; ++slot) {
-        void* p = std::malloc(layout_.slot_bytes);
-        if (!p) {
-            throw std::runtime_error("failed to allocate cache slot");
-        }
-        std::memset(p, 0, layout_.slot_bytes);
-
-        DeviceBuffer buf;
-        buf.data = p;
-        buf.bytes = layout_.slot_bytes;
-        buf.device = device_;
-        buf.device_id = device_id_;
-
-        Slot& s = slots_[static_cast<size_t>(slot)];
-        s.buffer = std::move(buf);
-        s.views.resize(static_cast<size_t>(layout_.num_layers));
-
-        auto* base = static_cast<std::byte*>(s.buffer.data);
-        for (int layer = 0; layer < layout_.num_layers; ++layer) {
-            const MambaLayerLayout& L = layout_.layers[static_cast<size_t>(layer)];
-            s.views[static_cast<size_t>(layer)] = MambaLayerCacheView{
-                .conv = base + L.conv_offset,
-                .conv_bytes = L.conv_size,
-                .ssm = base + L.ssm_offset,
-                .ssm_bytes = L.ssm_size,
-            };
-        }
-
-        free_list_.push_back(slot);
-    }
+  return std::move(pool);
 }
 
 StatusOr<CacheHandle> CachePool::acquire() {
-    if (free_list_.empty()) {
-        return Status::OOM("Slot Memory Pool Exhausted");
-    }
+  if (free_list_.empty()) {
+    return Status::OOM("Slot Memory Pool Exhausted");
+  }
 
-    const int slot_id = free_list_.back();
-    free_list_.pop_back();
-    slots_[static_cast<size_t>(slot_id)].in_use = true;
-    return CacheHandle(slot_id);
+  const int slot_id = free_list_.back();
+  free_list_.pop_back();
+  slots_[static_cast<size_t>(slot_id)].in_use = true;
+  return CacheHandle(slot_id);
 }
 
 Status CachePool::zero_slot_(int slot_id) {
-    if (slot_id < 0 || static_cast<size_t>(slot_id) >= slots_.size()) {
-        return Status::InvalidArgument("Invalid slot id");
-    }
+  if (slot_id < 0 || static_cast<size_t>(slot_id) >= slots_.size()) {
+    return Status::InvalidArgument("Invalid slot id");
+  }
 
-    Slot& slot = slots_[static_cast<size_t>(slot_id)];
-    if (slot.buffer.data == nullptr || slot.buffer.bytes == 0) {
-        return Status::InvalidArgument("Slot buffer is not allocated");
-    }
+  if (allocator_ != nullptr && slab_.ptr != nullptr) {
+    const size_t offset = static_cast<size_t>(slot_id) * layout_.slot_bytes;
+    return allocator_->memset_zero(slab_, offset, layout_.slot_bytes);
+  }
 
-    // Keep allocation and views; clear recurrent state only.
-    std::memset(slot.buffer.data, 0, slot.buffer.bytes);
-    return Status::Ok();
+  Slot& slot = slots_[static_cast<size_t>(slot_id)];
+  auto* slot_base = static_cast<std::byte*>(slab_.ptr) + slot_id * layout_.slot_bytes;
+  size_t slot_bytes = layout_.slot_bytes; // same for every slot
+
+  // Keep allocation and views; clear recurrent state only.
+  std::memset(slot_base, 0, slot_bytes);
+  return Status::Ok();
 }
 
 Status CachePool::free_slot_(int slot_id) {
-    if (slot_id < 0 || static_cast<size_t>(slot_id) >= slots_.size()) {
-        return Status::InvalidArgument("Invalid slot id");
-    }
+  if (slot_id < 0 || static_cast<size_t>(slot_id) >= slots_.size()) {
+    return Status::InvalidArgument("Invalid slot id");
+  }
 
-    Slot& slot = slots_[static_cast<size_t>(slot_id)];
-    if (!slot.in_use) {
-        return Status::InvalidArgument("Slot is not in use");
-    }
+  Slot& slot = slots_[static_cast<size_t>(slot_id)];
+  if (!slot.in_use) {
+    return Status::InvalidArgument("Slot is not in use");
+  }
 
-    Status z = zero_slot_(slot_id);
-    if (!z.ok()) {
-        return z;
-    }
+  Status z = zero_slot_(slot_id);
+  if (!z.ok()) {
+    return z;
+  }
 
-    slot.in_use = false;
-    free_list_.push_back(slot_id);
-    return Status::Ok();
+  slot.in_use = false;
+  free_list_.push_back(slot_id);
+  return Status::Ok();
 }
 
 Status CachePool::release(CacheHandle& handle) {
-    if (!handle.valid()) {
-        return Status::InvalidArgument("Invalid cache handle");
-    }
+  if (!handle.valid()) {
+    return Status::InvalidArgument("Invalid cache handle");
+  }
 
-    Status st = free_slot_(handle.id());
-    handle.invalidate();
-    return st;
+  Status st = free_slot_(handle.id());
+  handle.invalidate();
+  return st;
 }
 
 Status CachePool::reset(CacheHandle& handle) {
-    if (!handle.valid()) {
-        return Status::InvalidArgument("Invalid cache handle");
-    }
+  if (!handle.valid()) {
+    return Status::InvalidArgument("Invalid cache handle");
+  }
 
-    const int slot_id = handle.id();
-    if (static_cast<size_t>(slot_id) >= slots_.size() ||
-        !slots_[static_cast<size_t>(slot_id)].in_use) {
-        return Status::InvalidArgument("Slot is not in use");
-    }
+  const int slot_id = handle.id();
+  if (static_cast<size_t>(slot_id) >= slots_.size() ||
+      !slots_[static_cast<size_t>(slot_id)].in_use) {
+    return Status::InvalidArgument("Slot is not in use");
+  }
 
-    return zero_slot_(slot_id);
+  return zero_slot_(slot_id);
 }
 
-StatusOr<MambaLayerCacheView> CachePool::layer_view(const CacheHandle& handle, int layer) const {
-    if (!handle.valid()) {
-        return Status::NotFound("Could not find slot or invalid slot_id");
-    }
-    if (layer < 0 || layer >= layout_.num_layers) {
-        return Status::InvalidArgument("Invalid layer");
-    }
+StatusOr<LayerCacheView> CachePool::layer_view(const CacheHandle& handle, int layer) const {
+  if (!handle.valid()) {
+    return Status::NotFound("Could not find slot or invalid slot_id");
+  }
+  if (layer < 0 || layer >= layout_.num_layers) {
+    return Status::InvalidArgument("Invalid layer");
+  }
 
-    const int slot_id = handle.id();
-    if (static_cast<size_t>(slot_id) >= slots_.size() ||
-        !slots_[static_cast<size_t>(slot_id)].in_use) {
-        return Status::InvalidArgument("Slot is not in use");
-    }
+  const int slot_id = handle.id();
+  if (static_cast<size_t>(slot_id) >= slots_.size() ||
+      !slots_[static_cast<size_t>(slot_id)].in_use) {
+    return Status::InvalidArgument("Slot is not in use");
+  }
 
-    return slots_[static_cast<size_t>(slot_id)].views[static_cast<size_t>(layer)];
+  return slots_[static_cast<size_t>(slot_id)].views[static_cast<size_t>(layer)];
 }

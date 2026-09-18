@@ -1,5 +1,5 @@
 #include "core/device.h"
-#include "ops/cpu/mamba2_mixer.h"
+#include "ops/backend.h"
 #include "ops/cpu/map.h"
 #include "runtime/cache/cache_layout.h"
 #include "runtime/cache/cache_pool.h"
@@ -35,33 +35,35 @@ Tensor make_embeddings(int vocab, int hidden) {
   return t;
 }
 
-Mamba2Config make_cfg() {
-  Mamba2Config cfg{};
+ModelConfig make_cfg() {
+  ModelConfig cfg{};
+  cfg.layout = ArchLayout::MambaOnly;
   cfg.model_type = "mamba2";
   cfg.hidden_size = 4;
   cfg.vocab_size = 8;
   cfg.tie_word_embeddings = true;
   cfg.num_hidden_layers = 1;
-  cfg.expand = 2;
-  cfg.conv_kernel = 4;
-  cfg.state_size = 4;
-  cfg.head_dim = 2;
-  cfg.num_heads = 4;
-  cfg.n_groups = 1;
-  cfg.chunk_size = 4;
-  cfg.time_step_rank = 1;
-  cfg.layer_norm_epsilon = 1e-5f;
-  cfg.use_conv_bias = true;
-  cfg.use_bias = false;
+  cfg.ssm.d_inner = 8;
+  cfg.ssm.d_conv = 4;
+  cfg.ssm.d_state = 4;
+  cfg.ssm.d_head = 2;
+  cfg.ssm.n_heads = 4;
+  cfg.ssm.n_groups = 1;
+  cfg.ssm.chunk_size = 4;
+  cfg.ssm.use_conv_bias = true;
+  cfg.ssm.use_proj_bias = false;
+  cfg.ssm.gated_rms_norm = true;
+  cfg.rms_norm_eps = 1e-5f;
   return cfg;
 }
 
-Mamba2Weights make_weights(const Mamba2Config& cfg) {
+Mamba2Weights make_weights(const ModelConfig& cfg) {
   const int64_t D = cfg.hidden_size;
-  const int64_t I = D * cfg.expand;
-  const int64_t G = cfg.n_groups;
-  const int64_t N = cfg.state_size;
-  const int64_t H = cfg.num_heads;
+  const int64_t I = cfg.ssm.d_inner;
+  const int64_t G = cfg.ssm.n_groups;
+  const int64_t N = cfg.ssm.d_state;
+  const int64_t H = cfg.ssm.n_heads;
+  const int64_t K = cfg.ssm.d_conv;
   const int64_t conv_dim = I + 2 * G * N;
   const int64_t proj_size = I + conv_dim + H;
 
@@ -76,12 +78,12 @@ Mamba2Weights make_weights(const Mamba2Config& cfg) {
     layer.mixer_norm = make_f32({I}, 1.f);
     layer.in_proj = make_f32({proj_size, D}, 0.01f);
     layer.out_proj = make_f32({D, I}, 0.01f);
-    layer.conv1d = make_f32({conv_dim, cfg.conv_kernel}, 0.1f);
+    layer.conv1d = make_f32({conv_dim, K}, 0.1f);
     {
       auto cw = as_mat_f32(layer.conv1d);
       cw.setZero();
       for (int64_t c = 0; c < conv_dim; ++c)
-        cw(c, cfg.conv_kernel - 1) = 1.f;
+        cw(c, K - 1) = 1.f;
     }
     layer.conv1d_bias = make_f32({conv_dim}, 0.f);
     layer.dt_bias = make_f32({H}, 0.f);
@@ -96,7 +98,7 @@ Mamba2Weights make_weights(const Mamba2Config& cfg) {
   return w;
 }
 
-StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const Mamba2Config& cfg, int n_slots) {
+StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const ModelConfig& cfg, int n_slots) {
   std::unique_ptr<DeviceAllocator> alloc;
   ASSIGN_OR_RETURN(alloc, create_device_allocator(Device::CPU, 0));
 
@@ -107,40 +109,15 @@ StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const Mamba2Config& cfg, int
   }
 
   std::unique_ptr<CachePool> pool;
-  ASSIGN_OR_RETURN(pool, create_cache_pool(cfg, alloc.get(), n_slots, create_mamba2_layout));
-  return std::make_unique<Mamba2Runner>(cfg, std::move(weights), std::move(pool), std::move(alloc));
+  ASSIGN_OR_RETURN(pool, create_cache_pool(cfg, alloc.get(), n_slots, create_cache_layout));
+  return std::make_unique<Mamba2Runner>(cfg, std::move(weights), std::move(pool), std::move(alloc),
+                                        cpu_ops());
 }
 
 } // namespace
 
-TEST(Mamba2Mixer, CausalConvUpdatesCacheAndAppliesSilu) {
-  const int64_t C = 2;
-  const int K = 3;
-  const int64_t T = 2;
-  std::vector<float> x = {1.f, 2.f, 3.f, 4.f};
-  std::vector<float> weight(static_cast<size_t>(C * K), 0.f);
-  weight[0 * K + (K - 1)] = 1.f;
-  weight[1 * K + (K - 1)] = 1.f;
-  std::vector<float> bias = {0.f, 0.f};
-  std::vector<float> cache(static_cast<size_t>(C * (K - 1)), 0.f);
-  std::vector<float> y(static_cast<size_t>(T * C), 0.f);
-
-  ASSERT_TRUE(causal_conv1d_f32(x.data(), T, C, K, weight.data(), bias.data(), cache.data(),
-                                y.data(), /*silu=*/false)
-                  .ok());
-
-  EXPECT_FLOAT_EQ(y[0], 1.f);
-  EXPECT_FLOAT_EQ(y[1], 2.f);
-  EXPECT_FLOAT_EQ(y[2], 3.f);
-  EXPECT_FLOAT_EQ(y[3], 4.f);
-  EXPECT_FLOAT_EQ(cache[0 * (K - 1) + 0], 1.f);
-  EXPECT_FLOAT_EQ(cache[0 * (K - 1) + 1], 3.f);
-  EXPECT_FLOAT_EQ(cache[1 * (K - 1) + 0], 2.f);
-  EXPECT_FLOAT_EQ(cache[1 * (K - 1) + 1], 4.f);
-}
-
 TEST(Mamba2Runner, PrefillReturnsCacheAndVocabLogits) {
-  Mamba2Config cfg = make_cfg();
+  ModelConfig cfg = make_cfg();
   StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
   Mamba2Runner& runner = *runner_or.value();
@@ -158,7 +135,7 @@ TEST(Mamba2Runner, PrefillReturnsCacheAndVocabLogits) {
 }
 
 TEST(Mamba2Runner, DecodeReusesHandleAndReturnsLogits) {
-  Mamba2Config cfg = make_cfg();
+  ModelConfig cfg = make_cfg();
   StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
   Mamba2Runner& runner = *runner_or.value();
@@ -177,7 +154,7 @@ TEST(Mamba2Runner, DecodeReusesHandleAndReturnsLogits) {
 }
 
 TEST(Mamba2Runner, PrefillEmptyTokensFails) {
-  Mamba2Config cfg = make_cfg();
+  ModelConfig cfg = make_cfg();
   StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, 1);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
 
@@ -186,7 +163,7 @@ TEST(Mamba2Runner, PrefillEmptyTokensFails) {
 }
 
 TEST(Mamba2Runner, DecodeInvalidHandleFails) {
-  Mamba2Config cfg = make_cfg();
+  ModelConfig cfg = make_cfg();
   StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, 1);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
 

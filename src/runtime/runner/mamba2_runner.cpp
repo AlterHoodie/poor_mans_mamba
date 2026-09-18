@@ -1,24 +1,21 @@
 #include "runtime/runner/mamba2_runner.h"
 
-#include "ops/cpu/element_wise.h"
 #include "ops/cpu/linear.h"
-#include "ops/cpu/mamba2_mixer.h"
 #include "ops/cpu/map.h"
-#include "ops/cpu/rms_norm.h"
 
 #include <cstring>
 #include <utility>
-#include <vector>
 
 Mamba2Runner::~Mamba2Runner() = default;
 
-Mamba2Runner::Mamba2Runner(Mamba2Config cfg, Mamba2Weights weights, std::unique_ptr<CachePool> pool,
-                           std::unique_ptr<DeviceAllocator> alloc)
-    : cfg_(std::move(cfg)), weights_(std::move(weights)), pool_(std::move(pool)),
-      alloc_(std::move(alloc)) {}
+Mamba2Runner::Mamba2Runner(ModelConfig cfg, Mamba2Weights weights, std::unique_ptr<CachePool> pool,
+                           std::unique_ptr<DeviceAllocator> alloc, const OpsBackend& ops)
+    : alloc_(std::move(alloc)), ops_(&ops), cfg_(std::move(cfg)), weights_(std::move(weights)),
+      pool_(std::move(pool)) {}
 
 Status Mamba2Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tensor& hidden,
                                     bool is_prefill) {
+  (void)is_prefill;
   if (cache.kind != LayerCacheKind::Mamba2)
     return Status::InvalidArgument("cache kind must be mamba2");
   if (layer_idx < 0 || layer_idx >= static_cast<int>(weights_.layers.size())) {
@@ -26,20 +23,32 @@ Status Mamba2Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tensor
   }
   const Mamba2LayerWeights& layer = weights_.layers[static_cast<size_t>(layer_idx)];
 
-  // residual stays in `hidden`; norm into a temp (don't move the caller's Tensor&).
-  StatusOr<Tensor> normed = rms_norm(hidden, layer.layer_norm, cfg_.layer_norm_epsilon);
+  StatusOr<Tensor> normed = allocate_f32_tensor(hidden.shape);
   if (!normed.ok())
     return Status(normed.status());
+  if (Status s = ops_->rms_norm(hidden, layer.layer_norm, cfg_.rms_norm_eps, normed.value());
+      !s.ok())
+    return s;
 
   StatusOr<Tensor> mixer_out = allocate_f32_tensor(hidden.shape);
   if (!mixer_out.ok())
     return Status(mixer_out.status());
 
-  if (Status s = mamba2_mixer_f32(normed.value(), layer, cfg_, cache, mixer_out.value()); !s.ok()) {
+  Mamba2MixerWeights mw{.in_proj = layer.in_proj,
+                        .conv1d = layer.conv1d,
+                        .conv1d_bias = layer.conv1d_bias,
+                        .dt_bias = layer.dt_bias,
+                        .out_proj = layer.out_proj,
+                        .A_log = layer.A_log,
+                        .D = layer.D,
+                        .mixer_norm = &layer.mixer_norm};
+  if (Status s = ops_->mamba2_mixer_f32(normed.value(), mw, cfg_.ssm, /*scales=*/nullptr,
+                                        cfg_.rms_norm_eps, cache, mixer_out.value());
+      !s.ok()) {
     return s;
   }
 
-  return add(hidden, mixer_out.value(), hidden);
+  return ops_->add(hidden, mixer_out.value(), hidden);
 }
 
 StatusOr<Tensor> Mamba2Runner::embed_(std::span<const int32_t> tokens) {
@@ -77,7 +86,7 @@ StatusOr<Tensor> Mamba2Runner::embed_(std::span<const int32_t> tokens) {
 }
 
 Status Mamba2Runner::norm_f_(Tensor& hidden) {
-  return rms_norm_inplace(hidden, weights_.norm_f, cfg_.layer_norm_epsilon);
+  return ops_->rms_norm(hidden, weights_.norm_f, cfg_.rms_norm_eps, hidden);
 }
 
 StatusOr<Tensor> Mamba2Runner::last_token_hidden_(const Tensor& hidden) const {
@@ -85,7 +94,6 @@ StatusOr<Tensor> Mamba2Runner::last_token_hidden_(const Tensor& hidden) const {
     return Status::InvalidArgument("hidden is empty");
 
   if (hidden.size() == 1) {
-    // Already a single vector {D}; copy so caller owns a separate buffer for linear.
     StatusOr<Tensor> copy = allocate_f32_tensor(hidden.shape);
     if (!copy.ok())
       return Status(copy.status());
@@ -146,7 +154,7 @@ StatusOr<PrefillResult> Mamba2Runner::prefill(std::span<const int32_t> tokens) {
   if (!alloc_)
     return Status::InvalidArgument("allocator is not initialized");
 
-  AllocatorScope scope(alloc_.get()); // ops see this alloc via TLS
+  AllocatorScope scope(alloc_.get());
 
   PrefillResult result;
   ASSIGN_OR_RETURN(result.cache, pool_->acquire());
@@ -181,14 +189,13 @@ StatusOr<DecodeResult> Mamba2Runner::decode(const CacheHandle& cache, int32_t to
   if (!cache.valid())
     return Status::InvalidArgument("invalid cache handle");
 
-  AllocatorScope scope(alloc_.get()); // ops see this alloc via TLS
+  AllocatorScope scope(alloc_.get());
 
   const int32_t tok = token;
   StatusOr<Tensor> hidden = embed_(std::span<const int32_t>(&tok, 1));
   if (!hidden.ok())
     return Status(hidden.status());
 
-  // Decode is always rank-1 after embed {1, D}; flatten to {D} for vector path consistency.
   if (hidden.value().size() == 2 && hidden.value().shape[0] == 1) {
     hidden.value().shape = {hidden.value().shape[1]};
   }

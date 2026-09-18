@@ -2,6 +2,7 @@
 
 #include "io/config.h"
 #include "model/mamba2_weights.h"
+#include "ops/backend.h"
 #include "runner.h"
 #include "runtime/cache/cache_layout.h"
 #include "runtime/cache/cache_pool.h"
@@ -12,7 +13,8 @@
 class Mamba2Runner : public Runner {
 private:
   std::unique_ptr<DeviceAllocator> alloc_;
-  Mamba2Config cfg_;
+  const OpsBackend* ops_ = nullptr;
+  ModelConfig cfg_;
   Mamba2Weights weights_;
   std::unique_ptr<CachePool> pool_;
 
@@ -26,8 +28,8 @@ private:
   StatusOr<Tensor> forward_hidden_(const CacheHandle& cache, Tensor hidden, bool is_prefill);
 
 public:
-  Mamba2Runner(Mamba2Config cfg, Mamba2Weights weights, std::unique_ptr<CachePool> pool,
-               std::unique_ptr<DeviceAllocator> alloc);
+  Mamba2Runner(ModelConfig cfg, Mamba2Weights weights, std::unique_ptr<CachePool> pool,
+               std::unique_ptr<DeviceAllocator> alloc, const OpsBackend& ops);
 
   ~Mamba2Runner() override;
 

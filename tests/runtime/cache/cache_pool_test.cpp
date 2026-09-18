@@ -9,16 +9,17 @@
 
 namespace {
 
-Mamba2Config make_valid_config() {
-  Mamba2Config cfg{};
+ModelConfig make_valid_config() {
+  ModelConfig cfg{};
+  cfg.layout = ArchLayout::MambaOnly;
   cfg.num_hidden_layers = 2;
   cfg.hidden_size = 64;
-  cfg.expand = 2;
-  cfg.conv_kernel = 4;
-  cfg.num_heads = 8;
-  cfg.head_dim = 16;
-  cfg.state_size = 16;
-  cfg.n_groups = 1;
+  cfg.ssm.d_inner = 128;
+  cfg.ssm.d_conv = 4;
+  cfg.ssm.n_heads = 8;
+  cfg.ssm.d_head = 16;
+  cfg.ssm.d_state = 16;
+  cfg.ssm.n_groups = 1;
   return cfg;
 }
 
@@ -26,11 +27,11 @@ struct PoolFixture {
   std::unique_ptr<DeviceAllocator> alloc;
   std::unique_ptr<CachePool> pool;
 
-  static StatusOr<PoolFixture> create(const Mamba2Config& cfg, int num_slots) {
+  static StatusOr<PoolFixture> create(const ModelConfig& cfg, int num_slots) {
     PoolFixture f;
     ASSIGN_OR_RETURN(f.alloc, create_device_allocator(Device::CPU, 0));
     ASSIGN_OR_RETURN(f.pool,
-                     create_cache_pool(cfg, f.alloc.get(), num_slots, create_mamba2_layout));
+                     create_cache_pool(cfg, f.alloc.get(), num_slots, create_cache_layout));
     return f;
   }
 };
@@ -38,7 +39,7 @@ struct PoolFixture {
 } // namespace
 
 TEST(CachePool, AcquireReleaseRoundTrip) {
-  const Mamba2Config cfg = make_valid_config();
+  const ModelConfig cfg = make_valid_config();
   StatusOr<PoolFixture> fix_or = PoolFixture::create(cfg, /*num_slots=*/2);
   ASSERT_TRUE(fix_or.ok()) << fix_or.status().message();
   CachePool& pool = *fix_or.value().pool;
@@ -64,7 +65,7 @@ TEST(CachePool, AcquireReleaseRoundTrip) {
 }
 
 TEST(CachePool, LayerViewsPointIntoSlotAndHaveExpectedSizes) {
-  const Mamba2Config cfg = make_valid_config();
+  const ModelConfig cfg = make_valid_config();
   StatusOr<PoolFixture> fix_or = PoolFixture::create(cfg, 1);
   ASSERT_TRUE(fix_or.ok()) << fix_or.status().message();
   CachePool& pool = *fix_or.value().pool;
@@ -73,7 +74,7 @@ TEST(CachePool, LayerViewsPointIntoSlotAndHaveExpectedSizes) {
   ASSERT_TRUE(handle_or.ok());
   const CacheHandle& handle = handle_or.value();
 
-  StatusOr<CacheLayout> layout_or = create_mamba2_layout(cfg);
+  StatusOr<CacheLayout> layout_or = create_cache_layout(cfg);
   ASSERT_TRUE(layout_or.ok());
   const CacheLayout& layout = layout_or.value();
 
@@ -98,7 +99,7 @@ TEST(CachePool, LayerViewsPointIntoSlotAndHaveExpectedSizes) {
 }
 
 TEST(CachePool, ResetZerosStateButKeepsViewsUsable) {
-  const Mamba2Config cfg = make_valid_config();
+  const ModelConfig cfg = make_valid_config();
   StatusOr<PoolFixture> fix_or = PoolFixture::create(cfg, 1);
   ASSERT_TRUE(fix_or.ok()) << fix_or.status().message();
   CachePool& pool = *fix_or.value().pool;
@@ -133,7 +134,7 @@ TEST(CachePool, ResetZerosStateButKeepsViewsUsable) {
 }
 
 TEST(CachePool, LayerViewRejectsBadHandleAndLayer) {
-  const Mamba2Config cfg = make_valid_config();
+  const ModelConfig cfg = make_valid_config();
   StatusOr<PoolFixture> fix_or = PoolFixture::create(cfg, 1);
   ASSERT_TRUE(fix_or.ok()) << fix_or.status().message();
   CachePool& pool = *fix_or.value().pool;
@@ -156,7 +157,7 @@ TEST(CachePool, LayerViewRejectsBadHandleAndLayer) {
 }
 
 TEST(CachePool, ReleaseThenLayerViewFails) {
-  const Mamba2Config cfg = make_valid_config();
+  const ModelConfig cfg = make_valid_config();
   StatusOr<PoolFixture> fix_or = PoolFixture::create(cfg, 1);
   ASSERT_TRUE(fix_or.ok()) << fix_or.status().message();
   CachePool& pool = *fix_or.value().pool;

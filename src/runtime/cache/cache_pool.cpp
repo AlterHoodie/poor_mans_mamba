@@ -1,5 +1,6 @@
 #include "runtime/cache/cache_pool.h"
 
+#include <cstring>
 #include <limits>
 
 CachePool::CachePool(CacheLayout layout, DeviceAllocator* allocator)
@@ -54,14 +55,16 @@ StatusOr<std::unique_ptr<CachePool>> CachePool::create(CacheLayout layout,
       const LayerEntry& entry = pool->layout_.layers[static_cast<size_t>(layer)];
 
       // Direct views into the Device Memory Slab
-      // Depending on the LayerEntry Kind I need to build different layer cache views
       slot.views[static_cast<size_t>(layer)] = LayerCacheView{
           .kind = entry.kind,
           .conv = {.ptr = slot_base + entry.conv.offset, .bytes = entry.conv.bytes},
           .ssm = {.ptr = slot_base + entry.ssm.offset, .bytes = entry.ssm.bytes},
+          .k = {.ptr = slot_base + entry.k.offset, .bytes = entry.k.bytes},
+          .v = {.ptr = slot_base + entry.v.offset, .bytes = entry.v.bytes},
       };
     }
 
+    slot.seq_len = 0;
     pool->free_list_.push_back(slot_id);
   }
 
@@ -76,6 +79,7 @@ StatusOr<CacheHandle> CachePool::acquire() {
   const int slot_id = free_list_.back();
   free_list_.pop_back();
   slots_[static_cast<size_t>(slot_id)].in_use = true;
+  slots_[static_cast<size_t>(slot_id)].seq_len = 0;
   return CacheHandle(slot_id);
 }
 
@@ -84,12 +88,14 @@ Status CachePool::zero_slot_(int slot_id) {
     return Status::InvalidArgument("Invalid slot id");
   }
 
+  Slot& slot = slots_[static_cast<size_t>(slot_id)];
+  slot.seq_len = 0;
+
   if (allocator_ != nullptr && slab_.ptr != nullptr) {
     const size_t offset = static_cast<size_t>(slot_id) * layout_.slot_bytes;
     return allocator_->memset_zero(slab_, offset, layout_.slot_bytes);
   }
 
-  Slot& slot = slots_[static_cast<size_t>(slot_id)];
   auto* slot_base = static_cast<std::byte*>(slab_.ptr) + slot_id * layout_.slot_bytes;
   size_t slot_bytes = layout_.slot_bytes; // same for every slot
 
@@ -157,4 +163,29 @@ StatusOr<LayerCacheView> CachePool::layer_view(const CacheHandle& handle, int la
   }
 
   return slots_[static_cast<size_t>(slot_id)].views[static_cast<size_t>(layer)];
+}
+
+StatusOr<int64_t> CachePool::seq_len(const CacheHandle& handle) const {
+  if (!handle.valid())
+    return Status::InvalidArgument("invalid cache handle");
+  const int slot_id = handle.id();
+  if (static_cast<size_t>(slot_id) >= slots_.size() ||
+      !slots_[static_cast<size_t>(slot_id)].in_use) {
+    return Status::InvalidArgument("Slot is not in use");
+  }
+  return slots_[static_cast<size_t>(slot_id)].seq_len;
+}
+
+Status CachePool::set_seq_len(const CacheHandle& handle, int64_t len) {
+  if (!handle.valid())
+    return Status::InvalidArgument("invalid cache handle");
+  if (len < 0)
+    return Status::InvalidArgument("seq_len must be non-negative");
+  const int slot_id = handle.id();
+  if (static_cast<size_t>(slot_id) >= slots_.size() ||
+      !slots_[static_cast<size_t>(slot_id)].in_use) {
+    return Status::InvalidArgument("Slot is not in use");
+  }
+  slots_[static_cast<size_t>(slot_id)].seq_len = len;
+  return Status::Ok();
 }

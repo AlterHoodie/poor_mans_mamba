@@ -37,6 +37,8 @@ private:
     // Precomputed non-owning views into buffer (stable for slot lifetime).
     std::vector<LayerCacheView> views;
     bool in_use = false;
+    // Tokens written into KV cache so far (Falcon-H1 / AttnKV). Unused for pure Mamba2.
+    int64_t seq_len = 0;
   };
 
   std::vector<Slot> slots_;
@@ -58,6 +60,9 @@ public:
   Status reset(CacheHandle& handle);   // zero state, keep lease
 
   StatusOr<LayerCacheView> layer_view(const CacheHandle& handle, int layer) const;
+
+  StatusOr<int64_t> seq_len(const CacheHandle& handle) const;
+  Status set_seq_len(const CacheHandle& handle, int64_t len);
 
   CachePool(const CachePool&) = delete;
   CachePool& operator=(const CachePool&) = delete;

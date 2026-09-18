@@ -6,39 +6,34 @@ namespace {
 
 constexpr size_t kF32Bytes = sizeof(float);
 
-} // namespace
-
-StatusOr<CacheLayout> create_mamba2_layout(const Mamba2Config& cfg) {
+StatusOr<CacheLayout> create_mamba_only_layout(const ModelConfig& cfg) {
   if (cfg.num_hidden_layers <= 0) {
     return Status::InvalidArgument("num_hidden_layers must be positive");
   }
-  if (cfg.hidden_size <= 0 || cfg.expand <= 0) {
-    return Status::InvalidArgument("hidden_size and expand must be positive");
+  if (cfg.hidden_size <= 0) {
+    return Status::InvalidArgument("hidden_size must be positive");
   }
-  if (cfg.conv_kernel <= 1) {
+  const SsmConfig& ssm = cfg.ssm;
+  if (ssm.d_conv <= 1) {
     return Status::InvalidArgument("conv_kernel must be > 1 for conv state");
   }
-  if (cfg.num_heads <= 0 || cfg.head_dim <= 0 || cfg.state_size <= 0) {
-    return Status::InvalidArgument("num_heads, head_dim, and state_size must be positive");
+  if (ssm.n_heads <= 0 || ssm.d_head <= 0 || ssm.d_state <= 0 || ssm.d_inner <= 0) {
+    return Status::InvalidArgument("invalid ssm dimensions");
   }
-  if (cfg.n_groups <= 0) {
+  if (ssm.n_groups <= 0) {
     return Status::InvalidArgument("n_groups must be positive");
   }
-  if (cfg.num_heads % cfg.n_groups != 0) {
-    return Status::InvalidArgument("num_heads must be divisible by n_groups");
+  if (ssm.n_heads % ssm.n_groups != 0) {
+    return Status::InvalidArgument("n_heads must be divisible by n_groups");
+  }
+  if (ssm.d_inner != ssm.n_heads * ssm.d_head) {
+    return Status::InvalidArgument("d_inner must equal n_heads * d_head");
   }
 
-  const int64_t intermediate = static_cast<int64_t>(cfg.hidden_size) * cfg.expand;
-  if (intermediate != static_cast<int64_t>(cfg.num_heads) * cfg.head_dim) {
-    return Status::InvalidArgument("expand*hidden_size must equal num_heads*head_dim");
-  }
-
-  // HF: conv_dim = intermediate + 2 * n_groups * state_size
-  const int64_t conv_dim = intermediate + 2 * static_cast<int64_t>(cfg.n_groups) * cfg.state_size;
-  const size_t conv_elems =
-      static_cast<size_t>(conv_dim) * static_cast<size_t>(cfg.conv_kernel - 1);
-  const size_t ssm_elems = static_cast<size_t>(cfg.num_heads) * static_cast<size_t>(cfg.head_dim) *
-                           static_cast<size_t>(cfg.state_size);
+  const int64_t conv_dim = ssm.d_inner + 2 * static_cast<int64_t>(ssm.n_groups) * ssm.d_state;
+  const size_t conv_elems = static_cast<size_t>(conv_dim) * static_cast<size_t>(ssm.d_conv - 1);
+  const size_t ssm_elems = static_cast<size_t>(ssm.n_heads) * static_cast<size_t>(ssm.d_head) *
+                           static_cast<size_t>(ssm.d_state);
 
   const size_t conv_bytes = conv_elems * kF32Bytes;
   const size_t ssm_bytes = ssm_elems * kF32Bytes;
@@ -64,57 +59,56 @@ StatusOr<CacheLayout> create_mamba2_layout(const Mamba2Config& cfg) {
   return layout;
 }
 
-StatusOr<CacheLayout> create_falconh1_layout(const FalconH1Config& cfg) {
+StatusOr<CacheLayout> create_parallel_hybrid_layout(const ModelConfig& cfg) {
   if (cfg.num_hidden_layers <= 0) {
     return Status::InvalidArgument("num_hidden_layers must be positive");
   }
-
-  // mamba checks
-  if (cfg.hidden_size <= 0 || cfg.mamba_expand <= 0) {
-    return Status::InvalidArgument("hidden_size and expand must be positive");
+  if (cfg.hidden_size <= 0) {
+    return Status::InvalidArgument("hidden_size must be positive");
   }
-  if (cfg.mamba_d_conv <= 1) {
+  if (!cfg.attn.has_value()) {
+    return Status::InvalidArgument("ParallelHybrid requires attn config");
+  }
+
+  const SsmConfig& ssm = cfg.ssm;
+  const AttnConfig& attn = *cfg.attn;
+
+  if (ssm.d_conv <= 1) {
     return Status::InvalidArgument("conv_kernel must be > 1 for conv state");
   }
-  if (cfg.mamba_n_heads <= 0 || cfg.mamba_d_head <= 0 || cfg.mamba_d_state <= 0) {
-    return Status::InvalidArgument("num_heads, head_dim, and state_size must be positive");
+  if (ssm.n_heads <= 0 || ssm.d_head <= 0 || ssm.d_state <= 0 || ssm.d_inner <= 0) {
+    return Status::InvalidArgument("invalid ssm dimensions");
   }
-  if (cfg.mamba_n_groups <= 0) {
+  if (ssm.n_groups <= 0) {
     return Status::InvalidArgument("n_groups must be positive");
   }
-  if (cfg.mamba_n_heads % cfg.mamba_n_groups != 0) {
-    return Status::InvalidArgument("num_heads must be divisible by n_groups");
+  if (ssm.n_heads % ssm.n_groups != 0) {
+    return Status::InvalidArgument("n_heads must be divisible by n_groups");
   }
-  if (cfg.mamba_d_ssm != cfg.mamba_n_heads * cfg.mamba_d_head) {
-    return Status::InvalidArgument("mamba intermediate state must be equal to n_heads  * d_heads");
+  if (ssm.d_inner != ssm.n_heads * ssm.d_head) {
+    return Status::InvalidArgument("d_inner must equal n_heads * d_head");
   }
 
-  // attention checks
-  if (cfg.num_attention_heads < 1)
+  if (attn.n_q_heads < 1)
     return Status::InvalidArgument("num_attention_heads should be greater than 0");
-  if (cfg.num_attention_heads < 1)
+  if (attn.n_kv_heads < 1)
     return Status::InvalidArgument("num_key_value_heads should be greater than 0");
-  if (cfg.num_attention_heads != cfg.num_key_value_heads)
-    return Status::InvalidArgument("num_attention_heads should be equal to num_key_value_heads");
-  if (cfg.head_dim < 1)
+  if (attn.n_q_heads % attn.n_kv_heads != 0)
+    return Status::InvalidArgument("num_attention_heads must be divisible by num_key_value_heads");
+  if (attn.head_dim < 1)
     return Status::InvalidArgument("head_dim should be greater than 0");
   if (cfg.max_seq_length < 1)
     return Status::InvalidArgument("max_seq_length should be greater than 0");
 
-  // Mamba Cache State
-  // HF: conv_dim = intermediate + 2 * n_groups * state_size
-  const int64_t conv_dim =
-      cfg.mamba_d_ssm + 2 * static_cast<int64_t>(cfg.mamba_n_groups) * cfg.mamba_d_state;
-  const size_t conv_elems =
-      static_cast<size_t>(conv_dim) * static_cast<size_t>(cfg.mamba_d_conv - 1);
-  const size_t ssm_elems = cfg.mamba_n_heads * cfg.mamba_d_head * cfg.mamba_d_state;
+  const int64_t conv_dim = ssm.d_inner + 2 * static_cast<int64_t>(ssm.n_groups) * ssm.d_state;
+  const size_t conv_elems = static_cast<size_t>(conv_dim) * static_cast<size_t>(ssm.d_conv - 1);
+  const size_t ssm_elems = static_cast<size_t>(ssm.n_heads) * static_cast<size_t>(ssm.d_head) *
+                           static_cast<size_t>(ssm.d_state);
 
   const size_t conv_bytes = conv_elems * kF32Bytes;
   const size_t ssm_bytes = ssm_elems * kF32Bytes;
 
-  // KV Cache State
-  const size_t kv_dim =
-      static_cast<size_t>(cfg.num_key_value_heads) * static_cast<size_t>(cfg.head_dim);
+  const size_t kv_dim = static_cast<size_t>(attn.n_kv_heads) * static_cast<size_t>(attn.head_dim);
   const size_t kv_bytes = static_cast<size_t>(cfg.max_seq_length) * kv_dim * kF32Bytes;
 
   CacheLayout layout;
@@ -127,7 +121,6 @@ StatusOr<CacheLayout> create_falconh1_layout(const FalconH1Config& cfg) {
     L.layer_idx = layer;
     L.kind = LayerCacheKind::Hybrid;
 
-    // mamba stuff
     L.conv.offset = offset;
     L.conv.bytes = conv_bytes;
     offset += conv_bytes;
@@ -136,7 +129,6 @@ StatusOr<CacheLayout> create_falconh1_layout(const FalconH1Config& cfg) {
     L.ssm.bytes = ssm_bytes;
     offset += ssm_bytes;
 
-    // attn stuff
     L.k.offset = offset;
     L.k.bytes = kv_bytes;
     offset += kv_bytes;
@@ -148,4 +140,16 @@ StatusOr<CacheLayout> create_falconh1_layout(const FalconH1Config& cfg) {
 
   layout.slot_bytes = offset;
   return layout;
+}
+
+} // namespace
+
+StatusOr<CacheLayout> create_cache_layout(const ModelConfig& cfg) {
+  switch (cfg.layout) {
+  case ArchLayout::MambaOnly:
+    return create_mamba_only_layout(cfg);
+  case ArchLayout::ParallelHybrid:
+    return create_parallel_hybrid_layout(cfg);
+  }
+  return Status::InvalidArgument("unknown ArchLayout");
 }

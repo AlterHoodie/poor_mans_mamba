@@ -5,37 +5,37 @@
 
 namespace {
 
-Mamba2Config make_valid_config() {
-  Mamba2Config cfg{};
+ModelConfig make_valid_config() {
+  ModelConfig cfg{};
+  cfg.layout = ArchLayout::MambaOnly;
   cfg.num_hidden_layers = 2;
   cfg.hidden_size = 64;
-  cfg.expand = 2;
-  cfg.conv_kernel = 4;
-  cfg.num_heads = 8;
-  cfg.head_dim = 16;
-  cfg.state_size = 16;
-  cfg.n_groups = 1;
+  cfg.ssm.d_inner = 128;
+  cfg.ssm.d_conv = 4;
+  cfg.ssm.n_heads = 8;
+  cfg.ssm.d_head = 16;
+  cfg.ssm.d_state = 16;
+  cfg.ssm.n_groups = 1;
   return cfg;
 }
 
 } // namespace
 
 TEST(CacheLayout, FromConfigPacksLayersContiguously) {
-  const Mamba2Config cfg = make_valid_config();
-  StatusOr<CacheLayout> result = create_mamba2_layout(cfg);
+  const ModelConfig cfg = make_valid_config();
+  StatusOr<CacheLayout> result = create_cache_layout(cfg);
   ASSERT_TRUE(result.ok());
 
   const CacheLayout& layout = result.value();
   EXPECT_EQ(layout.num_layers, 2);
   ASSERT_EQ(layout.layers.size(), 2u);
 
-  const size_t intermediate =
-      static_cast<size_t>(cfg.hidden_size) * static_cast<size_t>(cfg.expand);
+  const size_t intermediate = static_cast<size_t>(cfg.ssm.d_inner);
   const size_t conv_dim =
-      intermediate + 2 * static_cast<size_t>(cfg.n_groups) * static_cast<size_t>(cfg.state_size);
-  const size_t conv_bytes = conv_dim * static_cast<size_t>(cfg.conv_kernel - 1) * sizeof(float);
-  const size_t ssm_bytes = static_cast<size_t>(cfg.num_heads) * static_cast<size_t>(cfg.head_dim) *
-                           static_cast<size_t>(cfg.state_size) * sizeof(float);
+      intermediate + 2 * static_cast<size_t>(cfg.ssm.n_groups) * static_cast<size_t>(cfg.ssm.d_state);
+  const size_t conv_bytes = conv_dim * static_cast<size_t>(cfg.ssm.d_conv - 1) * sizeof(float);
+  const size_t ssm_bytes = static_cast<size_t>(cfg.ssm.n_heads) * static_cast<size_t>(cfg.ssm.d_head) *
+                           static_cast<size_t>(cfg.ssm.d_state) * sizeof(float);
   const size_t per_layer = conv_bytes + ssm_bytes;
 
   EXPECT_EQ(layout.slot_bytes, per_layer * 2);
@@ -56,39 +56,39 @@ TEST(CacheLayout, FromConfigPacksLayersContiguously) {
 }
 
 TEST(CacheLayout, RejectsNonPositiveLayerCount) {
-  Mamba2Config cfg = make_valid_config();
+  ModelConfig cfg = make_valid_config();
   cfg.num_hidden_layers = 0;
-  StatusOr<CacheLayout> result = create_mamba2_layout(cfg);
+  StatusOr<CacheLayout> result = create_cache_layout(cfg);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().code(), Code::kInvalidArgument);
 }
 
 TEST(CacheLayout, RejectsInvalidConvKernel) {
-  Mamba2Config cfg = make_valid_config();
-  cfg.conv_kernel = 1;
-  StatusOr<CacheLayout> result = create_mamba2_layout(cfg);
+  ModelConfig cfg = make_valid_config();
+  cfg.ssm.d_conv = 1;
+  StatusOr<CacheLayout> result = create_cache_layout(cfg);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().code(), Code::kInvalidArgument);
 }
 
 TEST(CacheLayout, RejectsInvalidHiddenOrExpand) {
-  Mamba2Config cfg = make_valid_config();
+  ModelConfig cfg = make_valid_config();
   cfg.hidden_size = 0;
-  StatusOr<CacheLayout> result = create_mamba2_layout(cfg);
+  StatusOr<CacheLayout> result = create_cache_layout(cfg);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().code(), Code::kInvalidArgument);
 
   cfg = make_valid_config();
-  cfg.expand = -1;
-  result = create_mamba2_layout(cfg);
+  cfg.ssm.d_inner = 0;
+  result = create_cache_layout(cfg);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().code(), Code::kInvalidArgument);
 }
 
 TEST(CacheLayout, RejectsInvalidSsmDims) {
-  Mamba2Config cfg = make_valid_config();
-  cfg.num_heads = 0;
-  StatusOr<CacheLayout> result = create_mamba2_layout(cfg);
+  ModelConfig cfg = make_valid_config();
+  cfg.ssm.n_heads = 0;
+  StatusOr<CacheLayout> result = create_cache_layout(cfg);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().code(), Code::kInvalidArgument);
 }

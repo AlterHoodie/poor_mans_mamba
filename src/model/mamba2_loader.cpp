@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-Status Mamba2ModelLoader::load(const Mamba2Config& cfg, Mamba2Weights& weights,
+Status Mamba2ModelLoader::load(const ModelConfig& cfg, Mamba2Weights& weights,
                                const std::string& model_dir, int device_id) {
   safetensors::safetensors_t st{};
   std::string err;

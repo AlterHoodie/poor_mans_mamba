@@ -5,24 +5,25 @@
 
 namespace {
 
-Mamba2Config make_cfg() {
-  Mamba2Config cfg{};
+ModelConfig make_cfg() {
+  ModelConfig cfg{};
+  cfg.layout = ArchLayout::MambaOnly;
   cfg.model_type = "mamba2";
   cfg.hidden_size = 4;
   cfg.vocab_size = 8;
   cfg.tie_word_embeddings = true;
   cfg.num_hidden_layers = 1;
-  cfg.expand = 2;
-  cfg.conv_kernel = 4;
-  cfg.state_size = 4;
-  cfg.head_dim = 2;
-  cfg.num_heads = 4;
-  cfg.n_groups = 1;
-  cfg.chunk_size = 4;
-  cfg.time_step_rank = 1;
-  cfg.layer_norm_epsilon = 1e-5f;
-  cfg.use_conv_bias = true;
-  cfg.use_bias = false;
+  cfg.ssm.d_inner = 8;
+  cfg.ssm.d_conv = 4;
+  cfg.ssm.d_state = 4;
+  cfg.ssm.d_head = 2;
+  cfg.ssm.n_heads = 4;
+  cfg.ssm.n_groups = 1;
+  cfg.ssm.chunk_size = 4;
+  cfg.ssm.use_conv_bias = true;
+  cfg.ssm.use_proj_bias = false;
+  cfg.ssm.gated_rms_norm = true;
+  cfg.rms_norm_eps = 1e-5f;
   cfg.eos_token_id = 0;
   return cfg;
 }

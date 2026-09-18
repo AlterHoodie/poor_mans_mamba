@@ -4,6 +4,8 @@
 #include "core/tensor.h"
 #include "map.h"
 
+#include <cmath>
+
 template <typename Derived> struct BinarySameShapeOp {
   Status operator()(const Tensor& a, const Tensor& b, Tensor& out) const {
     if (Status s = validate_binary_same_shape(a, b, out); !s.ok())
@@ -81,3 +83,12 @@ StatusOr<Tensor> add(const Tensor& a, const Tensor& b);
 
 Status silu(const Tensor& a, Tensor& out);
 StatusOr<Tensor> silu(const Tensor& a);
+inline float silu(float x) { return x / (1.f + std::exp(-x)); }
+
+inline float softplus(float x) {
+  if (x > 20.f)
+    return x;
+  if (x < -20.f)
+    return std::exp(x);
+  return std::log1p(std::exp(x));
+}

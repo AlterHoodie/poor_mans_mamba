@@ -2,11 +2,24 @@ cmake_minimum_required(VERSION 3.22)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-project(
-    MambaServe,
-    VERSION 0.0.1
-    LANGUAGES CXX
-)
+option(MAMBASERVE_WITH_CUDA "Build Cuda ops/ CudaAllocator" OFF)
+
+# CMAKE_CUDA_ARCHITECTURES must be set before project(... CUDA) / enable_language(CUDA),
+# otherwise CMake fills a default (e.g. 52) and a later set is ignored.
+#   50 = Maxwell (GTX 750 Ti); 75 = Turing; 80/86 = Ampere; 89 = Ada; 90 = Hopper.
+# Override with -DCMAKE_CUDA_ARCHITECTURES=... (e.g. "native" on CMake 3.24+).
+if(MAMBASERVE_WITH_CUDA)
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 50)
+  endif()
+  project(MambaServe VERSION 0.0.1 LANGUAGES CXX CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  find_package(CUDAToolkit REQUIRED)
+else()
+  project(MambaServe VERSION 0.0.1 LANGUAGES CXX)
+endif()
+
 include(FetchContent)
 
 FetchContent_Declare(
@@ -54,6 +67,11 @@ file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
 )
 add_library(core ${CORE_SOURCES})
 target_link_libraries(core PUBLIC mambaserve_common)
+if(MAMBASERVE_WITH_CUDA)
+  target_sources(core PRIVATE src/core/cuda_allocator.cu)
+  target_link_libraries(core PUBLIC CUDA::cudart)
+  target_compile_definitions(core PUBLIC MAMBASERVE_WITH_CUDA=1)
+endif()
 
 
 # For IO library for reading files, creating cfg and loading weights
@@ -64,11 +82,16 @@ add_library(io ${IO_SOURCES})
 target_link_libraries(io 
     PUBLIC 
         mambaserve_common
+        core
     PRIVATE
         nlohmann_json::nlohmann_json
         safetensors-cpp::safetensors_cpp
         
 )
+if(MAMBASERVE_WITH_CUDA)
+  target_compile_definitions(io PRIVATE MAMBASERVE_WITH_CUDA=1)
+  target_link_libraries(io PRIVATE CUDA::cudart)
+endif()
 
 
 # Mamba2 Model specific library
@@ -103,7 +126,7 @@ target_link_libraries(runtime
 )
 
 file(GLOB_RECURSE OPS_CPU_SOURCES CONFIGURE_DEPENDS
-    "src/ops/cpu/*.cpp"
+    "src/ops/*.cpp"
 )
 add_library(ops_cpu ${OPS_CPU_SOURCES})
 target_link_libraries(ops_cpu
@@ -113,15 +136,52 @@ target_link_libraries(ops_cpu
         Eigen3::Eigen
 )
 
+if(MAMBASERVE_WITH_CUDA)
+    file(GLOB_RECURSE OPS_CUDA_SOURCES CONFIGURE_DEPENDS
+        "src/ops/cuda/*.cu"
+        "src/ops/gpu/*.cu"
+        "src/ops/*.cu"
+    )
+    # No CUDA_SEPARABLE_COMPILATION: cross-TU __device__ helpers live as inline
+    # in headers (see block_reductions.cuh). RDC was causing
+    # __cudaRegisterLinkedBinary link failures for app/tests.
+    add_library(ops_cuda ${OPS_CUDA_SOURCES})
+    target_link_libraries(ops_cuda
+        PUBLIC
+            mambaserve_common
+            core
+            Eigen3::Eigen
+            CUDA::cudart
+            CUDA::cublas
+    )
+    target_compile_options(ops_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>
+    )
+    if(TARGET core)
+      target_compile_options(core PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>
+      )
+    endif()
+endif()
+
 ## Umbrella facade for all the different ops implementation
 add_library(ops INTERFACE)
 target_link_libraries(ops INTERFACE ops_cpu)
+if(MAMBASERVE_WITH_CUDA)
+    target_link_libraries(ops INTERFACE ops_cuda)
+endif()
 
 option(BUILD_TESTING "Build unit tests" OFF)
 
 if(BUILD_TESTING)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+option(BUILD_BENCHMARKS "Build Google Benchmark binaries" OFF)
+
+if(BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
 
 add_executable(app

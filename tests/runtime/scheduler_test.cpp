@@ -121,8 +121,9 @@ StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const ModelConfig& cfg, int 
 // Deterministic runner: peaks logits at successive entries of `token_seq_`.
 class FakeRunner : public Runner {
 public:
-  FakeRunner(int vocab, std::vector<int32_t> token_seq)
-      : vocab_(vocab), token_seq_(std::move(token_seq)) {
+  FakeRunner(int vocab, std::vector<int32_t> token_seq, int overflow_after_decodes = -1)
+      : vocab_(vocab), token_seq_(std::move(token_seq)),
+        overflow_after_decodes_(overflow_after_decodes) {
     assert(!token_seq_.empty());
     auto alloc_or = create_device_allocator(Device::CPU, 0);
     assert(alloc_or.ok());
@@ -146,6 +147,10 @@ public:
     if (!cache.valid() || !live_.count(cache.id())) {
       return Status::InvalidArgument("invalid cache");
     }
+    if (overflow_after_decodes_ >= 0 && decode_calls_ >= overflow_after_decodes_) {
+      return Status::KvCacheOverflow("KV cache overflow");
+    }
+    ++decode_calls_;
     DecodeResult r;
     ASSIGN_OR_RETURN(r.logits, make_logits_peak_(vocab_, peak_token_()));
     ++step_;
@@ -184,6 +189,8 @@ private:
 
   int vocab_;
   std::vector<int32_t> token_seq_;
+  int overflow_after_decodes_ = -1;
+  int decode_calls_ = 0;
   size_t step_ = 0;
   int next_handle_ = 0;
   std::unordered_set<int> live_;
@@ -247,6 +254,32 @@ TEST(Scheduler, EmitsExactTokenSequence) {
   ASSERT_TRUE(out.ok()) << out.status().message();
   const std::vector<int32_t> expected = {3, 5, 2, 0};
   EXPECT_EQ(out.value(), expected);
+  EXPECT_FALSE(runner.has_live_caches());
+}
+
+TEST(Scheduler, ReturnsPartialOnKvCacheOverflow) {
+  FakeRunner runner(/*vocab=*/8, /*token_seq=*/{3, 5, 2, 1}, /*overflow_after_decodes=*/2);
+  Scheduler sched(runner);
+  GenerateParams params{.max_new_tokens = 8, .eos_id = 0};
+  std::vector<int32_t> prompt = {1};
+
+  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
+  ASSERT_TRUE(out.ok()) << out.status().message();
+  const std::vector<int32_t> expected = {3, 5, 2};
+  EXPECT_EQ(out.value(), expected);
+  EXPECT_FALSE(runner.has_live_caches());
+}
+
+TEST(Scheduler, ReturnsPrefillTokenWhenDecodeOverflowsImmediately) {
+  FakeRunner runner(/*vocab=*/8, /*token_seq=*/{4, 1}, /*overflow_after_decodes=*/0);
+  Scheduler sched(runner);
+  GenerateParams params{.max_new_tokens = 8, .eos_id = 0};
+  std::vector<int32_t> prompt = {1};
+
+  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
+  ASSERT_TRUE(out.ok()) << out.status().message();
+  ASSERT_EQ(out.value().size(), 1u);
+  EXPECT_EQ(out.value()[0], 4);
   EXPECT_FALSE(runner.has_live_caches());
 }
 

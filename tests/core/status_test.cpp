@@ -25,6 +25,16 @@ TEST(Status, ErrorFactoriesSetCodeAndMessage) {
   EXPECT_FALSE(oom.ok());
   EXPECT_EQ(oom.code(), Code::kOOM);
   EXPECT_EQ(oom.message(), "out of memory");
+
+  const Status kv = Status::KvCacheOverflow("KV cache overflow");
+  EXPECT_FALSE(kv.ok());
+  EXPECT_EQ(kv.code(), Code::kKvCacheOverflow);
+  EXPECT_EQ(kv.message(), "KV cache overflow");
+
+  const Status runtime = Status::RuntimeError("cublasCreate failed");
+  EXPECT_FALSE(runtime.ok());
+  EXPECT_EQ(runtime.code(), Code::kRuntimeError);
+  EXPECT_EQ(runtime.message(), "cublasCreate failed");
 }
 
 TEST(StatusOr, HoldsValue) {

@@ -1,0 +1,29 @@
+CompileFlags:
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - -ccbin=*
+    - --generate-code=*
+    - -rdc=true
+  Add:
+    - --cuda-gpu-arch=sm_50
+    - -DMAMBASERVE_WITH_CUDA=1
+
+Diagnostics:
+  UnusedIncludes: None
+  ClangTidy:
+    Remove: '*'
+---
+
+If:
+  PathMatch: .*\.cu
+CompileFlags:
+  Add:
+    - -std=c++17
+
+---
+
+If:
+  PathMatch: .*\.(cpp|h|hpp|cuh)
+CompileFlags:
+  Add:
+    - -std=c++20

@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 void CPUBackend::apply_rope_inplace_(float* q, float* k, int64_t T, int Hq, int Hkv, int Dh,
@@ -47,9 +48,9 @@ Status CPUBackend::attention_f32(const Tensor& normed_hidden, const AttnWeights&
                                  const AttnConfig& attn, const ScaleConfig* scales,
                                  int max_seq_length, int hidden_size, LayerCacheView& cache,
                                  int64_t past_len, Tensor& out) const {
-  if (Status s = require_f32_cpu(normed_hidden, "normed_hidden"); !s.ok())
+  if (Status s = require_f32(normed_hidden, "normed_hidden", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(out, "out"); !s.ok())
+  if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
     return s;
   if (cache.k.ptr == nullptr || cache.v.ptr == nullptr)
     return Status::InvalidArgument("attn cache view is null");
@@ -85,7 +86,7 @@ Status CPUBackend::attention_f32(const Tensor& normed_hidden, const AttnWeights&
     return Status::InvalidArgument("out shape must match hidden");
 
   if (past_len + T > max_seq_length)
-    return Status::InvalidArgument("KV cache overflow");
+    return Status::KvCacheOverflow("KV cache overflow");
 
   const size_t expect_kv =
       static_cast<size_t>(max_seq_length) * static_cast<size_t>(kv_dim) * sizeof(float);
@@ -101,9 +102,9 @@ Status CPUBackend::attention_f32(const Tensor& normed_hidden, const AttnWeights&
   if (w.o_proj.size() != 2 || w.o_proj.shape[0] != D || w.o_proj.shape[1] != q_dim)
     return Status::InvalidArgument("o_proj must be [D, Hq*Dh]");
 
-  StatusOr<Tensor> Q = linear(normed_hidden, w.q_proj);
-  StatusOr<Tensor> K = linear(normed_hidden, w.k_proj);
-  StatusOr<Tensor> V = linear(normed_hidden, w.v_proj);
+  StatusOr<Tensor> Q = ::linear(normed_hidden, w.q_proj);
+  StatusOr<Tensor> K = ::linear(normed_hidden, w.k_proj);
+  StatusOr<Tensor> V = ::linear(normed_hidden, w.v_proj);
   if (!Q.ok())
     return Status(Q.status());
   if (!K.ok())
@@ -282,11 +283,11 @@ Status CPUBackend::causal_conv1d_f32_(const float* x, int64_t T, int64_t conv_di
 
 Status CPUBackend::rms_norm_gated_f32_(Tensor& y, const Tensor& gate, const Tensor& weight,
                                        float eps) const {
-  if (Status s = require_f32_cpu(y, "y"); !s.ok())
+  if (Status s = require_f32(y, "y", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(gate, "gate"); !s.ok())
+  if (Status s = require_f32(gate, "gate", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(weight, "weight"); !s.ok())
+  if (Status s = require_f32(weight, "weight", Device::CPU); !s.ok())
     return s;
   if (!same_shape(y.shape, gate.shape)) {
     return Status::InvalidArgument("y and gate shape mismatch");
@@ -303,9 +304,9 @@ Status CPUBackend::rms_norm_gated_f32_(Tensor& y, const Tensor& gate, const Tens
 Status CPUBackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2MixerWeights& w,
                                     const SsmConfig& ssm, const ScaleConfig* scales,
                                     float rms_norm_eps, LayerCacheView& cache, Tensor& out) const {
-  if (Status s = require_f32_cpu(normed_hidden, "normed_hidden"); !s.ok())
+  if (Status s = require_f32(normed_hidden, "normed_hidden", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(out, "out"); !s.ok())
+  if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
     return s;
 
   int64_t T = 1;
@@ -369,7 +370,7 @@ Status CPUBackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mix
                 normed_hidden.buffer.bytes);
   }
 
-  StatusOr<Tensor> projected = linear(scaled_hidden.value(), w.in_proj);
+  StatusOr<Tensor> projected = ::linear(scaled_hidden.value(), w.in_proj);
   if (!projected.ok())
     return Status(projected.status());
 
@@ -489,9 +490,9 @@ Status CPUBackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mix
 Status CPUBackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, const MlpConfig& mlp,
                            const ScaleConfig* scales, Tensor& out) const {
   (void)mlp;
-  if (Status s = require_f32_cpu(normed_hidden, "normed_hidden"); !s.ok())
+  if (Status s = require_f32(normed_hidden, "normed_hidden", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(out, "out"); !s.ok())
+  if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
     return s;
   if (!same_shape(out.shape, normed_hidden.shape))
     return Status::InvalidArgument("out shape must match hidden");
@@ -499,8 +500,8 @@ Status CPUBackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, con
   const float gate_mult = scales ? scales->mlp[0] : 1.f;
   const float down_mult = scales ? scales->mlp[1] : 1.f;
 
-  StatusOr<Tensor> up = linear(normed_hidden, w.up_proj);
-  StatusOr<Tensor> gate = linear(normed_hidden, w.gate_proj);
+  StatusOr<Tensor> up = ::linear(normed_hidden, w.up_proj);
+  StatusOr<Tensor> gate = ::linear(normed_hidden, w.gate_proj);
   if (!up.ok())
     return Status(up.status());
   if (!gate.ok())
@@ -533,24 +534,71 @@ Status CPUBackend::add(const Tensor& a, const Tensor& b, Tensor& out) const {
 }
 
 Status CPUBackend::scale(Tensor& x, float s) const {
-  if (Status st = require_f32_cpu(x, "x"); !st.ok())
+  if (Status st = require_f32(x, "x", Device::CPU); !st.ok())
     return st;
   as_vec_f32(x) *= s;
   return Status::Ok();
 }
 
-const OpsBackend& cpu_ops() {
-  static const CPUBackend k;
-  return k;
+Status CPUBackend::linear(const Tensor& x, const Tensor& W, Tensor& out) const {
+  return ::linear(x, W, out);
 }
 
-const OpsBackend& ops_for(Device d) {
-  switch (d) {
-  case Device::CPU:
-    return cpu_ops();
-  case Device::GPU:
-  case Device::NA:
-  default:
-    std::abort();
+Status CPUBackend::embedding_lookup(const Tensor& table, const int32_t* tokens, int64_t n_tokens,
+                                    float scale, Tensor& out) const {
+  if (tokens == nullptr || n_tokens <= 0)
+    return Status::InvalidArgument("embedding_lookup requires at least one token");
+  if (Status s = require_f32(table, "table", Device::CPU); !s.ok())
+    return s;
+  if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
+    return s;
+  if (table.size() != 2)
+    return Status::InvalidArgument("embedding table must be rank 2 [vocab, hidden]");
+
+  const int64_t vocab = table.shape[0];
+  const int64_t hidden = table.shape[1];
+  if (out.size() != 2 || out.shape[0] != n_tokens || out.shape[1] != hidden) {
+    return Status::InvalidArgument("out shape must be [T, hidden]");
   }
+
+  const auto emb = as_mat_f32(table);
+  auto dest = as_mat_f32(out);
+  for (int64_t i = 0; i < n_tokens; ++i) {
+    const int32_t id = tokens[i];
+    if (id < 0 || static_cast<int64_t>(id) >= vocab)
+      return Status::InvalidArgument("token id out of range");
+    dest.row(static_cast<Eigen::Index>(i)) =
+        emb.row(static_cast<Eigen::Index>(id)) * scale;
+  }
+  return Status::Ok();
+}
+
+Status CPUBackend::take_last_row(const Tensor& hidden, Tensor& out) const {
+  if (Status s = require_f32(hidden, "hidden", Device::CPU); !s.ok())
+    return s;
+  if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
+    return s;
+  if (hidden.empty())
+    return Status::InvalidArgument("hidden is empty");
+
+  if (hidden.size() == 1) {
+    if (!same_shape(out.shape, hidden.shape))
+      return Status::InvalidArgument("out shape must match rank-1 hidden");
+    std::memcpy(out.buffer.ptr, hidden.buffer.ptr, hidden.buffer.bytes);
+    return Status::Ok();
+  }
+
+  int64_t rows = 0;
+  int64_t cols = 0;
+  ASSIGN_OR_RETURN(rows, hidden.rows());
+  ASSIGN_OR_RETURN(cols, hidden.cols());
+  if (rows <= 0)
+    return Status::InvalidArgument("hidden has no rows");
+  if (out.size() != 1 || out.shape[0] != cols)
+    return Status::InvalidArgument("out must be shape {H}");
+
+  const auto src = as_mat_f32(hidden);
+  auto dst = as_vec_f32(out);
+  dst = src.row(rows - 1);
+  return Status::Ok();
 }

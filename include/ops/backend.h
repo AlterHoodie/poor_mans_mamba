@@ -61,7 +61,20 @@ public:
   virtual Status rms_norm(const Tensor& x, const Tensor& weight, float eps, Tensor& out) const = 0;
   virtual Status add(const Tensor& a, const Tensor& b, Tensor& out) const = 0;
   virtual Status scale(Tensor& x, float s) const = 0;
+
+  // y = x @ W^T  with W stored as [N, K]
+  virtual Status linear(const Tensor& x, const Tensor& W, Tensor& out) const = 0;
+
+  // out [T, H] = scale * table[tokens[t]]
+  virtual Status embedding_lookup(const Tensor& table, const int32_t* tokens, int64_t n_tokens,
+                                  float scale, Tensor& out) const = 0;
+
+  // rank-1: copy hidden into out; rank-2 [T,H]: copy last row into out {H}
+  virtual Status take_last_row(const Tensor& hidden, Tensor& out) const = 0;
 };
 
 const OpsBackend& cpu_ops();
+#ifdef MAMBASERVE_WITH_CUDA
+const OpsBackend& cuda_ops();
+#endif
 const OpsBackend& ops_for(Device d);

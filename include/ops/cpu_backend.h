@@ -45,4 +45,11 @@ public:
   Status add(const Tensor& a, const Tensor& b, Tensor& out) const override;
 
   Status scale(Tensor& x, float s) const override;
+
+  Status linear(const Tensor& x, const Tensor& W, Tensor& out) const override;
+
+  Status embedding_lookup(const Tensor& table, const int32_t* tokens, int64_t n_tokens, float scale,
+                          Tensor& out) const override;
+
+  Status take_last_row(const Tensor& hidden, Tensor& out) const override;
 };

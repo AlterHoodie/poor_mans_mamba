@@ -4,10 +4,13 @@
 
 #include <iostream>
 #include <string>
+#include <string_view>
 
 int main(int argc, char** argv) {
   const std::string model_dir = (argc > 1) ? argv[1] : "models/mamba2-130m-hf";
   const int max_seq_length = (argc > 2) ? std::stoi(argv[2]) : 2048;
+  const Device device =
+      (argc > 3 && std::string_view(argv[3]) == "GPU") ? Device::GPU : Device::CPU;
 
   auto entry_or = ModelRegistry::lookup(model_dir);
   if (!entry_or.ok()) {
@@ -24,7 +27,7 @@ int main(int argc, char** argv) {
   const ModelConfig& cfg = *cfg_or.value();
 
   auto runner_or =
-      entry.create_runner(cfg, model_dir, Device::CPU, /*num_slots=*/10, /*device_id=*/0);
+      entry.create_runner(cfg, model_dir, device, /*num_slots=*/10, /*device_id=*/0);
   if (!runner_or.ok()) {
     std::cerr << runner_or.status().message() << '\n';
     return 1;
@@ -45,7 +48,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  GenerateParams params{.max_new_tokens = 8, .eos_id = cfg.eos_token_id};
+  GenerateParams params{.max_new_tokens = max_seq_length, .eos_id = cfg.eos_token_id};
   auto out = sched.generate(ids.value(), params);
   if (!out.ok()) {
     std::cerr << out.status().message() << '\n';

@@ -1,6 +1,11 @@
 #include "io/model_loader.h"
 
 #include <cstdint>
+#include <vector>
+
+#ifdef MAMBASERVE_WITH_CUDA
+#include <cuda_runtime.h>
+#endif
 
 namespace {
 
@@ -9,6 +14,24 @@ inline float bf16_bits_to_f32(uint16_t bits) {
   float out;
   std::memcpy(&out, &u, sizeof(out));
   return out;
+}
+
+Status host_to_device_f32(DeviceMemory& buffer, const void* host, size_t nbytes) {
+  if (buffer.device == Device::CPU) {
+    std::memcpy(buffer.ptr, host, nbytes);
+    return Status::Ok();
+  }
+#ifdef MAMBASERVE_WITH_CUDA
+  if (buffer.device == Device::GPU) {
+    cudaError_t err = cudaMemcpy(buffer.ptr, host, nbytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      return Status::RuntimeError(std::string("cudaMemcpy H2D failed: ") +
+                                     cudaGetErrorString(err));
+    }
+    return Status::Ok();
+  }
+#endif
+  return Status::InvalidArgument("unsupported device for weight copy");
 }
 
 } // namespace
@@ -57,12 +80,15 @@ Status copy_tensor_f32(const safetensors::safetensors_t& st, const std::string& 
   ASSIGN_OR_RETURN(buffer, a->allocate(nbytes_dst));
 
   if (is_f32) {
-    std::memcpy(buffer.ptr, base + start, nbytes_src);
+    if (Status s = host_to_device_f32(buffer, base + start, nbytes_src); !s.ok())
+      return s;
   } else {
+    std::vector<float> host(numel);
     const auto* src = reinterpret_cast<const uint16_t*>(base + start);
-    auto* dst = static_cast<float*>(buffer.ptr);
     for (size_t i = 0; i < numel; ++i)
-      dst[i] = bf16_bits_to_f32(src[i]);
+      host[i] = bf16_bits_to_f32(src[i]);
+    if (Status s = host_to_device_f32(buffer, host.data(), nbytes_dst); !s.ok())
+      return s;
   }
 
   out.shape.clear();

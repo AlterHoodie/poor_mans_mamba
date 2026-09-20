@@ -1,10 +1,10 @@
 #include "runtime/runner/mamba2_runner.h"
 
-#include "ops/cpu/linear.h"
-#include "ops/cpu/map.h"
+#include "ops/common/shapes.h"
+#include "ops/common/tensor_checks.h"
 
-#include <cstring>
 #include <utility>
+#include <vector>
 
 Mamba2Runner::~Mamba2Runner() = default;
 
@@ -55,14 +55,10 @@ StatusOr<Tensor> Mamba2Runner::embed_(std::span<const int32_t> tokens) {
   if (tokens.empty()) {
     return Status::InvalidArgument("embed requires at least one token");
   }
-  if (Status s = require_f32_cpu(weights_.embeddings, "embeddings"); !s.ok()) {
-    return s;
-  }
   if (weights_.embeddings.size() != 2) {
     return Status::InvalidArgument("embeddings must be rank 2 [vocab, hidden]");
   }
 
-  const int64_t vocab = weights_.embeddings.shape[0];
   const int64_t hidden = weights_.embeddings.shape[1];
   if (hidden != cfg_.hidden_size) {
     return Status::InvalidArgument("embeddings hidden dim mismatch with config");
@@ -72,15 +68,11 @@ StatusOr<Tensor> Mamba2Runner::embed_(std::span<const int32_t> tokens) {
   if (!out.ok())
     return Status(out.status());
 
-  const auto emb = as_mat_f32(weights_.embeddings);
-  auto dest = as_mat_f32(out.value());
-
-  for (size_t i = 0; i < tokens.size(); ++i) {
-    const int32_t id = tokens[i];
-    if (id < 0 || static_cast<int64_t>(id) >= vocab) {
-      return Status::InvalidArgument("token id out of range");
-    }
-    dest.row(static_cast<Eigen::Index>(i)) = emb.row(static_cast<Eigen::Index>(id));
+  if (Status s = ops_->embedding_lookup(weights_.embeddings, tokens.data(),
+                                        static_cast<int64_t>(tokens.size()), /*scale=*/1.f,
+                                        out.value());
+      !s.ok()) {
+    return s;
   }
   return std::move(out.value());
 }
@@ -93,28 +85,20 @@ StatusOr<Tensor> Mamba2Runner::last_token_hidden_(const Tensor& hidden) const {
   if (hidden.empty())
     return Status::InvalidArgument("hidden is empty");
 
+  std::vector<int64_t> out_shape;
   if (hidden.size() == 1) {
-    StatusOr<Tensor> copy = allocate_f32_tensor(hidden.shape);
-    if (!copy.ok())
-      return Status(copy.status());
-    std::memcpy(copy.value().buffer.ptr, hidden.buffer.ptr, hidden.buffer.bytes);
-    return std::move(copy.value());
+    out_shape = hidden.shape;
+  } else {
+    int64_t cols = 0;
+    ASSIGN_OR_RETURN(cols, hidden.cols());
+    out_shape = {cols};
   }
 
-  int64_t rows = 0;
-  int64_t cols = 0;
-  ASSIGN_OR_RETURN(rows, hidden.rows());
-  ASSIGN_OR_RETURN(cols, hidden.cols());
-  if (rows <= 0)
-    return Status::InvalidArgument("hidden has no rows");
-
-  StatusOr<Tensor> last = allocate_f32_tensor({cols});
+  StatusOr<Tensor> last = allocate_f32_tensor(std::move(out_shape));
   if (!last.ok())
     return Status(last.status());
-
-  const auto src = as_mat_f32(hidden);
-  auto dst = as_vec_f32(last.value());
-  dst = src.row(rows - 1);
+  if (Status s = ops_->take_last_row(hidden, last.value()); !s.ok())
+    return s;
   return std::move(last.value());
 }
 
@@ -124,7 +108,16 @@ StatusOr<Tensor> Mamba2Runner::lm_head_(const Tensor& hidden) {
     return Status(last.status());
 
   const Tensor& weight = weights_.lm_head.has_value() ? *weights_.lm_head : weights_.embeddings;
-  return linear(last.value(), weight);
+  StatusOr<std::vector<int64_t>> out_shape = linear_output_shape(last.value(), weight);
+  if (!out_shape.ok())
+    return Status(out_shape.status());
+
+  StatusOr<Tensor> logits = allocate_f32_tensor(std::move(out_shape.value()));
+  if (!logits.ok())
+    return Status(logits.status());
+  if (Status s = ops_->linear(last.value(), weight, logits.value()); !s.ok())
+    return s;
+  return std::move(logits.value());
 }
 
 StatusOr<Tensor> Mamba2Runner::forward_hidden_(const CacheHandle& cache, Tensor hidden,

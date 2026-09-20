@@ -21,8 +21,9 @@ private:
 public:
   explicit Scheduler(Runner& runner) : runner_(runner) {}
 
-  // Sync greedy generate: prefill → decode until EOS or max_new_tokens → release.
-  // Returns only newly generated token ids (not the prompt).
+  // Sync greedy generate: prefill → decode until EOS, max_new_tokens, or KV
+  // cache overflow → release. Returns only newly generated token ids (not the
+  // prompt). Overflow returns tokens produced so far instead of failing.
   StatusOr<std::vector<int32_t>> generate(std::span<const int32_t> tokens,
                                           const GenerateParams& params);
 };

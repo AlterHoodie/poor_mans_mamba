@@ -63,14 +63,18 @@ Status CPUAllocator::memset_zero(DeviceMemory& mem, size_t offset, size_t bytes)
 StatusOr<std::unique_ptr<DeviceAllocator>> create_device_allocator(Device device, int device_id) {
   if (device == Device::NA)
     return Status::InvalidArgument("Invalid Device Argument");
-  if (device == Device::GPU)
-    return Status::InvalidArgument("Not yet implemented");
   if (device_id < 0)
     return Status::InvalidArgument("device_id cannot be less than 0");
 
-  std::unique_ptr<DeviceAllocator> allocator = std::make_unique<CPUAllocator>(device_id);
+  if (device == Device::GPU) {
+#ifdef MAMBASERVE_WITH_CUDA
+    return std::unique_ptr<DeviceAllocator>(std::make_unique<CUDAAllocator>(device_id));
+#else
+    return Status::InvalidArgument("GPU requested but build lacks MAMBASERVE_WITH_CUDA");
+#endif
+  }
 
-  return allocator;
+  return std::unique_ptr<DeviceAllocator>(std::make_unique<CPUAllocator>(device_id));
 }
 
 DeviceMemory::DeviceMemory(DeviceMemory&& mem) noexcept

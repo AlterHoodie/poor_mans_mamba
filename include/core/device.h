@@ -50,16 +50,21 @@ class CPUAllocator : public DeviceAllocator {
 public:
   explicit CPUAllocator(int device_id) : DeviceAllocator(Device::CPU, device_id){};
 
-  StatusOr<DeviceMemory> allocate(size_t bytes) final override;
+  StatusOr<DeviceMemory> allocate(size_t bytes) final;
 
-  Status free(DeviceMemory& mem) final override;
-  Status memset_zero(DeviceMemory& mem, size_t offset, size_t bytes) final override;
+  Status free(DeviceMemory& mem) final;
+  Status memset_zero(DeviceMemory& mem, size_t offset, size_t bytes) final;
 };
 
-StatusOr<std::unique_ptr<DeviceAllocator>> create_device_allocator(Device device, int device_id);
+class CUDAAllocator : public DeviceAllocator{
+  public:
+    explicit CUDAAllocator(int device_id) : DeviceAllocator(Device::GPU, device_id){};
 
-DeviceAllocator* current_allocator();
-void set_current_allocator(DeviceAllocator* a);
+    StatusOr<DeviceMemory> allocate(size_t bytes) final;
+
+    Status free(DeviceMemory& mem) final;
+    Status memset_zero(DeviceMemory& mem, size_t offset, size_t bytes) final;
+};
 
 struct AllocatorScope {
   DeviceAllocator* prev;
@@ -69,3 +74,8 @@ struct AllocatorScope {
   AllocatorScope(const AllocatorScope&) = delete;
   AllocatorScope& operator=(const AllocatorScope&) = delete;
 };
+
+StatusOr<std::unique_ptr<DeviceAllocator>> create_device_allocator(Device device, int device_id);
+
+DeviceAllocator* current_allocator();
+void set_current_allocator(DeviceAllocator* a);

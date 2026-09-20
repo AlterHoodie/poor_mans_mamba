@@ -1,47 +1,16 @@
 #include "ops/cpu/linear.h"
 
-#include <cstdlib>
-#include <string>
+#include "ops/common/shapes.h"
+
 #include <utility>
 #include <vector>
 
-namespace {
-
-// a: [..., K], b: [N, K] -> [..., N]
-StatusOr<std::vector<int64_t>> linear_output_shape(const Tensor& a, const Tensor& b) {
-  if (a.size() < 1)
-    return Status::InvalidArgument("a must have rank >= 1");
-  if (b.size() != 2)
-    return Status::InvalidArgument("b must be rank 2");
-
-  int64_t k_a = 0;
-  int64_t n_b = 0;
-  int64_t k_b = 0;
-  ASSIGN_OR_RETURN(k_a, a.last_dim());
-  n_b = b.shape[0];
-  k_b = b.shape[1];
-
-  if (k_a != k_b) {
-    return Status::InvalidArgument("inner dim mismatch: a.last=" + std::to_string(k_a) +
-                                   " b.cols=" + std::to_string(k_b));
-  }
-  if (n_b <= 0 || k_b <= 0) {
-    return Status::InvalidArgument("b dims must be positive");
-  }
-
-  std::vector<int64_t> out_shape = a.shape;
-  out_shape.back() = n_b;
-  return out_shape;
-}
-
-} // namespace
-
 Status linear(const Tensor& a, const Tensor& b, Tensor& out) {
-  if (Status s = require_f32_cpu(a, "a"); !s.ok())
+  if (Status s = require_f32(a, "a", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(b, "b"); !s.ok())
+  if (Status s = require_f32(b, "b", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(out, "out"); !s.ok())
+  if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
     return s;
 
   StatusOr<std::vector<int64_t>> expected_shape = linear_output_shape(a, b);

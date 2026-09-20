@@ -15,11 +15,11 @@ template <typename Derived> struct BinarySameShapeOp {
 
 protected:
   static Status validate_binary_same_shape(const Tensor& a, const Tensor& b, Tensor& out) {
-    if (Status s = require_f32_cpu(a, "a"); !s.ok())
+    if (Status s = require_f32(a, "a", Device::CPU); !s.ok())
       return s;
-    if (Status s = require_f32_cpu(b, "b"); !s.ok())
+    if (Status s = require_f32(b, "b", Device::CPU); !s.ok())
       return s;
-    if (Status s = require_f32_cpu(out, "out"); !s.ok())
+    if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
       return s;
     if (!same_shape(a.shape, b.shape)) {
       return Status::InvalidArgument("shape mismatch between a and b");
@@ -46,9 +46,9 @@ template <typename Derived> struct UnarySameShapeOp {
 
 protected:
   static Status validate_unary_same_shape(const Tensor& a, Tensor& out) {
-    if (Status s = require_f32_cpu(a, "a"); !s.ok())
+    if (Status s = require_f32(a, "a", Device::CPU); !s.ok())
       return s;
-    if (Status s = require_f32_cpu(out, "out"); !s.ok())
+    if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
       return s;
     if (!same_shape(out.shape, a.shape)) {
       return Status::InvalidArgument("out shape does not match unary element-wise result");

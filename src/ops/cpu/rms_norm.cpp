@@ -1,36 +1,12 @@
 #include "ops/cpu/rms_norm.h"
 
+#include "ops/common/shapes.h"
 #include "ops/cpu/map.h"
 
 #include <cmath>
 #include <utility>
 
 namespace {
-
-Status validate_rms_norm_shapes(const Tensor& x, const Tensor& weight, const Tensor& out) {
-  if (x.size() < 1)
-    return Status::InvalidArgument("x must have rank >= 1");
-
-  int64_t dim = 0;
-  ASSIGN_OR_RETURN(dim, x.last_dim());
-
-  int64_t weight_numel = 0;
-  ASSIGN_OR_RETURN(weight_numel, weight.numel());
-  if (weight_numel != dim) {
-    return Status::InvalidArgument("weight numel must match x last dim");
-  }
-
-  if (!same_shape(out.shape, x.shape)) {
-    return Status::InvalidArgument("out shape must match x");
-  }
-
-  int64_t out_numel = 0;
-  ASSIGN_OR_RETURN(out_numel, out.numel());
-  if (out.buffer.bytes < static_cast<size_t>(out_numel) * sizeof(float)) {
-    return Status::InvalidArgument("out buffer is too small");
-  }
-  return Status::Ok();
-}
 
 void normalize_row(Eigen::Ref<const Eigen::RowVectorXf> x_row, Eigen::Ref<Eigen::RowVectorXf> y_row,
                    Eigen::Ref<const Eigen::VectorXf> weight, float eps) {
@@ -83,11 +59,11 @@ Status compute_rms_norm_inplace(Tensor& x, const Tensor& weight, float eps) {
 } // namespace
 
 Status rms_norm(const Tensor& x, const Tensor& weight, float eps, Tensor& out) {
-  if (Status s = require_f32_cpu(x, "x"); !s.ok())
+  if (Status s = require_f32(x, "x", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(weight, "weight"); !s.ok())
+  if (Status s = require_f32(weight, "weight", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(out, "out"); !s.ok())
+  if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
     return s;
   if (Status s = validate_rms_norm_shapes(x, weight, out); !s.ok())
     return s;
@@ -110,9 +86,9 @@ StatusOr<Tensor> rms_norm(const Tensor& x, const Tensor& weight, float eps) {
 }
 
 Status rms_norm_inplace(Tensor& x, const Tensor& weight, float eps) {
-  if (Status s = require_f32_cpu(x, "x"); !s.ok())
+  if (Status s = require_f32(x, "x", Device::CPU); !s.ok())
     return s;
-  if (Status s = require_f32_cpu(weight, "weight"); !s.ok())
+  if (Status s = require_f32(weight, "weight", Device::CPU); !s.ok())
     return s;
 
   int64_t dim = 0;

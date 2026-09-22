@@ -3,7 +3,7 @@
 #include <cassert>
 #include <string>
 
-enum class Code { kOk, kNotFound, kInvalidArgument, kOOM, kKvCacheOverflow, kRuntimeError };
+enum class Code { kOk, kNotFound, kInvalidArgument, kOOM, kKvCacheOverflow, kRuntimeError, kNotImplemented };
 
 class Status {
 private:
@@ -24,6 +24,9 @@ public:
   }
   static Status RuntimeError(std::string msg) {
     return Status(Code::kRuntimeError, std::move(msg));
+  }
+  static Status NotImplemented(std::string msg){
+    return Status(Code::kNotImplemented, std::move(msg));
   }
 
   bool ok() const { return code_ == Code::kOk; }

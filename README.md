@@ -60,6 +60,8 @@ Pure Mamba has fixed-size recurrent state: convolution state plus SSM state. Hyb
                     +------------------+
 ```
 
+Design notes for the cluster scheduler / workers / transports: [docs/cluster_runtime.md](docs/cluster_runtime.md).
+
 ## Metrics
 
 The generate harness (`benchmarks/generate_bench.cpp`, target `benches`) reports:

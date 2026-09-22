@@ -3,3 +3,5 @@ models/
 build*/
 compile_commands.json
 .cache
+
+docs/

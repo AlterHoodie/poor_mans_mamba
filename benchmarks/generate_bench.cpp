@@ -2,6 +2,8 @@
 #include "core/status.h"
 #include "core/tensor.h"
 #include "ops/cpu/reductions.h"
+#include "runtime/cache/cache_layout.h"
+#include "runtime/cache/cache_pool.h"
 #include "runtime/model_registry.h"
 #include "runtime/runner/runner.h"
 
@@ -33,6 +35,8 @@ struct BenchConfig {
 };
 
 BenchConfig g_cfg;
+std::unique_ptr<DeviceAllocator> g_alloc;
+std::unique_ptr<CachePool> g_pool;
 std::unique_ptr<Runner> g_runner;
 ModelConfig g_model_cfg;
 int32_t g_fill_token = 0;
@@ -161,22 +165,18 @@ bool parse_args(int argc, char** argv, BenchConfig& cfg, int& bench_argc,
   return true;
 }
 
-StatusOr<std::unique_ptr<Runner>> load_runner(const BenchConfig& cfg) {
+Status load_model(const BenchConfig& cfg) {
 #ifndef MAMBASERVE_WITH_CUDA
   if (cfg.device == Device::GPU) {
     return Status::InvalidArgument("GPU requested but build lacks MAMBASERVE_WITH_CUDA");
   }
 #endif
 
-  auto entry_or = ModelRegistry::lookup(cfg.model_dir);
+  auto entry_or = ModelRegistry::open(cfg.model_dir, kMaxSeqLength);
   if (!entry_or.ok())
-    return Status(entry_or.status());
-  const ModelEntry& entry = *entry_or.value();
-
-  auto cfg_or = entry.parse(cfg.model_dir, kMaxSeqLength);
-  if (!cfg_or.ok())
-    return Status(cfg_or.status());
-  g_model_cfg = *cfg_or.value();
+    return entry_or.status();
+  ModelEntry entry = std::move(entry_or.value());
+  g_model_cfg = *entry.cfg;
 
   g_fill_token = g_model_cfg.bos_token_id;
   if (g_fill_token < 0)
@@ -184,8 +184,21 @@ StatusOr<std::unique_ptr<Runner>> load_runner(const BenchConfig& cfg) {
   if (g_fill_token < 0)
     g_fill_token = 0;
 
-  return entry.create_runner(g_model_cfg, cfg.model_dir, cfg.device, /*num_slots=*/1,
-                             /*device_id=*/0);
+  auto alloc_or = create_device_allocator(cfg.device, /*device_id=*/0);
+  if (!alloc_or.ok())
+    return alloc_or.status();
+  g_alloc = std::move(alloc_or.value());
+
+  auto runner_or = entry.create_runner(*g_alloc);
+  if (!runner_or.ok())
+    return runner_or.status();
+  g_runner = std::move(runner_or.value());
+
+  auto pool_or = create_cache_pool(g_model_cfg, g_alloc.get(), /*num_slots=*/1, create_cache_layout);
+  if (!pool_or.ok())
+    return pool_or.status();
+  g_pool = std::move(pool_or.value());
+  return Status::Ok();
 }
 
 void BM_Prefill(benchmark::State& state) {
@@ -198,20 +211,37 @@ void BM_Prefill(benchmark::State& state) {
   const auto prompt = make_prompt(prompt_len);
 
   for (auto _ : state) {
+    StatusOr<CacheHandle> handle_or = g_pool->acquire();
+    if (!handle_or.ok()) {
+      state.SkipWithError(handle_or.status().message().c_str());
+      return;
+    }
+    CacheHandle handle = std::move(handle_or.value());
+    StatusOr<std::span<LayerCacheView>> layers = g_pool->layer_views(handle);
+    if (!layers.ok()) {
+      (void)g_pool->release(handle);
+      state.SkipWithError(layers.status().message().c_str());
+      return;
+    }
+
     sync_device();
     const auto t0 = Clock::now();
-    StatusOr<PrefillResult> pref = g_runner->prefill(prompt);
+    StatusOr<Tensor> pref = [&]() -> StatusOr<Tensor> {
+      AllocatorScope scope(g_alloc.get());
+      return g_runner->prefill(prompt, layers.value());
+    }();
     sync_device();
     if (!pref.ok()) {
+      (void)g_pool->release(handle);
       state.SkipWithError(pref.status().message().c_str());
       return;
     }
 
-    StatusOr<int32_t> tok = sample_token(pref.value().logits);
+    StatusOr<int32_t> tok = sample_token(pref.value());
     sync_device();
     const auto t1 = Clock::now();
     if (!tok.ok()) {
-      (void)g_runner->release(pref.value().cache);
+      (void)g_pool->release(handle);
       state.SkipWithError(tok.status().message().c_str());
       return;
     }
@@ -226,7 +256,7 @@ void BM_Prefill(benchmark::State& state) {
     benchmark::DoNotOptimize(tok.value());
 
     state.PauseTiming();
-    if (Status s = g_runner->release(pref.value().cache); !s.ok()) {
+    if (Status s = g_pool->release(handle); !s.ok()) {
       state.SkipWithError(s.message().c_str());
       return;
     }
@@ -254,21 +284,38 @@ void BM_Generate(benchmark::State& state) {
     std::vector<double> itls;
     itls.reserve(static_cast<size_t>(std::max<int64_t>(0, gen_len - 1)));
 
+    StatusOr<CacheHandle> handle_or = g_pool->acquire();
+    if (!handle_or.ok()) {
+      state.SkipWithError(handle_or.status().message().c_str());
+      return;
+    }
+    CacheHandle handle = std::move(handle_or.value());
+    StatusOr<std::span<LayerCacheView>> layers = g_pool->layer_views(handle);
+    if (!layers.ok()) {
+      (void)g_pool->release(handle);
+      state.SkipWithError(layers.status().message().c_str());
+      return;
+    }
+
     sync_device();
     const auto t_start = Clock::now();
 
-    StatusOr<PrefillResult> pref = g_runner->prefill(prompt);
+    StatusOr<Tensor> pref = [&]() -> StatusOr<Tensor> {
+      AllocatorScope scope(g_alloc.get());
+      return g_runner->prefill(prompt, layers.value());
+    }();
     sync_device();
     if (!pref.ok()) {
+      (void)g_pool->release(handle);
       state.SkipWithError(pref.status().message().c_str());
       return;
     }
 
-    StatusOr<int32_t> token = sample_token(pref.value().logits);
+    StatusOr<int32_t> token = sample_token(pref.value());
     sync_device();
     const auto t_ttft = Clock::now();
     if (!token.ok()) {
-      (void)g_runner->release(pref.value().cache);
+      (void)g_pool->release(handle);
       state.SkipWithError(token.status().message().c_str());
       return;
     }
@@ -276,21 +323,25 @@ void BM_Generate(benchmark::State& state) {
     const double ttft_s = elapsed_s(t_start, t_ttft);
     int32_t cur = token.value();
     double decode_s = 0.0;
+    (void)g_pool->set_seq_len(handle, prompt_len);
 
     for (int64_t i = 1; i < gen_len; ++i) {
       const auto t0 = Clock::now();
-      StatusOr<DecodeResult> dec = g_runner->decode(pref.value().cache, cur);
+      StatusOr<Tensor> dec = [&]() -> StatusOr<Tensor> {
+        AllocatorScope scope(g_alloc.get());
+        return g_runner->decode(cur, layers.value());
+      }();
       sync_device();
       if (!dec.ok()) {
-        (void)g_runner->release(pref.value().cache);
+        (void)g_pool->release(handle);
         state.SkipWithError(dec.status().message().c_str());
         return;
       }
-      StatusOr<int32_t> next = sample_token(dec.value().logits);
+      StatusOr<int32_t> next = sample_token(dec.value());
       sync_device();
       const auto t1 = Clock::now();
       if (!next.ok()) {
-        (void)g_runner->release(pref.value().cache);
+        (void)g_pool->release(handle);
         state.SkipWithError(next.status().message().c_str());
         return;
       }
@@ -298,6 +349,7 @@ void BM_Generate(benchmark::State& state) {
       itls.push_back(step_s);
       decode_s += step_s;
       cur = next.value();
+      (void)g_pool->set_seq_len(handle, prompt_len + i);
     }
 
     const double e2e_s = ttft_s + decode_s;
@@ -321,7 +373,7 @@ void BM_Generate(benchmark::State& state) {
     benchmark::DoNotOptimize(cur);
 
     state.PauseTiming();
-    if (Status s = g_runner->release(pref.value().cache); !s.ok()) {
+    if (Status s = g_pool->release(handle); !s.ok()) {
       state.SkipWithError(s.message().c_str());
       return;
     }
@@ -363,12 +415,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto runner_or = load_runner(g_cfg);
-  if (!runner_or.ok()) {
-    std::cerr << "failed to load runner: " << runner_or.status().message() << '\n';
+  if (Status s = load_model(g_cfg); !s.ok()) {
+    std::cerr << "failed to load model: " << s.message() << '\n';
     return 1;
   }
-  g_runner = std::move(runner_or.value());
 
   std::cout << "model_dir=" << g_cfg.model_dir
             << " device=" << (g_cfg.device == Device::GPU ? "GPU" : "CPU")

@@ -1,4 +1,5 @@
 #include "runtime/cache/cache_pool.h"
+#include "runtime/cache/cache_layout.h"
 
 #include <cstring>
 #include <limits>
@@ -188,4 +189,19 @@ Status CachePool::set_seq_len(const CacheHandle& handle, int64_t len) {
   }
   slots_[static_cast<size_t>(slot_id)].seq_len = len;
   return Status::Ok();
+}
+
+
+StatusOr<std::span<LayerCacheView>> CachePool::layer_views(const CacheHandle& handle){
+  if (!handle.valid())
+    return Status::InvalidArgument("invalid cache handle");
+
+  const int slot_id = handle.id();
+  if (static_cast<size_t>(slot_id) >= slots_.size() ||
+      !slots_[static_cast<size_t>(slot_id)].in_use) {
+    return Status::InvalidArgument("Slot is not in use");
+  }
+
+  auto& views = slots_[static_cast<size_t>(slot_id)].views;
+  return std::span<LayerCacheView>{views.data(), views.size()};
 }

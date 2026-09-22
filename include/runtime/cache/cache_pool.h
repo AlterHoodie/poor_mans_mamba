@@ -6,6 +6,7 @@
 #include "runtime/cache/cache_layout.h"
 
 #include <memory>
+#include <span>
 
 // Opaque handle into CachePool. Pass this instead of raw pointers.
 struct CacheHandle {
@@ -60,6 +61,7 @@ public:
   Status reset(CacheHandle& handle);   // zero state, keep lease
 
   StatusOr<LayerCacheView> layer_view(const CacheHandle& handle, int layer) const;
+  StatusOr<std::span<LayerCacheView>> layer_views(const CacheHandle& handle);
 
   StatusOr<int64_t> seq_len(const CacheHandle& handle) const;
   Status set_seq_len(const CacheHandle& handle, int64_t len);

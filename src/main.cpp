@@ -1,8 +1,11 @@
+#include "core/device.h"
+#include "runtime/cache/cache_layout.h"
+#include "runtime/cache/cache_pool.h"
 #include "runtime/model_registry.h"
-#include "runtime/scheduler.h"
 #include "runtime/tokenizer.h"
 
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -12,34 +15,41 @@ int main(int argc, char** argv) {
   const Device device =
       (argc > 3 && std::string_view(argv[3]) == "GPU") ? Device::GPU : Device::CPU;
 
-  auto entry_or = ModelRegistry::lookup(model_dir);
+  auto entry_or = ModelRegistry::open(model_dir, max_seq_length);
   if (!entry_or.ok()) {
     std::cerr << entry_or.status().message() << '\n';
     return 1;
   }
-  const ModelEntry& entry = *entry_or.value();
+  ModelEntry entry = std::move(entry_or.value());
+  const ModelConfig& cfg = *entry.cfg;
 
-  auto cfg_or = entry.parse(model_dir, max_seq_length);
-  if (!cfg_or.ok()) {
-    std::cerr << cfg_or.status().message() << '\n';
+  std::unique_ptr<DeviceAllocator> alloc;
+  auto alloc_or = create_device_allocator(device, /*device_id=*/0);
+  if (!alloc_or.ok()) {
+    std::cerr << alloc_or.status().message() << '\n';
     return 1;
   }
-  const ModelConfig& cfg = *cfg_or.value();
+  alloc = std::move(alloc_or.value());
 
-  auto runner_or =
-      entry.create_runner(cfg, model_dir, device, /*num_slots=*/10, /*device_id=*/0);
+  auto runner_or = entry.create_runner(*alloc);
   if (!runner_or.ok()) {
     std::cerr << runner_or.status().message() << '\n';
     return 1;
   }
   std::unique_ptr<Runner> runner = std::move(runner_or.value());
 
+  auto pool_or = create_cache_pool(cfg, alloc.get(), /*num_slots=*/10, create_cache_layout);
+  if (!pool_or.ok()) {
+    std::cerr << pool_or.status().message() << '\n';
+    return 1;
+  }
+  std::unique_ptr<CachePool> pool = std::move(pool_or.value());
+
   std::cout << "model_type=" << cfg.model_type << '\n'
             << "layers=" << cfg.num_hidden_layers << '\n'
             << "hidden_size=" << cfg.hidden_size << '\n';
 
   Tokenizer tokenizer(cfg, model_dir);
-  Scheduler sched(*runner);
 
   std::string prompt = "Hi How are you?";
   auto ids = tokenizer.encode(prompt);
@@ -48,19 +58,29 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  GenerateParams params{.max_new_tokens = max_seq_length, .eos_id = cfg.eos_token_id};
-  auto out = sched.generate(ids.value(), params);
-  if (!out.ok()) {
-    std::cerr << out.status().message() << '\n';
+  auto handle_or = pool->acquire();
+  if (!handle_or.ok()) {
+    std::cerr << handle_or.status().message() << '\n';
+    return 1;
+  }
+  CacheHandle handle = std::move(handle_or.value());
+
+  auto layers_or = pool->layer_views(handle);
+  if (!layers_or.ok()) {
+    std::cerr << layers_or.status().message() << '\n';
     return 1;
   }
 
-  auto text = tokenizer.decode(out.value());
-  if (!text.ok()) {
-    std::cerr << text.status().message() << '\n';
+  auto logits_or = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    return runner->prefill(ids.value(), layers_or.value());
+  }();
+  if (!logits_or.ok()) {
+    std::cerr << logits_or.status().message() << '\n';
     return 1;
   }
 
-  std::cout << "Generated Text \n" << text.value() << '\n';
+  std::cout << "prefill ok; logits rank=" << logits_or.value().shape.size() << '\n';
+  (void)pool->release(handle);
   return 0;
 }

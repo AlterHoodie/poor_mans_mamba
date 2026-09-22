@@ -2,6 +2,7 @@
 
 #include "ops/common/shapes.h"
 #include "ops/common/tensor_checks.h"
+#include "runtime/cache/cache_layout.h"
 
 #include <cstring>
 #include <utility>
@@ -9,11 +10,8 @@
 
 FalconH1Runner::~FalconH1Runner() = default;
 
-FalconH1Runner::FalconH1Runner(ModelConfig cfg, FalconH1Weights weights,
-                               std::unique_ptr<CachePool> pool,
-                               std::unique_ptr<DeviceAllocator> alloc, const OpsBackend& ops)
-    : alloc_(std::move(alloc)), ops_(&ops), cfg_(std::move(cfg)), weights_(std::move(weights)),
-      pool_(std::move(pool)) {}
+FalconH1Runner::FalconH1Runner(ModelConfig cfg, FalconH1Weights weights, const OpsBackend& ops)
+    : ops_(&ops), cfg_(std::move(cfg)), weights_(std::move(weights)) {}
 
 Status FalconH1Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tensor& hidden,
                                       int64_t past_len) {
@@ -179,18 +177,11 @@ StatusOr<Tensor> FalconH1Runner::lm_head_(const Tensor& hidden) {
   return std::move(logits.value());
 }
 
-StatusOr<Tensor> FalconH1Runner::forward_hidden_(const CacheHandle& cache, Tensor hidden,
+StatusOr<Tensor> FalconH1Runner::forward_hidden_(std::span<LayerCacheView> layers, Tensor& hidden,
                                                  int64_t past_len) {
-  if (!cache.valid())
-    return Status::InvalidArgument("invalid cache handle");
-  if (!pool_)
-    return Status::InvalidArgument("cache pool is not initialized");
 
   for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-    StatusOr<LayerCacheView> view = pool_->layer_view(cache, i);
-    if (!view.ok())
-      return Status(view.status());
-    if (Status s = block_forward_(i, view.value(), hidden, past_len); !s.ok())
+    if (Status s = block_forward_(i, layers[i], hidden, past_len); !s.ok())
       return s;
   }
 
@@ -199,85 +190,32 @@ StatusOr<Tensor> FalconH1Runner::forward_hidden_(const CacheHandle& cache, Tenso
   return std::move(hidden);
 }
 
-StatusOr<PrefillResult> FalconH1Runner::prefill(std::span<const int32_t> tokens) {
-  if (!pool_)
-    return Status::InvalidArgument("cache pool is not initialized");
-  if (!alloc_)
-    return Status::InvalidArgument("allocator is not initialized");
+StatusOr<Tensor> FalconH1Runner::prefill(std::span<const int32_t> tokens, std::span<LayerCacheView> layers) {
 
-  AllocatorScope scope(alloc_.get());
+  Tensor hidden;
+  ASSIGN_OR_RETURN(hidden, embed_(tokens));
 
-  PrefillResult result;
-  ASSIGN_OR_RETURN(result.cache, pool_->acquire());
+  Tensor normalized;
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, 0));
 
-  StatusOr<Tensor> hidden = embed_(tokens);
-  if (!hidden.ok()) {
-    (void)pool_->release(result.cache);
-    return Status(hidden.status());
-  }
-
-  const int64_t past_len = 0;
-  StatusOr<Tensor> normalized = forward_hidden_(result.cache, std::move(hidden.value()), past_len);
-  if (!normalized.ok()) {
-    (void)pool_->release(result.cache);
-    return Status(normalized.status());
-  }
-
-  if (Status s = pool_->set_seq_len(result.cache, static_cast<int64_t>(tokens.size())); !s.ok()) {
-    (void)pool_->release(result.cache);
-    return s;
-  }
-
-  StatusOr<Tensor> logits = lm_head_(normalized.value());
-  if (!logits.ok()) {
-    (void)pool_->release(result.cache);
-    return Status(logits.status());
-  }
-
-  result.logits = std::move(logits.value());
-  return result;
+  Tensor logits;
+  ASSIGN_OR_RETURN(logits, lm_head_(normalized));
+  return std::move(logits);
 }
 
-StatusOr<DecodeResult> FalconH1Runner::decode(const CacheHandle& cache, int32_t token) {
-  if (!pool_)
-    return Status::InvalidArgument("cache pool is not initialized");
-  if (!alloc_)
-    return Status::InvalidArgument("allocator is not initialized");
-  if (!cache.valid())
-    return Status::InvalidArgument("invalid cache handle");
+StatusOr<Tensor> FalconH1Runner::decode(const int32_t token, std::span<LayerCacheView> layers) {
 
-  AllocatorScope scope(alloc_.get());
+  Tensor hidden;
+  ASSIGN_OR_RETURN(hidden, embed_(std::span<const int32_t>(&token,1)));
 
-  StatusOr<int64_t> past = pool_->seq_len(cache);
-  if (!past.ok())
-    return Status(past.status());
+  // convert shape from [1,H] to [H]
+  if (hidden.size() == 2 && hidden.shape[0] == 1)
+    hidden.shape = {hidden.shape[1]};
 
-  const int32_t tok = token;
-  StatusOr<Tensor> hidden = embed_(std::span<const int32_t>(&tok, 1));
-  if (!hidden.ok())
-    return Status(hidden.status());
+  Tensor normalized;
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, /*past_len=*/0));
 
-  if (hidden.value().size() == 2 && hidden.value().shape[0] == 1)
-    hidden.value().shape = {hidden.value().shape[1]};
-
-  StatusOr<Tensor> normalized = forward_hidden_(cache, std::move(hidden.value()), past.value());
-  if (!normalized.ok())
-    return Status(normalized.status());
-
-  if (Status s = pool_->set_seq_len(cache, past.value() + 1); !s.ok())
-    return s;
-
-  StatusOr<Tensor> logits = lm_head_(normalized.value());
-  if (!logits.ok())
-    return Status(logits.status());
-
-  DecodeResult result;
-  result.logits = std::move(logits.value());
-  return result;
-}
-
-Status FalconH1Runner::release(CacheHandle& cache) {
-  if (!pool_)
-    return Status::InvalidArgument("cache pool is not initialized");
-  return pool_->release(cache);
+  Tensor logits;
+  ASSIGN_OR_RETURN(logits, lm_head_(normalized));
+  return std::move(logits);
 }

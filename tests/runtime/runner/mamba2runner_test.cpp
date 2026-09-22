@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace {
@@ -98,7 +99,9 @@ Mamba2Weights make_weights(const ModelConfig& cfg) {
   return w;
 }
 
-StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const ModelConfig& cfg, int n_slots) {
+StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const ModelConfig& cfg, int n_slots,
+                                                     std::unique_ptr<DeviceAllocator>* out_alloc,
+                                                     std::unique_ptr<CachePool>* out_pool) {
   std::unique_ptr<DeviceAllocator> alloc;
   ASSIGN_OR_RETURN(alloc, create_device_allocator(Device::CPU, 0));
 
@@ -110,64 +113,88 @@ StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const ModelConfig& cfg, int 
 
   std::unique_ptr<CachePool> pool;
   ASSIGN_OR_RETURN(pool, create_cache_pool(cfg, alloc.get(), n_slots, create_cache_layout));
-  return std::make_unique<Mamba2Runner>(cfg, std::move(weights), std::move(pool), std::move(alloc),
-                                        cpu_ops());
+  auto runner = std::make_unique<Mamba2Runner>(cfg, std::move(weights), cpu_ops());
+  *out_alloc = std::move(alloc);
+  *out_pool = std::move(pool);
+  return runner;
 }
 
 } // namespace
 
-TEST(Mamba2Runner, PrefillReturnsCacheAndVocabLogits) {
+TEST(Mamba2Runner, PrefillReturnsVocabLogits) {
   ModelConfig cfg = make_cfg();
-  StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
+  std::unique_ptr<DeviceAllocator> alloc;
+  std::unique_ptr<CachePool> pool;
+  StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2, &alloc, &pool);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
   Mamba2Runner& runner = *runner_or.value();
 
-  const int32_t tokens[] = {1, 2, 3};
-  StatusOr<PrefillResult> result = runner.prefill(tokens);
-  ASSERT_TRUE(result.ok()) << result.status().message();
-  EXPECT_TRUE(result.value().cache.valid());
-  ASSERT_EQ(result.value().logits.shape.size(), 1u);
-  EXPECT_EQ(result.value().logits.shape[0], cfg.vocab_size);
+  StatusOr<CacheHandle> handle_or = pool->acquire();
+  ASSERT_TRUE(handle_or.ok()) << handle_or.status().message();
+  CacheHandle handle = std::move(handle_or.value());
+  StatusOr<std::span<LayerCacheView>> layers = pool->layer_views(handle);
+  ASSERT_TRUE(layers.ok()) << layers.status().message();
 
-  CacheHandle handle = result.value().cache;
-  ASSERT_TRUE(runner.release(handle).ok());
+  const int32_t tokens[] = {1, 2, 3};
+  StatusOr<Tensor> logits = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    return runner.prefill(tokens, layers.value());
+  }();
+  ASSERT_TRUE(logits.ok()) << logits.status().message();
+  ASSERT_EQ(logits.value().shape.size(), 1u);
+  EXPECT_EQ(logits.value().shape[0], cfg.vocab_size);
+
+  ASSERT_TRUE(pool->release(handle).ok());
   EXPECT_FALSE(handle.valid());
 }
 
 TEST(Mamba2Runner, DecodeReusesHandleAndReturnsLogits) {
   ModelConfig cfg = make_cfg();
-  StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
+  std::unique_ptr<DeviceAllocator> alloc;
+  std::unique_ptr<CachePool> pool;
+  StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2, &alloc, &pool);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
   Mamba2Runner& runner = *runner_or.value();
 
+  StatusOr<CacheHandle> handle_or = pool->acquire();
+  ASSERT_TRUE(handle_or.ok()) << handle_or.status().message();
+  CacheHandle handle = std::move(handle_or.value());
+  StatusOr<std::span<LayerCacheView>> layers = pool->layer_views(handle);
+  ASSERT_TRUE(layers.ok()) << layers.status().message();
+
   const int32_t prompt[] = {1, 2};
-  StatusOr<PrefillResult> pref = runner.prefill(prompt);
-  ASSERT_TRUE(pref.ok()) << pref.status().message();
-
-  StatusOr<DecodeResult> dec = runner.decode(pref.value().cache, /*token=*/3);
+  StatusOr<Tensor> dec = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    StatusOr<Tensor> pref = runner.prefill(prompt, layers.value());
+    if (!pref.ok())
+      return pref.status();
+    return runner.decode(/*token=*/3, layers.value());
+  }();
   ASSERT_TRUE(dec.ok()) << dec.status().message();
-  ASSERT_EQ(dec.value().logits.shape.size(), 1u);
-  EXPECT_EQ(dec.value().logits.shape[0], cfg.vocab_size);
+  ASSERT_EQ(dec.value().shape.size(), 1u);
+  EXPECT_EQ(dec.value().shape[0], cfg.vocab_size);
 
-  CacheHandle handle = pref.value().cache;
-  ASSERT_TRUE(runner.release(handle).ok());
+  ASSERT_TRUE(pool->release(handle).ok());
 }
 
 TEST(Mamba2Runner, PrefillEmptyTokensFails) {
   ModelConfig cfg = make_cfg();
-  StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, 1);
+  std::unique_ptr<DeviceAllocator> alloc;
+  std::unique_ptr<CachePool> pool;
+  StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, 1, &alloc, &pool);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
 
-  StatusOr<PrefillResult> result = runner_or.value()->prefill({});
+  StatusOr<CacheHandle> handle_or = pool->acquire();
+  ASSERT_TRUE(handle_or.ok()) << handle_or.status().message();
+  CacheHandle handle = std::move(handle_or.value());
+  StatusOr<std::span<LayerCacheView>> layers = pool->layer_views(handle);
+  ASSERT_TRUE(layers.ok()) << layers.status().message();
+
+  StatusOr<Tensor> result = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    return runner_or.value()->prefill({}, layers.value());
+  }();
   EXPECT_FALSE(result.ok());
+  ASSERT_TRUE(pool->release(handle).ok());
 }
 
-TEST(Mamba2Runner, DecodeInvalidHandleFails) {
-  ModelConfig cfg = make_cfg();
-  StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, 1);
-  ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
-
-  CacheHandle bad;
-  StatusOr<DecodeResult> result = runner_or.value()->decode(bad, 0);
-  EXPECT_FALSE(result.ok());
-}

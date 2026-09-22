@@ -12,11 +12,9 @@
 
 class Mamba2Runner : public Runner {
 private:
-  std::unique_ptr<DeviceAllocator> alloc_;
   const OpsBackend* ops_ = nullptr;
   ModelConfig cfg_;
   Mamba2Weights weights_;
-  std::unique_ptr<CachePool> pool_;
 
   Status block_forward_(int layer_idx, LayerCacheView& cache, Tensor& hidden, bool is_prefill);
 
@@ -25,15 +23,13 @@ private:
   StatusOr<Tensor> lm_head_(const Tensor& hidden);
   StatusOr<Tensor> last_token_hidden_(const Tensor& hidden) const;
 
-  StatusOr<Tensor> forward_hidden_(const CacheHandle& cache, Tensor hidden, bool is_prefill);
+  StatusOr<Tensor> forward_hidden_(std::span<LayerCacheView> layers, Tensor& hidden, bool is_prefill); 
 
 public:
-  Mamba2Runner(ModelConfig cfg, Mamba2Weights weights, std::unique_ptr<CachePool> pool,
-               std::unique_ptr<DeviceAllocator> alloc, const OpsBackend& ops);
+  Mamba2Runner(ModelConfig cfg, Mamba2Weights weights, const OpsBackend& ops);
 
   ~Mamba2Runner() override;
 
-  StatusOr<PrefillResult> prefill(std::span<const int32_t> tokens) override;
-  StatusOr<DecodeResult> decode(const CacheHandle& cache, int32_t token) override;
-  Status release(CacheHandle& cache) override;
+  StatusOr<Tensor> prefill(std::span<const int32_t> tokens, std::span<LayerCacheView> layers) override;
+  StatusOr<Tensor> decode( int32_t token, std::span<LayerCacheView> layers) override;
 };

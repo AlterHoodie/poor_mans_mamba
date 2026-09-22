@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -134,7 +135,9 @@ FalconH1Weights make_weights(const ModelConfig& cfg) {
   return w;
 }
 
-StatusOr<std::unique_ptr<FalconH1Runner>> make_runner(const ModelConfig& cfg, int n_slots) {
+StatusOr<std::unique_ptr<FalconH1Runner>> make_runner(const ModelConfig& cfg, int n_slots,
+                                                       std::unique_ptr<DeviceAllocator>* out_alloc,
+                                                       std::unique_ptr<CachePool>* out_pool) {
   std::unique_ptr<DeviceAllocator> alloc;
   ASSIGN_OR_RETURN(alloc, create_device_allocator(Device::CPU, 0));
 
@@ -146,8 +149,10 @@ StatusOr<std::unique_ptr<FalconH1Runner>> make_runner(const ModelConfig& cfg, in
 
   std::unique_ptr<CachePool> pool;
   ASSIGN_OR_RETURN(pool, create_cache_pool(cfg, alloc.get(), n_slots, create_cache_layout));
-  return std::make_unique<FalconH1Runner>(cfg, std::move(weights), std::move(pool),
-                                          std::move(alloc), cpu_ops());
+  auto runner = std::make_unique<FalconH1Runner>(cfg, std::move(weights), cpu_ops());
+  *out_alloc = std::move(alloc);
+  *out_pool = std::move(pool);
+  return runner;
 }
 
 } // namespace
@@ -294,87 +299,132 @@ TEST(FalconH1Attn, PrefillWritesKvAndDecodeAppends) {
   ASSERT_TRUE(pool_or.value()->release(handle).ok());
 }
 
-TEST(FalconH1Runner, PrefillReturnsCacheAndVocabLogits) {
+TEST(FalconH1Runner, PrefillReturnsVocabLogits) {
   ModelConfig cfg = make_cfg();
-  StatusOr<std::unique_ptr<FalconH1Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
+  std::unique_ptr<DeviceAllocator> alloc;
+  std::unique_ptr<CachePool> pool;
+  StatusOr<std::unique_ptr<FalconH1Runner>> runner_or = make_runner(cfg, /*n_slots=*/2, &alloc, &pool);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
   FalconH1Runner& runner = *runner_or.value();
 
-  const int32_t tokens[] = {1, 2, 3};
-  StatusOr<PrefillResult> result = runner.prefill(tokens);
-  ASSERT_TRUE(result.ok()) << result.status().message();
-  EXPECT_TRUE(result.value().cache.valid());
-  ASSERT_EQ(result.value().logits.shape.size(), 1u);
-  EXPECT_EQ(result.value().logits.shape[0], cfg.vocab_size);
+  StatusOr<CacheHandle> handle_or = pool->acquire();
+  ASSERT_TRUE(handle_or.ok()) << handle_or.status().message();
+  CacheHandle handle = std::move(handle_or.value());
+  StatusOr<std::span<LayerCacheView>> layers = pool->layer_views(handle);
+  ASSERT_TRUE(layers.ok()) << layers.status().message();
 
-  CacheHandle handle = result.value().cache;
-  ASSERT_TRUE(runner.release(handle).ok());
+  const int32_t tokens[] = {1, 2, 3};
+  StatusOr<Tensor> logits = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    return runner.prefill(tokens, layers.value());
+  }();
+  ASSERT_TRUE(logits.ok()) << logits.status().message();
+  ASSERT_EQ(logits.value().shape.size(), 1u);
+  EXPECT_EQ(logits.value().shape[0], cfg.vocab_size);
+
+  ASSERT_TRUE(pool->release(handle).ok());
   EXPECT_FALSE(handle.valid());
 }
 
-TEST(FalconH1Runner, PrefillThenDecodeAdvancesSeqLen) {
+TEST(FalconH1Runner, PrefillThenDecode) {
   ModelConfig cfg = make_cfg();
-  StatusOr<std::unique_ptr<FalconH1Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
+  std::unique_ptr<DeviceAllocator> alloc;
+  std::unique_ptr<CachePool> pool;
+  StatusOr<std::unique_ptr<FalconH1Runner>> runner_or = make_runner(cfg, /*n_slots=*/2, &alloc, &pool);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
   FalconH1Runner& runner = *runner_or.value();
 
-  // Reach into pool via prefill/decode behavior: decode succeeds twice after 2-token prefill.
+  StatusOr<CacheHandle> handle_or = pool->acquire();
+  ASSERT_TRUE(handle_or.ok()) << handle_or.status().message();
+  CacheHandle handle = std::move(handle_or.value());
+  StatusOr<std::span<LayerCacheView>> layers = pool->layer_views(handle);
+  ASSERT_TRUE(layers.ok()) << layers.status().message();
+
   const int32_t prompt[] = {1, 2};
-  StatusOr<PrefillResult> pref = runner.prefill(prompt);
-  ASSERT_TRUE(pref.ok()) << pref.status().message();
-
-  StatusOr<DecodeResult> d0 = runner.decode(pref.value().cache, /*token=*/3);
+  StatusOr<Tensor> d0 = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    StatusOr<Tensor> pref = runner.prefill(prompt, layers.value());
+    if (!pref.ok())
+      return pref.status();
+    if (Status s = pool->set_seq_len(handle, 2); !s.ok())
+      return s;
+    return runner.decode(/*token=*/3, layers.value());
+  }();
   ASSERT_TRUE(d0.ok()) << d0.status().message();
-  ASSERT_EQ(d0.value().logits.shape.size(), 1u);
-  EXPECT_EQ(d0.value().logits.shape[0], cfg.vocab_size);
+  ASSERT_EQ(d0.value().shape.size(), 1u);
+  EXPECT_EQ(d0.value().shape[0], cfg.vocab_size);
 
-  StatusOr<DecodeResult> d1 = runner.decode(pref.value().cache, /*token=*/4);
+  StatusOr<Tensor> d1 = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    return runner.decode(/*token=*/4, layers.value());
+  }();
   ASSERT_TRUE(d1.ok()) << d1.status().message();
 
-  CacheHandle handle = pref.value().cache;
-  ASSERT_TRUE(runner.release(handle).ok());
+  ASSERT_TRUE(pool->release(handle).ok());
 }
 
 TEST(FalconH1Runner, PrefillEmptyTokensFails) {
   ModelConfig cfg = make_cfg();
-  StatusOr<std::unique_ptr<FalconH1Runner>> runner_or = make_runner(cfg, 1);
+  std::unique_ptr<DeviceAllocator> alloc;
+  std::unique_ptr<CachePool> pool;
+  StatusOr<std::unique_ptr<FalconH1Runner>> runner_or = make_runner(cfg, 1, &alloc, &pool);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
 
-  StatusOr<PrefillResult> result = runner_or.value()->prefill({});
-  EXPECT_FALSE(result.ok());
-}
+  StatusOr<CacheHandle> handle_or = pool->acquire();
+  ASSERT_TRUE(handle_or.ok()) << handle_or.status().message();
+  CacheHandle handle = std::move(handle_or.value());
+  StatusOr<std::span<LayerCacheView>> layers = pool->layer_views(handle);
+  ASSERT_TRUE(layers.ok()) << layers.status().message();
 
-TEST(FalconH1Runner, DecodeInvalidHandleFails) {
-  ModelConfig cfg = make_cfg();
-  StatusOr<std::unique_ptr<FalconH1Runner>> runner_or = make_runner(cfg, 1);
-  ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
-
-  CacheHandle bad;
-  StatusOr<DecodeResult> result = runner_or.value()->decode(bad, 0);
+  StatusOr<Tensor> result = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    return runner_or.value()->prefill({}, layers.value());
+  }();
   EXPECT_FALSE(result.ok());
+  ASSERT_TRUE(pool->release(handle).ok());
 }
 
 TEST(FalconH1Runner, RegistryLoadsRealCheckpointPrefillDecode) {
-  auto entry_or = ModelRegistry::lookup(MAMBA_TEST_FALCON_DIR);
+  auto entry_or = ModelRegistry::open(MAMBA_TEST_FALCON_DIR, /*max_seq_length=*/64);
   ASSERT_TRUE(entry_or.ok()) << entry_or.status().message();
+  ModelEntry entry = std::move(entry_or.value());
+  ASSERT_NE(entry.cfg, nullptr);
 
-  auto cfg_or = entry_or.value()->parse(MAMBA_TEST_FALCON_DIR, /*max_seq_length=*/64);
-  ASSERT_TRUE(cfg_or.ok()) << cfg_or.status().message();
+  std::unique_ptr<DeviceAllocator> alloc;
+  auto alloc_or = create_device_allocator(Device::CPU, /*device_id=*/0);
+  ASSERT_TRUE(alloc_or.ok()) << alloc_or.status().message();
+  alloc = std::move(alloc_or.value());
 
-  auto runner_or = entry_or.value()->create_runner(*cfg_or.value(), MAMBA_TEST_FALCON_DIR,
-                                                   Device::CPU, /*num_slots=*/1, /*device_id=*/0);
+  auto runner_or = entry.create_runner(*alloc);
   ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
 
+  std::unique_ptr<CachePool> pool;
+  auto pool_or = create_cache_pool(*entry.cfg, alloc.get(), /*num_slots=*/1, create_cache_layout);
+  ASSERT_TRUE(pool_or.ok()) << pool_or.status().message();
+  pool = std::move(pool_or.value());
+
+  StatusOr<CacheHandle> handle_or = pool->acquire();
+  ASSERT_TRUE(handle_or.ok()) << handle_or.status().message();
+  CacheHandle handle = std::move(handle_or.value());
+  StatusOr<std::span<LayerCacheView>> layers = pool->layer_views(handle);
+  ASSERT_TRUE(layers.ok()) << layers.status().message();
+
   const int32_t tokens[] = {1, 2};
-  StatusOr<PrefillResult> pref = runner_or.value()->prefill(tokens);
+  StatusOr<Tensor> pref = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    return runner_or.value()->prefill(tokens, layers.value());
+  }();
   ASSERT_TRUE(pref.ok()) << pref.status().message();
-  ASSERT_EQ(pref.value().logits.shape.size(), 1u);
-  EXPECT_EQ(pref.value().logits.shape[0], cfg_or.value()->vocab_size);
+  ASSERT_EQ(pref.value().shape.size(), 1u);
+  EXPECT_EQ(pref.value().shape[0], entry.cfg->vocab_size);
 
-  StatusOr<DecodeResult> dec = runner_or.value()->decode(pref.value().cache, /*token=*/3);
+  ASSERT_TRUE(pool->set_seq_len(handle, 2).ok());
+  StatusOr<Tensor> dec = [&]() -> StatusOr<Tensor> {
+    AllocatorScope scope(alloc.get());
+    return runner_or.value()->decode(/*token=*/3, layers.value());
+  }();
   ASSERT_TRUE(dec.ok()) << dec.status().message();
-  EXPECT_EQ(dec.value().logits.shape[0], cfg_or.value()->vocab_size);
+  EXPECT_EQ(dec.value().shape[0], entry.cfg->vocab_size);
 
-  CacheHandle handle = pref.value().cache;
-  ASSERT_TRUE(runner_or.value()->release(handle).ok());
+  ASSERT_TRUE(pool->release(handle).ok());
 }

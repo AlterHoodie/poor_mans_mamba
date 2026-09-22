@@ -2,26 +2,17 @@
 
 #include "core/status.h"
 #include "core/tensor.h"
+#include "runtime/cache/cache_layout.h"
 #include "runtime/cache/cache_pool.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <span>
-
-// Runner ↔ scheduler step outputs. Scheduler owns seq_id + token history.
-struct PrefillResult {
-  CacheHandle cache;
-  Tensor logits; // shape {vocab_size}, last prompt position
-};
-
-struct DecodeResult {
-  Tensor logits; // shape {vocab_size}
-};
 
 class Runner {
 public:
   virtual ~Runner() = default;
 
-  virtual StatusOr<PrefillResult> prefill(std::span<const int32_t> tokens) = 0;
-  virtual StatusOr<DecodeResult> decode(const CacheHandle& cache, int32_t token) = 0;
-  virtual Status release(CacheHandle& cache) = 0;
+  virtual StatusOr<Tensor> prefill(std::span<const int32_t> tokens, std::span<LayerCacheView> layers) = 0;
+  virtual StatusOr<Tensor> decode(const int32_t token, std::span<LayerCacheView> layers) = 0;
 };

@@ -1,17 +1,17 @@
 #include "runtime/runner/mamba2_runner.h"
 
+#include "core/status.h"
 #include "ops/common/shapes.h"
 #include "ops/common/tensor_checks.h"
+#include "runtime/cache/cache_layout.h"
 
 #include <utility>
 #include <vector>
 
 Mamba2Runner::~Mamba2Runner() = default;
 
-Mamba2Runner::Mamba2Runner(ModelConfig cfg, Mamba2Weights weights, std::unique_ptr<CachePool> pool,
-                           std::unique_ptr<DeviceAllocator> alloc, const OpsBackend& ops)
-    : alloc_(std::move(alloc)), ops_(&ops), cfg_(std::move(cfg)), weights_(std::move(weights)),
-      pool_(std::move(pool)) {}
+Mamba2Runner::Mamba2Runner(ModelConfig cfg, Mamba2Weights weights, const OpsBackend& ops)
+    : ops_(&ops), cfg_(std::move(cfg)), weights_(std::move(weights)) {}
 
 Status Mamba2Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tensor& hidden,
                                     bool is_prefill) {
@@ -120,18 +120,11 @@ StatusOr<Tensor> Mamba2Runner::lm_head_(const Tensor& hidden) {
   return std::move(logits.value());
 }
 
-StatusOr<Tensor> Mamba2Runner::forward_hidden_(const CacheHandle& cache, Tensor hidden,
+StatusOr<Tensor> Mamba2Runner::forward_hidden_(std::span<LayerCacheView> layers, Tensor& hidden,
                                                bool is_prefill) {
-  if (!cache.valid())
-    return Status::InvalidArgument("invalid cache handle");
-  if (!pool_)
-    return Status::InvalidArgument("cache pool is not initialized");
 
   for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-    StatusOr<LayerCacheView> view = pool_->layer_view(cache, i);
-    if (!view.ok())
-      return Status(view.status());
-    if (Status s = block_forward_(i, view.value(), hidden, is_prefill); !s.ok()) {
+    if (Status s = block_forward_(i, layers[i], hidden, is_prefill); !s.ok()) {
       return s;
     }
   }
@@ -141,73 +134,33 @@ StatusOr<Tensor> Mamba2Runner::forward_hidden_(const CacheHandle& cache, Tensor 
   return std::move(hidden);
 }
 
-StatusOr<PrefillResult> Mamba2Runner::prefill(std::span<const int32_t> tokens) {
-  if (!pool_)
-    return Status::InvalidArgument("cache pool is not initialized");
-  if (!alloc_)
-    return Status::InvalidArgument("allocator is not initialized");
+StatusOr<Tensor> Mamba2Runner::prefill(std::span<const int32_t> tokens, std::span<LayerCacheView> layers) {
 
-  AllocatorScope scope(alloc_.get());
+  Tensor hidden;
+  ASSIGN_OR_RETURN(hidden, embed_(tokens));
 
-  PrefillResult result;
-  ASSIGN_OR_RETURN(result.cache, pool_->acquire());
+  Tensor normalized;
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, true));
 
-  StatusOr<Tensor> hidden = embed_(tokens);
-  if (!hidden.ok()) {
-    (void)pool_->release(result.cache);
-    return Status(hidden.status());
-  }
-
-  StatusOr<Tensor> normalized = forward_hidden_(result.cache, std::move(hidden.value()), true);
-  if (!normalized.ok()) {
-    (void)pool_->release(result.cache);
-    return Status(normalized.status());
-  }
-
-  StatusOr<Tensor> logits = lm_head_(normalized.value());
-  if (!logits.ok()) {
-    (void)pool_->release(result.cache);
-    return Status(logits.status());
-  }
-
-  result.logits = std::move(logits.value());
-  return result;
+  Tensor logits;
+  ASSIGN_OR_RETURN(logits, lm_head_(normalized));
+  return std::move(logits);
 }
 
-StatusOr<DecodeResult> Mamba2Runner::decode(const CacheHandle& cache, int32_t token) {
-  if (!pool_)
-    return Status::InvalidArgument("cache pool is not initialized");
-  if (!alloc_)
-    return Status::InvalidArgument("allocator is not initialized");
-  if (!cache.valid())
-    return Status::InvalidArgument("invalid cache handle");
+StatusOr<Tensor> Mamba2Runner::decode(const int32_t token, std::span<LayerCacheView> layers) {
 
-  AllocatorScope scope(alloc_.get());
+  Tensor hidden;
+  ASSIGN_OR_RETURN(hidden, embed_(std::span<const int32_t>(&token,1)));
 
-  const int32_t tok = token;
-  StatusOr<Tensor> hidden = embed_(std::span<const int32_t>(&tok, 1));
-  if (!hidden.ok())
-    return Status(hidden.status());
-
-  if (hidden.value().size() == 2 && hidden.value().shape[0] == 1) {
-    hidden.value().shape = {hidden.value().shape[1]};
+  // convert shape from [1,H] to [H]
+  if (hidden.size() == 2 && hidden.shape[0] == 1) {
+    hidden.shape = {hidden.shape[1]};
   }
 
-  StatusOr<Tensor> normalized = forward_hidden_(cache, std::move(hidden.value()), false);
-  if (!normalized.ok())
-    return Status(normalized.status());
+  Tensor normalized;
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers,hidden, false));
 
-  StatusOr<Tensor> logits = lm_head_(normalized.value());
-  if (!logits.ok())
-    return Status(logits.status());
-
-  DecodeResult result;
-  result.logits = std::move(logits.value());
-  return result;
-}
-
-Status Mamba2Runner::release(CacheHandle& cache) {
-  if (!pool_)
-    return Status::InvalidArgument("cache pool is not initialized");
-  return pool_->release(cache);
+  Tensor logits;
+  ASSIGN_OR_RETURN(logits, lm_head_(normalized));
+  return std::move(logits);
 }

@@ -33,12 +33,12 @@ TEST(Mamba2ConfigParser, Parses130mHf) {
   EXPECT_EQ(cfg.eos_token_id, 0);
 }
 
-TEST(ModelRegistry, LookupAndParseMamba2) {
-  auto entry_or = ModelRegistry::lookup(MAMBA_TEST_MODEL_DIR);
+TEST(ModelRegistry, OpenMamba2) {
+  auto entry_or = ModelRegistry::open(MAMBA_TEST_MODEL_DIR, 2048);
   ASSERT_TRUE(entry_or.ok()) << entry_or.status().message();
 
-  auto cfg_or = entry_or.value()->parse(MAMBA_TEST_MODEL_DIR, 2048);
-  ASSERT_TRUE(cfg_or.ok()) << cfg_or.status().message();
-  EXPECT_EQ(cfg_or.value()->layout, ArchLayout::MambaOnly);
-  EXPECT_EQ(cfg_or.value()->model_type, "mamba2");
+  const ModelEntry& entry = entry_or.value();
+  ASSERT_NE(entry.cfg, nullptr);
+  EXPECT_EQ(entry.cfg->layout, ArchLayout::MambaOnly);
+  EXPECT_EQ(entry.cfg->model_type, "mamba2");
 }

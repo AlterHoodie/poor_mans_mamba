@@ -5,14 +5,15 @@
 #include "runtime/cache/cache_layout.h"
 #include "runtime/cache/cache_pool.h"
 #include "runtime/runner/mamba2_runner.h"
-#include "runtime/scheduler.h"
+#include "runtime/runner/runner.h"
+#include "runtime/worker.h"
 #include <gtest/gtest.h>
 
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <memory>
-#include <unordered_set>
+#include <span>
 #include <vector>
 
 namespace {
@@ -32,9 +33,8 @@ Tensor make_embeddings(int vocab, int hidden) {
   Tensor t = make_f32({vocab, hidden}, 0.f);
   auto m = as_mat_f32(t);
   for (int v = 0; v < vocab; ++v) {
-    for (int h = 0; h < hidden; ++h) {
+    for (int h = 0; h < hidden; ++h)
       m(v, h) = static_cast<float>(v + 1) * 0.01f;
-    }
   }
   return t;
 }
@@ -58,6 +58,7 @@ ModelConfig make_cfg() {
   cfg.ssm.use_proj_bias = false;
   cfg.ssm.gated_rms_norm = true;
   cfg.rms_norm_eps = 1e-5f;
+  cfg.max_seq_length = 32;
   return cfg;
 }
 
@@ -102,22 +103,6 @@ Mamba2Weights make_weights(const ModelConfig& cfg) {
   return w;
 }
 
-StatusOr<std::unique_ptr<Mamba2Runner>> make_runner(const ModelConfig& cfg, int n_slots) {
-  std::unique_ptr<DeviceAllocator> alloc;
-  ASSIGN_OR_RETURN(alloc, create_device_allocator(Device::CPU, 0));
-
-  Mamba2Weights weights;
-  {
-    AllocatorScope scope(alloc.get());
-    weights = make_weights(cfg);
-  }
-
-  std::unique_ptr<CachePool> pool;
-  ASSIGN_OR_RETURN(pool, create_cache_pool(cfg, alloc.get(), n_slots, create_cache_layout));
-  return std::make_unique<Mamba2Runner>(cfg, std::move(weights), std::move(pool), std::move(alloc),
-                                        cpu_ops());
-}
-
 // Deterministic runner: peaks logits at successive entries of `token_seq_`.
 class FakeRunner : public Runner {
 public:
@@ -132,41 +117,26 @@ public:
 
   FakeRunner(int vocab, int32_t next_token) : FakeRunner(vocab, std::vector<int32_t>{next_token}) {}
 
-  StatusOr<PrefillResult> prefill(std::span<const int32_t> tokens) override {
+  StatusOr<Tensor> prefill(std::span<const int32_t> tokens,
+                           std::span<LayerCacheView> /*layers*/) override {
     if (tokens.empty())
       return Status::InvalidArgument("empty prompt");
-    PrefillResult r;
-    r.cache = CacheHandle(next_handle_++);
-    live_.insert(r.cache.id());
-    ASSIGN_OR_RETURN(r.logits, make_logits_peak_(vocab_, peak_token_()));
+    Tensor logits;
+    ASSIGN_OR_RETURN(logits, make_logits_peak_(vocab_, peak_token_()));
     ++step_;
-    return r;
+    return std::move(logits);
   }
 
-  StatusOr<DecodeResult> decode(const CacheHandle& cache, int32_t /*token*/) override {
-    if (!cache.valid() || !live_.count(cache.id())) {
-      return Status::InvalidArgument("invalid cache");
-    }
+  StatusOr<Tensor> decode(int32_t /*token*/, std::span<LayerCacheView> /*layers*/) override {
     if (overflow_after_decodes_ >= 0 && decode_calls_ >= overflow_after_decodes_) {
       return Status::KvCacheOverflow("KV cache overflow");
     }
     ++decode_calls_;
-    DecodeResult r;
-    ASSIGN_OR_RETURN(r.logits, make_logits_peak_(vocab_, peak_token_()));
+    Tensor logits;
+    ASSIGN_OR_RETURN(logits, make_logits_peak_(vocab_, peak_token_()));
     ++step_;
-    return r;
+    return std::move(logits);
   }
-
-  Status release(CacheHandle& cache) override {
-    if (!cache.valid() || !live_.count(cache.id())) {
-      return Status::InvalidArgument("invalid cache");
-    }
-    live_.erase(cache.id());
-    cache.invalidate();
-    return Status::Ok();
-  }
-
-  bool has_live_caches() const { return !live_.empty(); }
 
 private:
   StatusOr<Tensor> make_logits_peak_(int vocab, int32_t peak_id, float peak = 10.f) {
@@ -192,128 +162,194 @@ private:
   int overflow_after_decodes_ = -1;
   int decode_calls_ = 0;
   size_t step_ = 0;
-  int next_handle_ = 0;
-  std::unordered_set<int> live_;
   std::unique_ptr<DeviceAllocator> alloc_;
 };
 
+StatusOr<std::vector<int32_t>> greedy_generate(Runner& runner, CachePool& pool,
+                                               DeviceAllocator& alloc,
+                                               std::span<const int32_t> prompt,
+                                               const GenerateParams& params) {
+  if (prompt.empty())
+    return Status::InvalidArgument("empty prompt");
+  if (params.eos_id < 0)
+    return Status::InvalidArgument("eos_id required");
+
+  StatusOr<CacheHandle> handle_or = pool.acquire();
+  if (!handle_or.ok())
+    return handle_or.status();
+  CacheHandle handle = std::move(handle_or.value());
+
+  StatusOr<std::span<LayerCacheView>> layers = pool.layer_views(handle);
+  if (!layers.ok()) {
+    (void)pool.release(handle);
+    return layers.status();
+  }
+
+  AllocatorScope scope(&alloc);
+
+  std::vector<int32_t> out;
+  StatusOr<Tensor> logits = runner.prefill(prompt, layers.value());
+  if (!logits.ok()) {
+    (void)pool.release(handle);
+    return logits.status();
+  }
+
+  for (int i = 0; i < params.max_new_tokens; ++i) {
+    StatusOr<int32_t> tok = argmax(logits.value());
+    if (!tok.ok()) {
+      (void)pool.release(handle);
+      return tok.status();
+    }
+    out.push_back(tok.value());
+    if (tok.value() == params.eos_id)
+      break;
+    if (i + 1 >= params.max_new_tokens)
+      break;
+
+    logits = runner.decode(tok.value(), layers.value());
+    if (!logits.ok()) {
+      if (logits.status().code() == Code::kKvCacheOverflow) {
+        (void)pool.release(handle);
+        return out; // partial
+      }
+      (void)pool.release(handle);
+      return logits.status();
+    }
+  }
+
+  if (Status s = pool.release(handle); !s.ok())
+    return s;
+  return out;
+}
+
+StatusOr<std::unique_ptr<CachePool>> make_pool(const ModelConfig& cfg, DeviceAllocator* alloc,
+                                               int n_slots) {
+  return create_cache_pool(cfg, alloc, n_slots, create_cache_layout);
+}
+
 } // namespace
 
-TEST(Scheduler, RejectsEmptyPrompt) {
+TEST(GreedyGenerate, RejectsEmptyPrompt) {
   FakeRunner runner(/*vocab=*/8, /*next_token=*/1);
-  Scheduler sched(runner);
+  auto alloc_or = create_device_allocator(Device::CPU, 0);
+  ASSERT_TRUE(alloc_or.ok());
+  ModelConfig cfg = make_cfg();
+  auto pool_or = make_pool(cfg, alloc_or.value().get(), 1);
+  ASSERT_TRUE(pool_or.ok()) << pool_or.status().message();
+
   GenerateParams params{.max_new_tokens = 4, .eos_id = 0};
   std::vector<int32_t> prompt;
-  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
+  StatusOr<std::vector<int32_t>> out =
+      greedy_generate(runner, *pool_or.value(), *alloc_or.value(), prompt, params);
   EXPECT_FALSE(out.ok());
 }
 
-TEST(Scheduler, RejectsMissingEos) {
+TEST(GreedyGenerate, RejectsMissingEos) {
   FakeRunner runner(/*vocab=*/8, /*next_token=*/1);
-  Scheduler sched(runner);
+  auto alloc_or = create_device_allocator(Device::CPU, 0);
+  ASSERT_TRUE(alloc_or.ok());
+  ModelConfig cfg = make_cfg();
+  auto pool_or = make_pool(cfg, alloc_or.value().get(), 1);
+  ASSERT_TRUE(pool_or.ok()) << pool_or.status().message();
+
   GenerateParams params{.max_new_tokens = 4, .eos_id = -1};
   std::vector<int32_t> prompt = {1, 2};
-  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
+  StatusOr<std::vector<int32_t>> out =
+      greedy_generate(runner, *pool_or.value(), *alloc_or.value(), prompt, params);
   EXPECT_FALSE(out.ok());
 }
 
-TEST(Scheduler, StopsAtMaxNewTokens) {
+TEST(GreedyGenerate, StopsAtMaxNewTokens) {
   FakeRunner runner(/*vocab=*/8, /*next_token=*/3);
-  Scheduler sched(runner);
+  auto alloc_or = create_device_allocator(Device::CPU, 0);
+  ASSERT_TRUE(alloc_or.ok());
+  ModelConfig cfg = make_cfg();
+  auto pool_or = make_pool(cfg, alloc_or.value().get(), 1);
+  ASSERT_TRUE(pool_or.ok()) << pool_or.status().message();
+
   GenerateParams params{.max_new_tokens = 5, .eos_id = 0};
   std::vector<int32_t> prompt = {1, 2};
-
-  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
+  StatusOr<std::vector<int32_t>> out =
+      greedy_generate(runner, *pool_or.value(), *alloc_or.value(), prompt, params);
   ASSERT_TRUE(out.ok()) << out.status().message();
   ASSERT_EQ(out.value().size(), 5u);
   for (int32_t t : out.value())
     EXPECT_EQ(t, 3);
-  EXPECT_FALSE(runner.has_live_caches());
 }
 
-TEST(Scheduler, StopsAtEos) {
+TEST(GreedyGenerate, StopsAtEos) {
   FakeRunner runner(/*vocab=*/8, /*next_token=*/7);
-  Scheduler sched(runner);
+  auto alloc_or = create_device_allocator(Device::CPU, 0);
+  ASSERT_TRUE(alloc_or.ok());
+  ModelConfig cfg = make_cfg();
+  auto pool_or = make_pool(cfg, alloc_or.value().get(), 1);
+  ASSERT_TRUE(pool_or.ok()) << pool_or.status().message();
+
   GenerateParams params{.max_new_tokens = 16, .eos_id = 7};
   std::vector<int32_t> prompt = {1};
-
-  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
+  StatusOr<std::vector<int32_t>> out =
+      greedy_generate(runner, *pool_or.value(), *alloc_or.value(), prompt, params);
   ASSERT_TRUE(out.ok()) << out.status().message();
   ASSERT_EQ(out.value().size(), 1u);
   EXPECT_EQ(out.value()[0], 7);
-  EXPECT_FALSE(runner.has_live_caches());
 }
 
-TEST(Scheduler, EmitsExactTokenSequence) {
+TEST(GreedyGenerate, EmitsExactTokenSequence) {
   FakeRunner runner(/*vocab=*/8, /*token_seq=*/{3, 5, 2, 0});
-  Scheduler sched(runner);
+  auto alloc_or = create_device_allocator(Device::CPU, 0);
+  ASSERT_TRUE(alloc_or.ok());
+  ModelConfig cfg = make_cfg();
+  auto pool_or = make_pool(cfg, alloc_or.value().get(), 1);
+  ASSERT_TRUE(pool_or.ok()) << pool_or.status().message();
+
   GenerateParams params{.max_new_tokens = 4, .eos_id = 0};
   std::vector<int32_t> prompt = {1};
-
-  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
+  StatusOr<std::vector<int32_t>> out =
+      greedy_generate(runner, *pool_or.value(), *alloc_or.value(), prompt, params);
   ASSERT_TRUE(out.ok()) << out.status().message();
   const std::vector<int32_t> expected = {3, 5, 2, 0};
   EXPECT_EQ(out.value(), expected);
-  EXPECT_FALSE(runner.has_live_caches());
 }
 
-TEST(Scheduler, ReturnsPartialOnKvCacheOverflow) {
+TEST(GreedyGenerate, ReturnsPartialOnKvCacheOverflow) {
   FakeRunner runner(/*vocab=*/8, /*token_seq=*/{3, 5, 2, 1}, /*overflow_after_decodes=*/2);
-  Scheduler sched(runner);
+  auto alloc_or = create_device_allocator(Device::CPU, 0);
+  ASSERT_TRUE(alloc_or.ok());
+  ModelConfig cfg = make_cfg();
+  auto pool_or = make_pool(cfg, alloc_or.value().get(), 1);
+  ASSERT_TRUE(pool_or.ok()) << pool_or.status().message();
+
   GenerateParams params{.max_new_tokens = 8, .eos_id = 0};
   std::vector<int32_t> prompt = {1};
-
-  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
+  StatusOr<std::vector<int32_t>> out =
+      greedy_generate(runner, *pool_or.value(), *alloc_or.value(), prompt, params);
   ASSERT_TRUE(out.ok()) << out.status().message();
   const std::vector<int32_t> expected = {3, 5, 2};
   EXPECT_EQ(out.value(), expected);
-  EXPECT_FALSE(runner.has_live_caches());
 }
 
-TEST(Scheduler, ReturnsPrefillTokenWhenDecodeOverflowsImmediately) {
-  FakeRunner runner(/*vocab=*/8, /*token_seq=*/{4, 1}, /*overflow_after_decodes=*/0);
-  Scheduler sched(runner);
-  GenerateParams params{.max_new_tokens = 8, .eos_id = 0};
-  std::vector<int32_t> prompt = {1};
-
-  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
-  ASSERT_TRUE(out.ok()) << out.status().message();
-  ASSERT_EQ(out.value().size(), 1u);
-  EXPECT_EQ(out.value()[0], 4);
-  EXPECT_FALSE(runner.has_live_caches());
-}
-
-TEST(Scheduler, GenerateMatchesManualGreedyTokens) {
+TEST(GreedyGenerate, RealMamba2GreedyProducesTokens) {
   ModelConfig cfg = make_cfg();
-  StatusOr<std::unique_ptr<Mamba2Runner>> runner_or = make_runner(cfg, /*n_slots=*/2);
-  ASSERT_TRUE(runner_or.ok()) << runner_or.status().message();
-  Mamba2Runner& runner = *runner_or.value();
+  std::unique_ptr<DeviceAllocator> alloc;
+  auto alloc_or = create_device_allocator(Device::CPU, 0);
+  ASSERT_TRUE(alloc_or.ok());
+  alloc = std::move(alloc_or.value());
+
+  Mamba2Weights weights;
+  {
+    AllocatorScope scope(alloc.get());
+    weights = make_weights(cfg);
+  }
+  auto runner = std::make_unique<Mamba2Runner>(cfg, std::move(weights), cpu_ops());
+  auto pool_or = make_pool(cfg, alloc.get(), 2);
+  ASSERT_TRUE(pool_or.ok()) << pool_or.status().message();
 
   const std::vector<int32_t> prompt = {1, 2};
   const GenerateParams params{.max_new_tokens = 3, .eos_id = 0};
-
-  StatusOr<PrefillResult> pref = runner.prefill(prompt);
-  ASSERT_TRUE(pref.ok()) << pref.status().message();
-
-  std::vector<int32_t> expected;
-  StatusOr<int32_t> token = argmax(pref.value().logits);
-  ASSERT_TRUE(token.ok()) << token.status().message();
-  expected.push_back(token.value());
-
-  for (int i = 1; i < params.max_new_tokens && token.value() != params.eos_id; ++i) {
-    StatusOr<DecodeResult> dec = runner.decode(pref.value().cache, token.value());
-    ASSERT_TRUE(dec.ok()) << dec.status().message();
-    token = argmax(dec.value().logits);
-    ASSERT_TRUE(token.ok()) << token.status().message();
-    expected.push_back(token.value());
-  }
-  ASSERT_TRUE(runner.release(pref.value().cache).ok());
-
-  Scheduler sched(runner);
-  StatusOr<std::vector<int32_t>> out = sched.generate(prompt, params);
+  StatusOr<std::vector<int32_t>> out =
+      greedy_generate(*runner, *pool_or.value(), *alloc, prompt, params);
   ASSERT_TRUE(out.ok()) << out.status().message();
-  ASSERT_EQ(out.value().size(), expected.size());
-  EXPECT_EQ(out.value(), expected);
+  ASSERT_EQ(out.value().size(), 3u);
   for (int32_t t : out.value()) {
     EXPECT_GE(t, 0);
     EXPECT_LT(t, cfg.vocab_size);

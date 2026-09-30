@@ -66,6 +66,10 @@ public:
   StatusOr<int64_t> seq_len(const CacheHandle& handle) const;
   Status set_seq_len(const CacheHandle& handle, int64_t len);
 
+  size_t slot_bytes() const { return layout_.slot_bytes; }
+  // returns a pointer into the cache slot
+  StatusOr<void*> slot_ptr(const CacheHandle& handle) const;
+
   CachePool(const CachePool&) = delete;
   CachePool& operator=(const CachePool&) = delete;
 };

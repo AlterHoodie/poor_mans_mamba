@@ -38,6 +38,28 @@ struct PoolFixture {
 
 } // namespace
 
+TEST(CachePool, SlotPtrIsContiguousInSlab) {
+  const ModelConfig cfg = make_valid_config();
+  StatusOr<PoolFixture> fix_or = PoolFixture::create(cfg, /*num_slots=*/2);
+  ASSERT_TRUE(fix_or.ok()) << fix_or.status().message();
+  CachePool& pool = *fix_or.value().pool;
+
+  StatusOr<CacheHandle> h0 = pool.acquire();
+  StatusOr<CacheHandle> h1 = pool.acquire();
+  ASSERT_TRUE(h0.ok());
+  ASSERT_TRUE(h1.ok());
+
+  StatusOr<void*> p0 = pool.slot_ptr(h0.value());
+  StatusOr<void*> p1 = pool.slot_ptr(h1.value());
+  ASSERT_TRUE(p0.ok());
+  ASSERT_TRUE(p1.ok());
+  EXPECT_GT(pool.slot_bytes(), 0u);
+  const auto* a = static_cast<const std::byte*>(p0.value());
+  const auto* b = static_cast<const std::byte*>(p1.value());
+  const size_t delta = a < b ? static_cast<size_t>(b - a) : static_cast<size_t>(a - b);
+  EXPECT_EQ(delta, pool.slot_bytes());
+}
+
 TEST(CachePool, AcquireReleaseRoundTrip) {
   const ModelConfig cfg = make_valid_config();
   StatusOr<PoolFixture> fix_or = PoolFixture::create(cfg, /*num_slots=*/2);

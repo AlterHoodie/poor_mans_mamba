@@ -1,13 +1,17 @@
 #include "runtime/worker.h"
 
+#include "comm/comm_agent.h"
 #include "core/status.h"
 #include "ops/cpu/reductions.h"
 #include "runtime/cache/cache_layout.h"
 #include "runtime/cache/cache_pool.h"
 #include <sys/types.h>
 
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -169,10 +173,84 @@ Status Worker::release_(uint64_t req_id){
   return s;
 }
 
-Worker::Worker(std::unique_ptr<Runner> runner, std::unique_ptr<DeviceAllocator> alloc,
-               std::unique_ptr<CachePool> pool, std::function<void(Event)> emit)
-    : alloc_(std::move(alloc)), pool_(std::move(pool)), runner_(std::move(runner)),
-      emit_(std::move(emit)) {
+std::optional<MigrateEvent> Worker::post_xfer_(const MigrateCmd& cmd, int64_t seq_len) {
+  auto hit = cache_handles_.find(cmd.req_id);
+  if (hit == cache_handles_.end())
+    return MigrateEvent{.req_id = cmd.req_id,
+                        .role = cmd.role,
+                        .s = Status::NotFound("migrate missing cache handle for req_id " +
+                                              std::to_string(cmd.req_id))};
+
+  StatusOr<void*> slot_or = pool_->slot_ptr(hit->second);
+  if (!slot_or.ok())
+    return MigrateEvent{.req_id = cmd.req_id, .role = cmd.role, .s = slot_or.status()};
+
+  XferDesc desc{
+      .local_ptr = slot_or.value(),
+      .remote_ptr = nullptr, // resolved via MemcpyPeer rendezvous
+      .bytes = pool_->slot_bytes(),
+      .peer_device_id = cmd.peer_device_id,
+      .role = cmd.role,
+      .xfer_id = cmd.req_id,
+      .seq_len = seq_len,
+  };
+
+  StatusOr<XferHandle> handle_or = comm_agent_->post(desc);
+  if (!handle_or.ok())
+    return MigrateEvent{.req_id = cmd.req_id, .role = cmd.role, .s = handle_or.status()};
+
+  pending_transfers_[cmd.req_id] =
+      PendingXfer{.handle = handle_or.value(), .role = cmd.role};
+  return std::nullopt;
+}
+
+std::optional<MigrateEvent> Worker::migrate_recv_(const MigrateCmd& cmd) {
+  // Recv: register a fresh slot for the incoming cache, then post.
+  if (Status s = register_(cmd.req_id); !s.ok())
+    return MigrateEvent{.req_id = cmd.req_id, .role = cmd.role, .s = s};
+  return post_xfer_(cmd, /*seq_len=*/0);
+}
+
+std::optional<MigrateEvent> Worker::migrate_send_(const MigrateCmd& cmd) {
+  // Send: existing handle required; publish seq_len with the transfer.
+  auto hit = cache_handles_.find(cmd.req_id);
+  if (hit == cache_handles_.end())
+    return MigrateEvent{
+        .req_id = cmd.req_id,
+        .role = cmd.role,
+        .s = Status::NotFound("Send migrate missing cache handle for req_id " +
+                              std::to_string(cmd.req_id))};
+
+  StatusOr<int64_t> sl = pool_->seq_len(hit->second);
+  if (!sl.ok())
+    return MigrateEvent{.req_id = cmd.req_id, .role = cmd.role, .s = sl.status()};
+  return post_xfer_(cmd, sl.value());
+}
+
+std::optional<MigrateEvent> Worker::migrate_(const MigrateCmd& cmd) {
+  if (!pool_)
+    return MigrateEvent{.req_id = cmd.req_id,
+                        .role = cmd.role,
+                        .s = Status::RuntimeError("cache pool not yet initialized")};
+  if (!alloc_)
+    return MigrateEvent{.req_id = cmd.req_id,
+                        .role = cmd.role,
+                        .s = Status::RuntimeError("allocator not yet initialized")};
+  if (!comm_agent_)
+    return MigrateEvent{.req_id = cmd.req_id,
+                        .role = cmd.role,
+                        .s = Status::RuntimeError("comm agent not yet initialized")};
+
+  if (cmd.role == XferRole::Recv)
+    return migrate_recv_(cmd);
+  return migrate_send_(cmd);
+}
+
+Worker::Worker(size_t index, std::unique_ptr<Runner> runner, std::unique_ptr<DeviceAllocator> alloc,
+               std::unique_ptr<CachePool> pool, std::unique_ptr<CommAgent> comm_agent,
+               std::function<void(Event)> emit)
+    : index_(index), alloc_(std::move(alloc)), pool_(std::move(pool)), runner_(std::move(runner)),
+      comm_agent_(std::move(comm_agent)), emit_(std::move(emit)) {
   thread_ = std::thread(&Worker::loop_, this);
 }
 
@@ -194,38 +272,98 @@ void Worker::enqueue(Command cmd){
   cmd_cv_.notify_one();
 }
 
+void Worker::poll_transfer_states_(){
+  for (auto it = pending_transfers_.begin(); it != pending_transfers_.end(); ) {
+    XferState state = comm_agent_->poll(it->second.handle);
+    switch (state) {
+      case XferState::Pending:
+        ++it;
+        break;
+      case XferState::Done: {
+        if (it->second.role == XferRole::Recv) {
+          auto hit = cache_handles_.find(it->first);
+          if (hit != cache_handles_.end()) {
+            const int64_t sl = comm_agent_->xfer_seq_len(it->second.handle);
+            if (Status s = pool_->set_seq_len(hit->second, sl); !s.ok()) {
+              emit_(MigrateEvent{.req_id = it->first, .role = it->second.role, .s = s});
+              it = pending_transfers_.erase(it);
+              break;
+            }
+          }
+        }
+        emit_(MigrateEvent{
+            .req_id = it->first, .role = it->second.role, .s = Status::Ok()});
+        it = pending_transfers_.erase(it);
+        break;
+      }
+      case XferState::Error:
+        emit_(MigrateEvent{
+            .req_id = it->first,
+            .role = it->second.role,
+            .s = Status::RuntimeError("transfer failed for req_id: " +
+                                      std::to_string(it->first))});
+        it = pending_transfers_.erase(it);
+        break;
+    }
+  }
+}
+
 void Worker::loop_(){
+#ifdef MAMBASERVE_WITH_CUDA
+  if (alloc_ && alloc_->kind() == Device::GPU) {
+    cudaError_t err = cudaSetDevice(alloc_->device_id());
+    if (err != cudaSuccess) {
+      // Device bind failed; subsequent CUDA work will surface errors.
+    }
+  }
+#endif
   for(;;){
+    poll_transfer_states_();
+
     Command cmd;
     {
       std::unique_lock<std::mutex> lk(cmd_mu_);
+
+      // poll only when they are active transfers
+      if(!pending_transfers_.empty()){
+        // wake on: new cmd, stop or timeout so we can poll again
+        cmd_cv_.wait_for(lk, std::chrono::milliseconds(1), [&] {return !cmdq_.empty() || stop_;});
+      } else { // else simply wait on the queue
       cmd_cv_.wait(lk, [&](){return !cmdq_.empty() || stop_;});
-      if (cmdq_.empty() && stop_)
+      }
+
+      if (cmdq_.empty() && stop_ && pending_transfers_.empty())
         return;
+      if(cmdq_.empty()) // wait_for timed out with only pending work - loop back to poll
+        continue;
       cmd = std::move(cmdq_.front());
       cmdq_.pop_front();
     }
 
-    // execute the command
-    Event ev = std::visit(overloaded{
-      [&](PrefillCmd& c) -> Event {
-        if(auto s = register_(c.req_id); !s.ok()){
-          return PrefillEvent{.req_id = c.req_id, .s = s};
-        }
-        return prefill_(c.req_id, c.tokens);
-      },
-      [&](DecodeCmd& c) -> Event {
-        return decode_(c.req_id, c.token);
-      },
-      [&](ReleaseCmd& c) -> Event {
-        return ReleaseEvent{.req_id = c.req_id, .s = release_(c.req_id)};
-      },
-      [&](MigrateCmd& c) -> Event {
-        return MigrateEvent{.req_id = c.req_id,
-                            .s = Status::NotImplemented("migrate")};
-      },
-    }, cmd);
-    // push the result into the cluster queue
-    emit_(std::move(ev));
+    // Migrate posts asynchronously; only Prefill/Decode/Release/fail emit here.
+    // Event is not assignable (const token fields), so emplace into optional.
+    std::optional<Event> ev;
+    std::visit(overloaded{
+                   [&](PrefillCmd& c) {
+                     if (auto s = register_(c.req_id); !s.ok()) {
+                       ev.emplace(PrefillEvent{.req_id = c.req_id, .s = s});
+                       return;
+                     }
+                     ev.emplace(prefill_(c.req_id, c.tokens));
+                   },
+                   [&](DecodeCmd& c) { ev.emplace(decode_(c.req_id, c.token)); },
+                   [&](ReleaseCmd& c) {
+                     ev.emplace(ReleaseEvent{.req_id = c.req_id,
+                                             .worker_idx = index_,
+                                             .s = release_(c.req_id)});
+                   },
+                   [&](MigrateCmd& c) {
+                     if (auto m = migrate_(c))
+                       ev.emplace(*m);
+                   },
+               },
+               cmd);
+    if (ev)
+      emit_(std::move(*ev));
   }
 }

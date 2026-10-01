@@ -60,7 +60,7 @@ Pure Mamba has fixed-size recurrent state: convolution state plus SSM state. Hyb
                     +------------------+
 ```
 
-Design notes for the cluster scheduler / workers / transports: [docs/cluster_runtime.md](docs/cluster_runtime.md).
+Design notes for the cluster scheduler / workers / transports: [docs/cluster_runtime.md](docs/cluster_runtime.md). Implemented CommAgent backends and migration FSM: [docs/comm_and_migration.md](docs/comm_and_migration.md).
 
 ## Metrics
 

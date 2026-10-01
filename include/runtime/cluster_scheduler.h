@@ -1,9 +1,13 @@
 #pragma once
 
+#include "comm/comm_factory.h"
 #include "core/status.h"
 #include "io/config.h"
+#include "runtime/cluster_config.h"
 #include "runtime/model_registry.h"
 #include "runtime/policy/placement_policy.h"
+#include "runtime/policy/rebalance_policy.h"
+#include "runtime/session.h"
 #include "runtime/worker.h"
 
 #include <atomic>
@@ -32,22 +36,6 @@ struct WorkerSlot {
   std::unique_ptr<Worker> worker;
 };
 
-enum class SessionPhase { Prefilling, Decoding, Migrating, Done, Failed };
-
-// Control-plane bookkeeping for one in-flight generate() request. Only the
-// event-processing thread and poll()/submit() (under session_mu_) touch this.
-struct Session {
-  std::vector<int32_t> generated_tokens;
-  GenerateParams params;
-  SessionPhase phase = SessionPhase::Prefilling;
-  Status s = Status::Ok();
-  size_t worker_idx = 0;
-  size_t migrate_dst_idx = 0;
-  int migrate_acks = 0;
-  // When set, the next decode boundary starts migrate instead of another Decode.
-  bool migrate_pending = false;
-};
-
 // takes in some sort of config , spins up that many threads of workers
 // , a placement policy that returns a worker view for a given request
 // pushes cmds using workers->enqueue
@@ -66,8 +54,12 @@ private:
   // array of worker stats (index-aligned with workers_)
   std::vector<WorkerStat> worker_stats_;
 
+  ClusterConfig cfg_{};
+  std::shared_ptr<TransportContext> transport_ctx_;
+
   // policy that decides which worker to be chosen from
   std::unique_ptr<PlacementPolicy> policy_;
+  std::unique_ptr<RebalancePolicy> rebalance_;
 
   // for simple request id generation
   std::atomic<uint64_t> req_id_counter_{0};
@@ -77,8 +69,7 @@ private:
   mutable std::mutex session_mu_;
   std::unordered_map<uint64_t, Session> sessions_;
 
-  StatusOr<WorkerSlot> create_worker_(const ModelEntry& entry, Device kind, int device_id,
-                                      int num_slots);
+  StatusOr<WorkerSlot> create_worker_(const ModelEntry& entry, int device_id);
 
   // drains eventq_ and applies PrefillDone/DecodeDone/Released/Migrated
   // to the matching session, driving the next command (decode/release).
@@ -93,10 +84,14 @@ private:
   void cancel_pending_migrate_(Session& sess);
   // After a successful Prefill/Decode token: Done, begin migrate, or continue decode.
   void continue_after_token_(Session& sess, uint64_t req_id, int32_t token);
+  // Call with session_mu_ held.
+  Status migrate_locked_(uint64_t req_id, size_t dst_idx);
+  void maybe_rebalance_();
 
 public:
-  // Defaults to SimplePlacementPolicy when policy is null / default-constructed.
-  explicit ClusterScheduler(std::unique_ptr<PlacementPolicy> policy = nullptr);
+  // Defaults to SimplePlacementPolicy / SimpleRebalancePolicy when null.
+  explicit ClusterScheduler(std::unique_ptr<PlacementPolicy> policy = nullptr,
+                            std::unique_ptr<RebalancePolicy> rebalance = nullptr);
 
   // submit token ids directly; tokenization is not wired into the
   // cluster scheduler yet (see runtime/tokenizer.h for the single-model
@@ -108,7 +103,7 @@ public:
   // (after the in-flight decode settles) so token history stays contiguous.
   Status migrate(uint64_t req_id, size_t dst_idx);
 
-  Status load_model(const std::string model_dir, Device kind, int n_devices, int num_slots = 8);
+  Status load_model(const ClusterConfig& cfg);
 
   // shutdown all workers (waits for all requests to be done) then shutsdown
   void shutdown();

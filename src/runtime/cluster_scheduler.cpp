@@ -1,15 +1,18 @@
 #include "runtime/cluster_scheduler.h"
 
-#include "comm/memcpy_peer_comm_agent.h"
+#include "comm/comm_factory.h"
 #include "core/device.h"
 #include "core/status.h"
 #include "runtime/cache/cache_layout.h"
 #include "runtime/cache/cache_pool.h"
+#include "runtime/policy/rebalance_policy.h"
 #include "runtime/runner/runner.h"
 #include "runtime/worker.h"
 
 #include <memory>
+#include <optional>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -24,61 +27,79 @@ overloaded(Ts...) -> overloaded<Ts...>;
 
 } // namespace
 
-ClusterScheduler::ClusterScheduler(std::unique_ptr<PlacementPolicy> policy)
-    : policy_(std::move(policy)) {
+ClusterScheduler::ClusterScheduler(std::unique_ptr<PlacementPolicy> policy,
+                                   std::unique_ptr<RebalancePolicy> rebalance)
+    : policy_(std::move(policy)), rebalance_(std::move(rebalance)) {
   if (!policy_)
     policy_ = std::make_unique<SimplePlacementPolicy>();
+  if (!rebalance_)
+    rebalance_ = std::make_unique<SimpleRebalancePolicy>();
 }
 
 ClusterScheduler::~ClusterScheduler() { shutdown(); }
 
-Status ClusterScheduler::load_model(const std::string model_dir, Device kind, int n_workers,
-                                    int num_slots) {
-#if !MAMBASERVE_WITH_CUDA
-  if (kind == Device::GPU)
-    return Status::InvalidArgument("Cannot create gpu workers in a non gpu host");
-#endif
-  if (n_workers <= 0)
-    return Status::InvalidArgument("n_workers must be > 0");
-  if (num_slots <= 0)
-    return Status::InvalidArgument("num_slots must be > 0");
+Status ClusterScheduler::load_model(const ClusterConfig& cfg) {
   if (!workers_.empty())
     return Status::InvalidArgument("ClusterScheduler already has a loaded model");
 
-  ModelEntry entry;
-  ASSIGN_OR_RETURN(entry, ModelRegistry::open(model_dir, kDefaultMaxSeqLength));
+  std::shared_ptr<TransportContext> ctx;
+  ASSIGN_OR_RETURN(ctx, create_transport_context(cfg));
 
-  for (int device_id = 0; device_id < n_workers; ++device_id) {
-    StatusOr<WorkerSlot> slot_or = create_worker_(entry, kind, device_id, num_slots);
-    if (!slot_or.ok())
+  ModelEntry entry;
+  ASSIGN_OR_RETURN(entry, ModelRegistry::open(cfg.model_dir, kDefaultMaxSeqLength));
+
+  cfg_ = cfg;
+  transport_ctx_ = std::move(ctx);
+
+  for (int device_id = 0; device_id < cfg_.n_workers; ++device_id) {
+    StatusOr<WorkerSlot> slot_or = create_worker_(entry, device_id);
+    if (!slot_or.ok()) {
+      workers_.clear();
+      worker_stats_.clear();
+      transport_ctx_.reset();
       return slot_or.status();
+    }
     workers_.push_back(std::move(slot_or.value()));
     worker_stats_.push_back(WorkerStat{
         .index = workers_.size() - 1,
-        .capacity = num_slots,
+        .capacity = cfg_.num_slots,
         .inflight = 0,
     });
+  }
+
+  if (Status s = finalize_transport_peers(transport_ctx_); !s.ok()) {
+    workers_.clear();
+    worker_stats_.clear();
+    transport_ctx_.reset();
+    return s;
   }
 
   event_thread_ = std::thread(&ClusterScheduler::event_loop_, this);
   return Status::Ok();
 }
 
-StatusOr<WorkerSlot> ClusterScheduler::create_worker_(const ModelEntry& entry, Device kind,
-                                                      int device_id, int num_slots) {
+StatusOr<WorkerSlot> ClusterScheduler::create_worker_(const ModelEntry& entry, int device_id) {
   if (device_id < 0)
     return Status::InvalidArgument("device id cannot be less than 0");
   if (!entry.cfg)
     return Status::RuntimeError("ModelEntry has no config");
 
   std::unique_ptr<DeviceAllocator> alloc;
-  ASSIGN_OR_RETURN(alloc, create_device_allocator(kind, device_id));
+  ASSIGN_OR_RETURN(alloc, create_device_allocator(cfg_.device, device_id));
 
   std::unique_ptr<Runner> runner;
   ASSIGN_OR_RETURN(runner, entry.create_runner(*alloc));
 
   std::unique_ptr<CachePool> pool;
-  ASSIGN_OR_RETURN(pool, create_cache_pool(*entry.cfg, alloc.get(), num_slots, create_cache_layout));
+  ASSIGN_OR_RETURN(pool,
+                   create_cache_pool(*entry.cfg, alloc.get(), cfg_.num_slots, create_cache_layout));
+
+  std::unique_ptr<CommAgent> agent;
+  ASSIGN_OR_RETURN(agent, create_comm_agent(cfg_, device_id, transport_ctx_));
+
+  // No-op for MemcpyPeer/NCCL; required for NIXL.
+  if (Status s = agent->register_slab(pool->slab_ptr(), pool->slab_bytes()); !s.ok())
+    return s;
 
   auto emit = [this](Event ev) {
     {
@@ -87,8 +108,6 @@ StatusOr<WorkerSlot> ClusterScheduler::create_worker_(const ModelEntry& entry, D
     }
     event_cv_.notify_one();
   };
-
-  auto agent = std::make_unique<MemcpyPeerCommAgent>(device_id, kind);
 
   WorkerSlot slot;
   slot.device_id = device_id;
@@ -143,8 +162,7 @@ Response ClusterScheduler::poll(uint64_t req_id) const {
   };
 }
 
-Status ClusterScheduler::migrate(uint64_t req_id, size_t dst_idx) {
-  std::lock_guard<std::mutex> lk(session_mu_);
+Status ClusterScheduler::migrate_locked_(uint64_t req_id, size_t dst_idx) {
   auto it = sessions_.find(req_id);
   if (it == sessions_.end())
     return Status::NotFound("unknown req_id");
@@ -169,6 +187,31 @@ Status ClusterScheduler::migrate(uint64_t req_id, size_t dst_idx) {
   sess.migrate_pending = true;
   sess.migrate_dst_idx = dst_idx;
   return Status::Ok();
+}
+
+Status ClusterScheduler::migrate(uint64_t req_id, size_t dst_idx) {
+  std::lock_guard<std::mutex> lk(session_mu_);
+  return migrate_locked_(req_id, dst_idx);
+}
+
+void ClusterScheduler::maybe_rebalance_() {
+  std::vector<SessionView> views;
+  views.reserve(sessions_.size());
+  for (const auto& [req_id, sess] : sessions_) {
+    views.push_back(SessionView{
+        .req_id = req_id,
+        .worker_idx = sess.worker_idx,
+        .phase = sess.phase,
+        .migrate_pending = sess.migrate_pending,
+        .gen_len = sess.generated_tokens.size(),
+    });
+  }
+
+  std::optional<RebalanceDecision> decision = rebalance_->check(worker_stats_, views);
+  if (!decision.has_value())
+    return;
+  
+    (void)migrate_locked_(decision->victim_req_id, decision->dst_idx);
 }
 
 void ClusterScheduler::begin_migrate_(Session& sess, uint64_t req_id, size_t dst_idx) {
@@ -234,6 +277,7 @@ void ClusterScheduler::continue_after_token_(Session& sess, uint64_t req_id, int
   // if not migration pending and decode phase is not done yet let it decode more
   sess.phase = SessionPhase::Decoding;
   worker.enqueue(DecodeCmd{req_id, token});
+  maybe_rebalance_();
 }
 
 void ClusterScheduler::event_loop_() {

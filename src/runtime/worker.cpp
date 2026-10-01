@@ -5,6 +5,9 @@
 #include "ops/cpu/reductions.h"
 #include "runtime/cache/cache_layout.h"
 #include "runtime/cache/cache_pool.h"
+#include "telemetry/log.h"
+#include "telemetry/nvtx.h"
+#include "telemetry/recorder.h"
 #include <sys/types.h>
 
 #include <chrono>
@@ -201,6 +204,11 @@ std::optional<MigrateEvent> Worker::post_xfer_(const MigrateCmd& cmd, int64_t se
 
   pending_transfers_[cmd.req_id] =
       PendingXfer{.handle = handle_or.value(), .role = cmd.role};
+  telemetry::trace(telemetry::TraceKind::MigrateXferPosted, cmd.req_id, static_cast<int>(index_),
+                   cmd.role == XferRole::Recv ? 1 : 0, static_cast<int64_t>(desc.bytes));
+  LOG_DEBUG("migrate xfer posted req_id=%llu worker=%zu role=%s peer=%d bytes=%zu",
+            static_cast<unsigned long long>(cmd.req_id), index_,
+            cmd.role == XferRole::Recv ? "recv" : "send", cmd.peer_device_id, desc.bytes);
   return std::nullopt;
 }
 
@@ -273,6 +281,16 @@ void Worker::enqueue(Command cmd){
 }
 
 void Worker::poll_transfer_states_(){
+  using telemetry::TraceKind;
+  auto xfer_done = [&](uint64_t req_id, XferRole role, bool ok) {
+    telemetry::trace(TraceKind::MigrateXferDone, req_id, static_cast<int>(index_),
+                     role == XferRole::Recv ? 1 : 0, ok ? 1 : 0);
+    if (ok && role == XferRole::Send && pool_)
+      telemetry::counters().bytes_migrated += pool_->slot_bytes();
+    LOG_DEBUG("migrate xfer done req_id=%llu worker=%zu role=%s ok=%d",
+              static_cast<unsigned long long>(req_id), index_,
+              role == XferRole::Recv ? "recv" : "send", ok ? 1 : 0);
+  };
   for (auto it = pending_transfers_.begin(); it != pending_transfers_.end(); ) {
     XferState state = comm_agent_->poll(it->second.handle);
     switch (state) {
@@ -285,18 +303,23 @@ void Worker::poll_transfer_states_(){
           if (hit != cache_handles_.end()) {
             const int64_t sl = comm_agent_->xfer_seq_len(it->second.handle);
             if (Status s = pool_->set_seq_len(hit->second, sl); !s.ok()) {
+              xfer_done(it->first, it->second.role, false);
               emit_(MigrateEvent{.req_id = it->first, .role = it->second.role, .s = s});
               it = pending_transfers_.erase(it);
               break;
             }
           }
         }
+        xfer_done(it->first, it->second.role, true);
         emit_(MigrateEvent{
             .req_id = it->first, .role = it->second.role, .s = Status::Ok()});
         it = pending_transfers_.erase(it);
         break;
       }
       case XferState::Error:
+        xfer_done(it->first, it->second.role, false);
+        LOG_ERROR("transfer failed req_id=%llu worker=%zu",
+                  static_cast<unsigned long long>(it->first), index_);
         emit_(MigrateEvent{
             .req_id = it->first,
             .role = it->second.role,
@@ -345,21 +368,44 @@ void Worker::loop_(){
     std::optional<Event> ev;
     std::visit(overloaded{
                    [&](PrefillCmd& c) {
+                     MS_NVTX_RANGE("prefill");
+                     const int w = static_cast<int>(index_);
+                     telemetry::trace(telemetry::TraceKind::PrefillStart, c.req_id, w,
+                                      static_cast<int64_t>(c.tokens.size()));
                      if (auto s = register_(c.req_id); !s.ok()) {
+                       if (s.code() == Code::kOOM)
+                         telemetry::counters().slot_rejects++;
+                       LOG_WARN("prefill register failed req_id=%llu worker=%d: %s",
+                                static_cast<unsigned long long>(c.req_id), w, s.message().c_str());
+                       telemetry::trace(telemetry::TraceKind::PrefillEnd, c.req_id, w, 0);
                        ev.emplace(PrefillEvent{.req_id = c.req_id, .s = s});
                        return;
                      }
                      ev.emplace(prefill_(c.req_id, c.tokens));
+                     telemetry::trace(telemetry::TraceKind::PrefillEnd, c.req_id, w,
+                                      std::get<PrefillEvent>(*ev).s.ok() ? 1 : 0);
                    },
-                   [&](DecodeCmd& c) { ev.emplace(decode_(c.req_id, c.token)); },
+                   [&](DecodeCmd& c) {
+                     MS_NVTX_RANGE("decode");
+                     const int w = static_cast<int>(index_);
+                     telemetry::trace(telemetry::TraceKind::DecodeStart, c.req_id, w);
+                     ev.emplace(decode_(c.req_id, c.token));
+                     telemetry::trace(telemetry::TraceKind::DecodeEnd, c.req_id, w, 0,
+                                      std::get<DecodeEvent>(*ev).s.ok() ? 1 : 0);
+                   },
                    [&](ReleaseCmd& c) {
                      ev.emplace(ReleaseEvent{.req_id = c.req_id,
                                              .worker_idx = index_,
                                              .s = release_(c.req_id)});
                    },
                    [&](MigrateCmd& c) {
-                     if (auto m = migrate_(c))
+                     MS_NVTX_RANGE("migrate_post");
+                     if (auto m = migrate_(c)) {
+                       LOG_ERROR("migrate post failed req_id=%llu worker=%zu: %s",
+                                 static_cast<unsigned long long>(c.req_id), index_,
+                                 m->s.message().c_str());
                        ev.emplace(*m);
+                     }
                    },
                },
                cmd);

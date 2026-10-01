@@ -23,6 +23,7 @@ else()
 endif()
 
 include(FetchContent)
+find_package(Threads REQUIRED)
 
 FetchContent_Declare(
     nlohmann_json
@@ -110,6 +111,33 @@ target_link_libraries(model
 )
 target_compile_definitions(model PRIVATE SAFETENSORS_CPP_NO_IMPLEMENTATION)
 
+# Telemetry: leveled logging, per-thread trace recorder, counters, run metadata.
+option(MAMBASERVE_WITH_NVTX "Emit NVTX ranges for Nsight Systems" OFF)
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    OUTPUT_VARIABLE MAMBASERVE_GIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT MAMBASERVE_GIT_HASH)
+  set(MAMBASERVE_GIT_HASH "unknown")
+endif()
+file(GLOB_RECURSE TELEMETRY_SOURCES CONFIGURE_DEPENDS
+    "src/telemetry/*.cpp"
+)
+add_library(telemetry ${TELEMETRY_SOURCES})
+target_link_libraries(telemetry PUBLIC mambaserve_common core)
+target_compile_definitions(telemetry PRIVATE MAMBASERVE_GIT_HASH="${MAMBASERVE_GIT_HASH}")
+if(MAMBASERVE_WITH_NVTX)
+  if(NOT MAMBASERVE_WITH_CUDA)
+    message(FATAL_ERROR "MAMBASERVE_WITH_NVTX requires MAMBASERVE_WITH_CUDA=ON")
+  endif()
+  target_compile_definitions(telemetry PUBLIC MAMBASERVE_WITH_NVTX=1)
+  target_link_libraries(telemetry PUBLIC CUDA::cudart)
+  target_link_libraries(telemetry PUBLIC ${CMAKE_DL_LIBS})
+endif()
+
 # Runtime Library holds actual logic to run the model across different runtimes - cpu, gpu, multi-gpu etc.
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
     "src/runtime/*.cpp"
@@ -125,6 +153,7 @@ target_link_libraries(runtime
         io
         core
         ops
+        telemetry
     PRIVATE 
         tokenizers_cpp
         safetensors-cpp::safetensors_cpp

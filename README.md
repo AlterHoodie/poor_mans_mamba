@@ -80,6 +80,32 @@ cmake --build build-cuda --target benches
 ./build-cuda/benchmarks/benches --device CPU --benchmark_counters_tabular=true
 ```
 
+## Multi-GPU benchmarking and telemetry
+
+Two plain-`main()` drivers (CSV output) sit next to the google-benchmark `benches` target:
+
+* `transport_bench`: model-free CommAgent microbenchmark (MemcpyPeer / NCCL / NIXL plus a raw `cudaMemcpyPeerAsync` baseline). Size sweep, uni/bidirectional, one-time setup cost reported separately.
+* `cluster_bench`: drives `ClusterScheduler`. Scenarios `scale` (workers x sessions), `migrate` (forced migrations, idle vs busy peer GPU, state size via `--max-seq`), `rebalance` (skewed load, policy off/on).
+
+```text
+cmake -S . -B build-cuda -DMAMBASERVE_WITH_CUDA=ON -DMAMBASERVE_WITH_NCCL=ON \
+      -DMAMBASERVE_WITH_NIXL=ON -DBUILD_BENCHMARKS=ON [-DMAMBASERVE_WITH_NVTX=ON]
+cmake --build build-cuda --target transport_bench cluster_bench
+scripts/run_matrix.sh            # full matrix on a 2-GPU VM -> results/<timestamp>/report.md
+```
+
+`scripts/run_matrix.sh` runs per transport variant (`memcpy`, `nccl`, `nccl_nop2p`, `nixl_cudaipc`, `nixl_hoststaged`), records the NCCL/UCX path actually chosen (`paths` stage), compares `MAMBASERVE_LOG=off` vs `debug` (`logcheck` stage), and calls `scripts/analyze.py` for the report. Use `STAGES=...`, `DEVICE=CPU REPEATS=1` for subsets or a no-GPU smoke test.
+
+**Telemetry.** `MAMBASERVE_LOG=debug|info|warn|error|off` (default `warn`) controls logging. The trace recorder (`include/telemetry/recorder.h`) stamps submit, prefill, every decode, and each migrate phase per thread with no shared lock; `cluster_bench` enables it and derives TTFT, ITL, migrate wait/transfer/ack/stall, and background-session interference from it. Counters (bytes migrated, rebalance decisions, slot rejects, ...) land in `summary.csv`. NVTX ranges for Nsight Systems are compiled in with `-DMAMBASERVE_WITH_NVTX=ON`.
+
+**Reading the numbers.**
+
+* Everything is one process with a thread per worker. NIXL runs over UCX between local GPUs (`cuda_ipc` or host staged), not network RDMA, so results are intra-node only.
+* A migrate always moves the whole slot (`slot_bytes`, set by `--max-seq`), not just the used KV prefix. State size is therefore swept with `--max-seq`.
+* The worker polls transfers on a 1 ms tick, so host-side `xfer_us` is only reliable above about 1 ms. Use `transport_bench` for fine-grained transfer latency.
+* NCCL and NIXL senders ack at post time; the receive side marks real completion.
+* Needs at least `workers + 3` hardware threads (workers, event thread, driver, migrate driver) for clean numbers.
+
 ## Status
 
 CPU Mamba2 and Falcon-H1 runners, hybrid cache, scheduler, tokenizer, CUDA backends, and the generate latency/throughput harness are in place. Active work is multi-GPU static placement: full-model replicas with admission-time routing.

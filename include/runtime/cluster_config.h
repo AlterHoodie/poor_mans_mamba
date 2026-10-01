@@ -14,4 +14,6 @@ struct ClusterConfig {
   int n_workers = 1;
   int num_slots = 8;
   TransportBackend transport = TransportBackend::MemcpyPeer;
+  // Per-slot capacity; sets cache slot bytes and therefore bytes moved per migrate.
+  int max_seq_length = 2048;
 };

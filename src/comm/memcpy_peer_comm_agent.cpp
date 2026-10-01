@@ -120,6 +120,14 @@ Status MemcpyPeerCommAgent::ensure_peer_access_(int peer_device_id) {
   if (err != cudaSuccess) {
     return Status::RuntimeError(std::string("cudaSetDevice failed: ") + cudaGetErrorString(err));
   }
+  // Without P2P support (e.g. consumer cards, T4 pairs on some hosts) skip the enable:
+  // cudaMemcpyPeer still works and stages through host memory.
+  int can_access = 0;
+  if (cudaDeviceCanAccessPeer(&can_access, device_id(), peer_device_id) != cudaSuccess ||
+      !can_access) {
+    (void)cudaGetLastError();
+    return Status::Ok();
+  }
   err = cudaDeviceEnablePeerAccess(peer_device_id, 0);
   if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
     return Status::RuntimeError(std::string("cudaDeviceEnablePeerAccess failed: ") +

@@ -67,6 +67,9 @@ public:
   Status set_seq_len(const CacheHandle& handle, int64_t len);
 
   size_t slot_bytes() const { return layout_.slot_bytes; }
+  // Entire pool allocation (for CommAgent::register_slab / NIXL).
+  void* slab_ptr() const { return slab_.ptr; }
+  size_t slab_bytes() const { return slab_.bytes; }
   // returns a pointer into the cache slot
   StatusOr<void*> slot_ptr(const CacheHandle& handle) const;
 

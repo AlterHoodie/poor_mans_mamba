@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(MAMBASERVE_WITH_CUDA "Build Cuda ops/ CudaAllocator" OFF)
+option(MAMBASERVE_WITH_NCCL "Build NCCL transport backend" OFF)
+option(MAMBASERVE_WITH_NIXL "Build NIXL transport backend" OFF)
 
 # CMAKE_CUDA_ARCHITECTURES must be set before project(... CUDA) / enable_language(CUDA),
 # otherwise CMake fills a default (e.g. 52) and a later set is ignored.
@@ -112,7 +114,10 @@ target_compile_definitions(model PRIVATE SAFETENSORS_CPP_NO_IMPLEMENTATION)
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
     "src/runtime/*.cpp"
 )
-add_library(runtime ${RUNTIME_SOURCES})
+file(GLOB_RECURSE COMM_SOURCES CONFIGURE_DEPENDS
+    "src/comm/*.cpp"
+)
+add_library(runtime ${RUNTIME_SOURCES} ${COMM_SOURCES})
 target_link_libraries(runtime
     PUBLIC 
         mambaserve_common
@@ -124,6 +129,61 @@ target_link_libraries(runtime
         tokenizers_cpp
         safetensors-cpp::safetensors_cpp
 )
+
+if(MAMBASERVE_WITH_NCCL)
+  if(NOT MAMBASERVE_WITH_CUDA)
+    message(FATAL_ERROR "MAMBASERVE_WITH_NCCL requires MAMBASERVE_WITH_CUDA=ON")
+  endif()
+  find_path(NCCL_INCLUDE_DIR nccl.h
+    HINTS ${NCCL_ROOT} $ENV{NCCL_ROOT} ${CUDAToolkit_INCLUDE_DIRS}
+    PATH_SUFFIXES include)
+  find_library(NCCL_LIBRARY nccl
+    HINTS ${NCCL_ROOT} $ENV{NCCL_ROOT} ${CUDAToolkit_LIBRARY_DIR}
+    PATH_SUFFIXES lib lib64)
+  if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+    message(FATAL_ERROR "NCCL not found (set NCCL_ROOT or install libnccl)")
+  endif()
+  target_include_directories(runtime PRIVATE ${NCCL_INCLUDE_DIR})
+  target_link_libraries(runtime PUBLIC ${NCCL_LIBRARY} CUDA::cudart)
+  target_compile_definitions(runtime PUBLIC MAMBASERVE_WITH_NCCL=1)
+else()
+  target_compile_definitions(runtime PUBLIC MAMBASERVE_WITH_NCCL=0)
+endif()
+
+if(MAMBASERVE_WITH_NIXL)
+  if(NOT MAMBASERVE_WITH_CUDA)
+    message(FATAL_ERROR "MAMBASERVE_WITH_NIXL requires MAMBASERVE_WITH_CUDA=ON")
+  endif()
+  find_path(NIXL_INCLUDE_DIR nixl.h
+    HINTS ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
+    PATH_SUFFIXES include)
+  find_library(NIXL_LIBRARY nixl
+    HINTS ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
+    PATH_SUFFIXES lib lib64)
+  if(NOT NIXL_INCLUDE_DIR OR NOT NIXL_LIBRARY)
+    message(FATAL_ERROR "NIXL not found (set NIXL_ROOT or install libnixl)")
+  endif()
+  target_include_directories(runtime PRIVATE ${NIXL_INCLUDE_DIR})
+  target_link_libraries(runtime PUBLIC ${NIXL_LIBRARY} CUDA::cudart)
+
+  # NIXL often needs UCX at link/runtime; pull it in when present.
+  find_library(UCX_UCP_LIBRARY ucp
+    HINTS ${UCX_ROOT} $ENV{UCX_ROOT} ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
+    PATH_SUFFIXES lib lib64)
+  find_library(UCX_UCS_LIBRARY ucs
+    HINTS ${UCX_ROOT} $ENV{UCX_ROOT} ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
+    PATH_SUFFIXES lib lib64)
+  if(UCX_UCP_LIBRARY)
+    target_link_libraries(runtime PUBLIC ${UCX_UCP_LIBRARY})
+  endif()
+  if(UCX_UCS_LIBRARY)
+    target_link_libraries(runtime PUBLIC ${UCX_UCS_LIBRARY})
+  endif()
+
+  target_compile_definitions(runtime PUBLIC MAMBASERVE_WITH_NIXL=1)
+else()
+  target_compile_definitions(runtime PUBLIC MAMBASERVE_WITH_NIXL=0)
+endif()
 
 file(GLOB_RECURSE OPS_CPU_SOURCES CONFIGURE_DEPENDS
     "src/ops/*.cpp"

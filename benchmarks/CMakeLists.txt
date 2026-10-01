@@ -33,3 +33,24 @@ if(MAMBASERVE_WITH_CUDA)
     target_compile_definitions(benches PRIVATE MAMBASERVE_WITH_CUDA=1)
     target_link_libraries(benches PRIVATE CUDA::cudart)
 endif()
+
+# ---- transport / cluster drivers (plain mains, CSV output, no google-benchmark) ----
+foreach(drv transport_bench cluster_bench)
+    add_executable(${drv} ${drv}.cpp)
+    target_include_directories(${drv} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(${drv}
+        PRIVATE
+            core
+            io
+            model
+            runtime
+            telemetry
+            safetensors-cpp::safetensors_cpp
+            ops
+            Threads::Threads
+    )
+    if(MAMBASERVE_WITH_CUDA)
+        target_compile_definitions(${drv} PRIVATE MAMBASERVE_WITH_CUDA=1)
+        target_link_libraries(${drv} PRIVATE CUDA::cudart)
+    endif()
+endforeach()

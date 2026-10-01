@@ -75,6 +75,7 @@ public:
 
 const OpsBackend& cpu_ops();
 #ifdef MAMBASERVE_WITH_CUDA
-const OpsBackend& cuda_ops();
+// Per-device backend (cuBLAS handle is device-bound). Default 0 for single-GPU tests.
+const OpsBackend& cuda_ops(int device_id = 0);
 #endif
-const OpsBackend& ops_for(Device d);
+const OpsBackend& ops_for(Device d, int device_id = 0);

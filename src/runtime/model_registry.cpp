@@ -45,8 +45,8 @@ StatusOr<std::unique_ptr<Runner>> create_mamba2_runner(const ModelConfig& config
     return s;
   }
 
-  return std::unique_ptr<Runner>(
-      std::make_unique<Mamba2Runner>(config, std::move(weights), ops_for(alloc.kind())));
+  return std::unique_ptr<Runner>(std::make_unique<Mamba2Runner>(
+      config, std::move(weights), ops_for(alloc.kind(), alloc.device_id())));
 }
 
 StatusOr<std::unique_ptr<ModelConfig>> parse_falcon_h1(const std::string& model_dir,
@@ -67,8 +67,8 @@ StatusOr<std::unique_ptr<Runner>> create_falcon_h1_runner(const ModelConfig& con
     return s;
   }
 
-  return std::unique_ptr<Runner>(
-      std::make_unique<FalconH1Runner>(config, std::move(weights), ops_for(alloc.kind())));
+  return std::unique_ptr<Runner>(std::make_unique<FalconH1Runner>(
+      config, std::move(weights), ops_for(alloc.kind(), alloc.device_id())));
 }
 
 const std::unordered_map<std::string, ModelTypeEntry>& type_entries() {

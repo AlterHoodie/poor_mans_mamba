@@ -1,7 +1,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -18,58 +21,80 @@
 #include "ops/gpu/rms_norm.cuh"
 
 namespace {
-    // y = x * W^T  with W: [N, K]
-    Status gpu_linear(cublasHandle_t handle, const Tensor& x, const Tensor& W, Tensor& y) {
-      if (Status s = require_f32(x, "x", Device::GPU); !s.ok())
-        return s;
-      if (Status s = require_f32(W, "W", Device::GPU); !s.ok())
-        return s;
-      if (Status s = require_f32(y, "y", Device::GPU); !s.ok())
-        return s;
+// y = x * W^T  with W: [N, K]
+Status gpu_linear(cublasHandle_t handle, const Tensor& x, const Tensor& W, Tensor& y) {
+  if (Status s = require_f32(x, "x", Device::GPU); !s.ok())
+    return s;
+  if (Status s = require_f32(W, "W", Device::GPU); !s.ok())
+    return s;
+  if (Status s = require_f32(y, "y", Device::GPU); !s.ok())
+    return s;
 
-      StatusOr<std::vector<int64_t>> expected = linear_output_shape(x, W);
-      if (!expected.ok())
-        return Status(expected.status());
-      if (!same_shape(y.shape, expected.value()))
-        return Status::InvalidArgument("out shape does not match linear result");
+  StatusOr<std::vector<int64_t>> expected = linear_output_shape(x, W);
+  if (!expected.ok())
+    return Status(expected.status());
+  if (!same_shape(y.shape, expected.value()))
+    return Status::InvalidArgument("out shape does not match linear result");
 
-      int64_t K = 0;
-      ASSIGN_OR_RETURN(K, x.last_dim());
-      const int64_t N = W.shape[0];
-      int64_t numel = 0;
-      ASSIGN_OR_RETURN(numel, x.numel());
-      const int M = static_cast<int>(numel / K);
+  int64_t K = 0;
+  ASSIGN_OR_RETURN(K, x.last_dim());
+  const int64_t N = W.shape[0];
+  int64_t numel = 0;
+  ASSIGN_OR_RETURN(numel, x.numel());
+  const int M = static_cast<int>(numel / K);
 
-      cudaError_t err =
-          linear_f32(handle, static_cast<const float*>(x.buffer.ptr),
-                     static_cast<const float*>(W.buffer.ptr), static_cast<float*>(y.buffer.ptr), M,
-                     static_cast<int>(N), static_cast<int>(K));
-      if (err != cudaSuccess)
-        return Status::RuntimeError("linear_f32 / cublasSgemm failed");
-      return Status::Ok();
-    }
+  cudaError_t err =
+      linear_f32(handle, static_cast<const float*>(x.buffer.ptr),
+                 static_cast<const float*>(W.buffer.ptr), static_cast<float*>(y.buffer.ptr), M,
+                 static_cast<int>(N), static_cast<int>(K));
+  if (err != cudaSuccess)
+    return Status::RuntimeError(std::string("linear_f32 / cublasSgemm failed: ") +
+                                cudaGetErrorString(err));
+  return Status::Ok();
+}
 
-    Status ensure_cublas(cublasHandle_t& handle) {
-      if (handle)
-        return Status::Ok();
-      if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS)
-        return Status::RuntimeError("cublasCreate failed");
-      return Status::Ok();
-    }
+StatusOr<Tensor> alloc_gpu_f32(std::vector<int64_t> shape) {
+  StatusOr<Tensor> t = allocate_f32_tensor(std::move(shape));
+  if (!t.ok())
+    return Status(t.status());
+  if (t.value().buffer.device != Device::GPU)
+    return Status::RuntimeError("allocate_f32_tensor did not use GPU allocator");
+  return std::move(t.value());
+}
 
-    StatusOr<Tensor> alloc_gpu_f32(std::vector<int64_t> shape) {
-      StatusOr<Tensor> t = allocate_f32_tensor(std::move(shape));
-      if (!t.ok())
-        return Status(t.status());
-      if (t.value().buffer.device != Device::GPU)
-        return Status::RuntimeError("allocate_f32_tensor did not use GPU allocator");
-      return std::move(t.value());
-    }
+int launch_grid(int n, int block) { return (n + block - 1) / block; }
+} // namespace
 
-    int launch_grid(int n, int block) { return (n + block - 1) / block; }
+CUDABackend::CUDABackend(int device_id) : OpsBackend(Device::GPU), device_id_(device_id) {}
+
+CUDABackend::~CUDABackend() {
+  if (!handle_)
+    return;
+  if (cudaSetDevice(device_id_) == cudaSuccess)
+    cublasDestroy(handle_);
+  handle_ = nullptr;
+}
+
+Status CUDABackend::bind_device_() const {
+  cudaError_t err = cudaSetDevice(device_id_);
+  if (err != cudaSuccess)
+    return Status::RuntimeError(std::string("cudaSetDevice failed: ") + cudaGetErrorString(err));
+  return Status::Ok();
+}
+
+Status CUDABackend::ensure_cublas_() const {
+  if (Status s = bind_device_(); !s.ok())
+    return s;
+  if (handle_)
+    return Status::Ok();
+  if (cublasCreate(&handle_) != CUBLAS_STATUS_SUCCESS)
+    return Status::RuntimeError("cublasCreate failed");
+  return Status::Ok();
 }
 
 Status CUDABackend::rms_norm(const Tensor& x, const Tensor& weight, float eps, Tensor& out) const {
+  if (Status s = bind_device_(); !s.ok())
+    return s;
     if (Status s = require_f32(x, "x", Device::GPU); !s.ok())
     return s;
     if (Status s = require_f32(weight, "weight", Device::GPU); !s.ok())
@@ -96,8 +121,10 @@ Status CUDABackend::rms_norm(const Tensor& x, const Tensor& weight, float eps, T
 }
 
 Status CUDABackend::add(const Tensor& a, const Tensor& b, Tensor& out) const {
+  if (Status s = bind_device_(); !s.ok())
+    return s;
     if (Status s = require_f32(a, "a", Device::GPU); !s.ok())
-        return s;
+    return s;
     if (Status s = require_f32(b, "b", Device::GPU); !s.ok())
         return s;
     if (Status s = require_f32(out, "out", Device::GPU); !s.ok())
@@ -121,8 +148,10 @@ Status CUDABackend::add(const Tensor& a, const Tensor& b, Tensor& out) const {
 }
 
 Status CUDABackend::scale(Tensor& x, float s) const {
+  if (Status s_bind = bind_device_(); !s_bind.ok())
+    return s_bind;
     if (Status st = require_f32(x, "x", Device::GPU); !st.ok())
-        return st;
+    return st;
 
     int64_t numel = 0;
     ASSIGN_OR_RETURN(numel, x.numel());
@@ -134,7 +163,7 @@ Status CUDABackend::scale(Tensor& x, float s) const {
 }
 
 Status CUDABackend::linear(const Tensor& x, const Tensor& W, Tensor& out) const {
-  if (Status s = ensure_cublas(handle_); !s.ok())
+  if (Status s = ensure_cublas_(); !s.ok())
     return s;
   return gpu_linear(handle_, x, W, out);
 }
@@ -143,6 +172,8 @@ Status CUDABackend::embedding_lookup(const Tensor& table, const int32_t* tokens,
                                      float scale, Tensor& out) const {
   if (tokens == nullptr || n_tokens <= 0)
     return Status::InvalidArgument("embedding_lookup requires at least one token");
+  if (Status s = bind_device_(); !s.ok())
+    return s;
   if (Status s = require_f32(table, "table", Device::GPU); !s.ok())
     return s;
   if (Status s = require_f32(out, "out", Device::GPU); !s.ok())
@@ -186,6 +217,8 @@ Status CUDABackend::embedding_lookup(const Tensor& table, const int32_t* tokens,
 }
 
 Status CUDABackend::take_last_row(const Tensor& hidden, Tensor& out) const {
+  if (Status s = bind_device_(); !s.ok())
+    return s;
   if (Status s = require_f32(hidden, "hidden", Device::GPU); !s.ok())
     return s;
   if (Status s = require_f32(out, "out", Device::GPU); !s.ok())
@@ -226,6 +259,8 @@ Status CUDABackend::take_last_row(const Tensor& hidden, Tensor& out) const {
 Status CUDABackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, const MlpConfig& mlp,
                             const ScaleConfig* scales, Tensor& out) const {
   (void)mlp;
+  if (Status s = ensure_cublas_(); !s.ok())
+    return s;
   if (Status s = require_f32(normed_hidden, "normed_hidden", Device::GPU); !s.ok())
     return s;
   if (Status s = require_f32(out, "out", Device::GPU); !s.ok())
@@ -235,12 +270,6 @@ Status CUDABackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, co
 
   const float gate_mult = scales ? scales->mlp[0] : 1.f;
   const float down_mult = scales ? scales->mlp[1] : 1.f;
-
-  if (!handle_) {
-    if (cublasCreate(&handle_) != CUBLAS_STATUS_SUCCESS) {
-      return Status::RuntimeError("cublasCreate failed");
-    }
-  }
 
   std::vector<int64_t> up_shape;
   ASSIGN_OR_RETURN(up_shape, linear_output_shape(normed_hidden, w.up_proj));
@@ -362,7 +391,7 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
       return s;
   }
 
-  if (Status s = ensure_cublas(handle_); !s.ok())
+  if (Status s = ensure_cublas_(); !s.ok())
     return s;
 
   StatusOr<Tensor> scaled_or = alloc_gpu_f32(normed_hidden.shape);
@@ -546,7 +575,7 @@ Status CUDABackend::attention_f32(const Tensor& normed_hidden, const AttnWeights
   if (Status s = require_f32(w.o_proj, "o_proj", Device::GPU); !s.ok())
     return s;
 
-  if (Status s = ensure_cublas(handle_); !s.ok())
+  if (Status s = ensure_cublas_(); !s.ok())
     return s;
 
   StatusOr<std::vector<int64_t>> q_shape_or = linear_output_shape(normed_hidden, w.q_proj);
@@ -627,7 +656,14 @@ Status CUDABackend::attention_f32(const Tensor& normed_hidden, const AttnWeights
   return gpu_linear(handle_, attn_out, w.o_proj, out);
 }
 
-const OpsBackend& cuda_ops() {
-  static const CUDABackend k;
-  return k;
+const OpsBackend& cuda_ops(int device_id) {
+  if (device_id < 0)
+    device_id = 0;
+  static std::mutex mu;
+  static std::unordered_map<int, std::unique_ptr<CUDABackend>> backends;
+  std::lock_guard<std::mutex> lk(mu);
+  auto& slot = backends[device_id];
+  if (!slot)
+    slot = std::make_unique<CUDABackend>(device_id);
+  return *slot;
 }

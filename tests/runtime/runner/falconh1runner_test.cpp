@@ -348,7 +348,7 @@ TEST(FalconH1Runner, PrefillThenDecode) {
       return pref.status();
     if (Status s = pool->set_seq_len(handle, 2); !s.ok())
       return s;
-    return runner.decode(/*token=*/3, layers.value());
+    return runner.decode(/*token=*/3, layers.value(), /*past_len=*/2);
   }();
   ASSERT_TRUE(d0.ok()) << d0.status().message();
   ASSERT_EQ(d0.value().shape.size(), 1u);
@@ -356,7 +356,7 @@ TEST(FalconH1Runner, PrefillThenDecode) {
 
   StatusOr<Tensor> d1 = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    return runner.decode(/*token=*/4, layers.value());
+    return runner.decode(/*token=*/4, layers.value(), /*past_len=*/3);
   }();
   ASSERT_TRUE(d1.ok()) << d1.status().message();
 
@@ -421,7 +421,7 @@ TEST(FalconH1Runner, RegistryLoadsRealCheckpointPrefillDecode) {
   ASSERT_TRUE(pool->set_seq_len(handle, 2).ok());
   StatusOr<Tensor> dec = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    return runner_or.value()->decode(/*token=*/3, layers.value());
+    return runner_or.value()->decode(/*token=*/3, layers.value(), /*past_len=*/2);
   }();
   ASSERT_TRUE(dec.ok()) << dec.status().message();
   EXPECT_EQ(dec.value().shape[0], entry.cfg->vocab_size);

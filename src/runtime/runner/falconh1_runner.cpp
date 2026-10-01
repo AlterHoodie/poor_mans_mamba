@@ -8,6 +8,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef MAMBASERVE_WITH_CUDA
+#include <cuda_runtime.h>
+#endif
+
 FalconH1Runner::~FalconH1Runner() = default;
 
 FalconH1Runner::FalconH1Runner(ModelConfig cfg, FalconH1Weights weights, const OpsBackend& ops)
@@ -58,21 +62,35 @@ Status FalconH1Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tens
   if (Status s = ops_->scale(mamba_out.value(), ssm_out); !s.ok())
     return s;
 
-  StatusOr<Tensor> attn_in_t = allocate_f32_tensor(normed.value().shape);
-  if (!attn_in_t.ok())
-    return Status(attn_in_t.status());
-  {
-    // attn_in_t = normed * attn_in
-    std::memcpy(attn_in_t.value().buffer.ptr, normed.value().buffer.ptr,
-                normed.value().buffer.bytes);
-    if (Status s = ops_->scale(attn_in_t.value(), attn_in); !s.ok())
+  // attn_input = normed * attn_in (skip the copy when the scale is 1).
+  const Tensor* attn_input = &normed.value();
+  Tensor attn_scaled;
+  if (attn_in != 1.f) {
+    StatusOr<Tensor> scaled_or = allocate_f32_tensor(normed.value().shape);
+    if (!scaled_or.ok())
+      return Status(scaled_or.status());
+    attn_scaled = std::move(scaled_or.value());
+    if (normed.value().buffer.device == Device::CPU) {
+      std::memcpy(attn_scaled.buffer.ptr, normed.value().buffer.ptr, normed.value().buffer.bytes);
+    } else {
+#ifdef MAMBASERVE_WITH_CUDA
+      cudaError_t err = cudaMemcpy(attn_scaled.buffer.ptr, normed.value().buffer.ptr,
+                                   normed.value().buffer.bytes, cudaMemcpyDeviceToDevice);
+      if (err != cudaSuccess)
+        return Status::RuntimeError(std::string("attn_in copy failed: ") + cudaGetErrorString(err));
+#else
+      return Status::InvalidArgument("GPU FalconH1 requires CUDA");
+#endif
+    }
+    if (Status s = ops_->scale(attn_scaled, attn_in); !s.ok())
       return s;
+    attn_input = &attn_scaled;
   }
   AttnWeights aw{.q_proj = layer.q_proj,
                  .k_proj = layer.k_proj,
                  .v_proj = layer.v_proj,
                  .o_proj = layer.o_proj};
-  if (Status s = ops_->attention_f32(attn_in_t.value(), aw, *cfg_.attn, scales, cfg_.max_seq_length,
+  if (Status s = ops_->attention_f32(*attn_input, aw, *cfg_.attn, scales, cfg_.max_seq_length,
                                      cfg_.hidden_size, cache, past_len, attn_out.value());
       !s.ok()) {
     return s;
@@ -203,17 +221,20 @@ StatusOr<Tensor> FalconH1Runner::prefill(std::span<const int32_t> tokens, std::s
   return std::move(logits);
 }
 
-StatusOr<Tensor> FalconH1Runner::decode(const int32_t token, std::span<LayerCacheView> layers) {
+StatusOr<Tensor> FalconH1Runner::decode(const int32_t token, std::span<LayerCacheView> layers,
+                                        int64_t past_len) {
+  if (past_len < 0)
+    return Status::InvalidArgument("past_len must be non-negative");
 
   Tensor hidden;
-  ASSIGN_OR_RETURN(hidden, embed_(std::span<const int32_t>(&token,1)));
+  ASSIGN_OR_RETURN(hidden, embed_(std::span<const int32_t>(&token, 1)));
 
   // convert shape from [1,H] to [H]
   if (hidden.size() == 2 && hidden.shape[0] == 1)
     hidden.shape = {hidden.shape[1]};
 
   Tensor normalized;
-  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, /*past_len=*/0));
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, past_len));
 
   Tensor logits;
   ASSIGN_OR_RETURN(logits, lm_head_(normalized));

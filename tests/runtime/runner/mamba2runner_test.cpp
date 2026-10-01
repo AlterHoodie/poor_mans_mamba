@@ -168,7 +168,7 @@ TEST(Mamba2Runner, DecodeReusesHandleAndReturnsLogits) {
     StatusOr<Tensor> pref = runner.prefill(prompt, layers.value());
     if (!pref.ok())
       return pref.status();
-    return runner.decode(/*token=*/3, layers.value());
+    return runner.decode(/*token=*/3, layers.value(), /*past_len=*/2);
   }();
   ASSERT_TRUE(dec.ok()) << dec.status().message();
   ASSERT_EQ(dec.value().shape.size(), 1u);

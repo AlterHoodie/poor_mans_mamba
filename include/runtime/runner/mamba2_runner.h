@@ -30,6 +30,8 @@ public:
 
   ~Mamba2Runner() override;
 
-  StatusOr<Tensor> prefill(std::span<const int32_t> tokens, std::span<LayerCacheView> layers) override;
-  StatusOr<Tensor> decode( int32_t token, std::span<LayerCacheView> layers) override;
+  StatusOr<Tensor> prefill(std::span<const int32_t> tokens,
+                           std::span<LayerCacheView> layers) override;
+  StatusOr<Tensor> decode(int32_t token, std::span<LayerCacheView> layers,
+                          int64_t past_len) override;
 };

@@ -127,7 +127,8 @@ public:
     return std::move(logits);
   }
 
-  StatusOr<Tensor> decode(int32_t /*token*/, std::span<LayerCacheView> /*layers*/) override {
+  StatusOr<Tensor> decode(int32_t /*token*/, std::span<LayerCacheView> /*layers*/,
+                          int64_t /*past_len*/) override {
     if (overflow_after_decodes_ >= 0 && decode_calls_ >= overflow_after_decodes_) {
       return Status::KvCacheOverflow("KV cache overflow");
     }
@@ -206,7 +207,9 @@ StatusOr<std::vector<int32_t>> greedy_generate(Runner& runner, CachePool& pool,
     if (i + 1 >= params.max_new_tokens)
       break;
 
-    logits = runner.decode(tok.value(), layers.value());
+    // out already holds the just-sampled token; KV write index is prompt + prior gens.
+    const int64_t past_len = static_cast<int64_t>(prompt.size() + out.size() - 1);
+    logits = runner.decode(tok.value(), layers.value(), past_len);
     if (!logits.ok()) {
       if (logits.status().code() == Code::kKvCacheOverflow) {
         (void)pool.release(handle);

@@ -329,7 +329,7 @@ void BM_Generate(benchmark::State& state) {
       const auto t0 = Clock::now();
       StatusOr<Tensor> dec = [&]() -> StatusOr<Tensor> {
         AllocatorScope scope(g_alloc.get());
-        return g_runner->decode(cur, layers.value());
+        return g_runner->decode(cur, layers.value(), prompt_len + i - 1);
       }();
       sync_device();
       if (!dec.ok()) {

@@ -192,7 +192,9 @@ inline telemetry::MetaKV common_meta(const std::string& driver, const Args& args
   kv.emplace_back("nccl_version",
                   telemetry::capture_command(
                       "ldconfig -p | grep -m1 libnccl.so | sed 's/.*=> *//'"));
-  kv.emplace_back("ucx_version", telemetry::capture_command("ucx_info -v | head -n 1"));
+  kv.emplace_back("ucx_version",
+                  telemetry::capture_command(
+                      "command -v ucx_info >/dev/null && ucx_info -v 2>/dev/null | head -n 1"));
 #if defined(MAMBASERVE_WITH_NCCL) && MAMBASERVE_WITH_NCCL
   kv.emplace_back("built_with_nccl", "1");
 #else

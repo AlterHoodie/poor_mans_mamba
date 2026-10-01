@@ -81,8 +81,12 @@ if have_stage env; then
     nvidia-smi --query-gpu=index,name,memory.total,driver_version,clocks.max.sm --format=csv || true
     nvcc --version || true
     ldconfig -p | grep -E 'libnccl|libucp|libnixl' || true
-    ucx_info -v || true
-    ucx_info -d | grep -E 'Transport|Device' | head -40 || true
+    if command -v ucx_info >/dev/null; then
+      ucx_info -v || true
+      ucx_info -d | grep -E 'Transport|Device' | head -40 || true
+    else
+      echo "ucx_info: not installed"
+    fi
   } > "$OUT/env/host.txt" 2>&1
   log "tip: for a hardware ceiling also run the CUDA sample p2pBandwidthLatencyTest and save it to $OUT/env/"
 fi

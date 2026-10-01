@@ -147,10 +147,12 @@ StatusOr<Tensor> Mamba2Runner::prefill(std::span<const int32_t> tokens, std::spa
   return std::move(logits);
 }
 
-StatusOr<Tensor> Mamba2Runner::decode(const int32_t token, std::span<LayerCacheView> layers) {
+StatusOr<Tensor> Mamba2Runner::decode(const int32_t token, std::span<LayerCacheView> layers,
+                                      int64_t past_len) {
+  (void)past_len;
 
   Tensor hidden;
-  ASSIGN_OR_RETURN(hidden, embed_(std::span<const int32_t>(&token,1)));
+  ASSIGN_OR_RETURN(hidden, embed_(std::span<const int32_t>(&token, 1)));
 
   // convert shape from [1,H] to [H]
   if (hidden.size() == 2 && hidden.shape[0] == 1) {
@@ -158,7 +160,7 @@ StatusOr<Tensor> Mamba2Runner::decode(const int32_t token, std::span<LayerCacheV
   }
 
   Tensor normalized;
-  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers,hidden, false));
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, false));
 
   Tensor logits;
   ASSIGN_OR_RETURN(logits, lm_head_(normalized));

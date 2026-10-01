@@ -101,7 +101,10 @@ PrefillEvent Worker::prefill_(uint64_t req_id, std::span<const int32_t> tokens) 
   }();
   if(!prefill.ok())
     return {.req_id = req_id, .s = prefill.status()};
-  
+
+  if (Status s = pool_->set_seq_len(it->second, static_cast<int64_t>(tokens.size())); !s.ok())
+    return {.req_id = req_id, .s = s};
+
   int32_t token = 0;
   {
     StatusOr<int32_t> sampled = sample_(prefill.value());
@@ -133,13 +136,20 @@ DecodeEvent Worker::decode_(uint64_t req_id, const int32_t token){
   if(!views.ok())
     return {.req_id = req_id, .s = views.status()};
 
+  StatusOr<int64_t> past = pool_->seq_len(it->second);
+  if (!past.ok())
+    return {.req_id = req_id, .s = past.status()};
+
   StatusOr<Tensor> logits = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc_.get());
-    return runner_->decode(token, views.value());
+    return runner_->decode(token, views.value(), past.value());
   }();
   if(!logits.ok())
     return {.req_id = req_id, .s = logits.status()};
-  
+
+  if (Status s = pool_->set_seq_len(it->second, past.value() + 1); !s.ok())
+    return {.req_id = req_id, .s = s};
+
   StatusOr<int32_t> sampled = sample_(logits.value());
   if (!sampled.ok())
     return {.req_id = req_id, .s = sampled.status()};

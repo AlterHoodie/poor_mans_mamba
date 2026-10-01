@@ -23,7 +23,8 @@ NcclCommAgent::NcclCommAgent(int device_id, int rank, std::shared_ptr<NcclCluste
   if (rank_ < 0 || rank_ >= cluster_->nranks)
     return;
 
-  if (cudaSetDevice(device_id()) != cudaSuccess)
+  // Parameter `device_id` shadows CommAgent::device_id(); use this-> explicitly.
+  if (cudaSetDevice(this->device_id()) != cudaSuccess)
     return;
   if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
     stream_ = nullptr;
@@ -59,7 +60,7 @@ StatusOr<XferHandle> NcclCommAgent::post(XferDesc& desc) {
   if (peer == rank_)
     return Status::InvalidArgument("NCCL peer cannot be self");
 
-  if (cudaSetDevice(device_id()) != cudaSuccess)
+  if (cudaSetDevice(this->device_id()) != cudaSuccess)
     return Status::RuntimeError("cudaSetDevice failed");
 
   int64_t* seq_dev = nullptr;

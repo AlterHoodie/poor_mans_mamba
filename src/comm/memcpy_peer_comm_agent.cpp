@@ -18,7 +18,10 @@ MemcpyPeerCommAgent::MemcpyPeerCommAgent(int device_id, Device kind)
 MemcpyPeerCommAgent::~MemcpyPeerCommAgent() { shutdown(); }
 
 void MemcpyPeerCommAgent::publish_recv_(uint64_t xfer_id, void* dst, size_t bytes, int dst_dev) {
+  // acquires lock 
   std::lock_guard<std::mutex> lk(rendezvous_mu_);
+  // creates a new randezvous entry so later on send can poll on this xfer id 
+  // and initiate a copy
   Rendezvous& rz = rendezvous_[xfer_id];
   rz.dst_ptr = dst;
   rz.bytes = bytes;
@@ -28,22 +31,29 @@ void MemcpyPeerCommAgent::publish_recv_(uint64_t xfer_id, void* dst, size_t byte
 
 MemcpyPeerCommAgent::ClaimCopy MemcpyPeerCommAgent::try_claim_copy_(uint64_t xfer_id,
                                                                    size_t fallback_bytes) {
+  // acquire lock
   std::lock_guard<std::mutex> lk(rendezvous_mu_);
   Rendezvous& rz = rendezvous_[xfer_id];
-
+  
+  // check phase of recv side whether its ready with dst ptr and and bytes
   ClaimCopy out;
   switch (rz.phase) {
+  // recv side could not set dst ptr and bytes for some reason
   case Phase::Failed:
     out.claim = Claim::Error;
     return out;
+  // waiting for recv side to post dst ptr and bytes
   case Phase::WaitingRecv:
+  // copying the bytes, never runs currently cause its sync - will be useful when copy is async
   case Phase::Copying:
     out.claim = Claim::Pending;
     return out;
+  // copy done 
   case Phase::Done:
     out.claim = Claim::Done;
     out.seq_len = rz.seq_len;
     return out;
+  // recv side has posted valid dst ptr and bytes, can begin copying into it
   case Phase::Ready:
     rz.phase = Phase::Copying;
     out.claim = Claim::DoCopy;
@@ -128,7 +138,7 @@ Status MemcpyPeerCommAgent::do_copy_(void* dst, int dst_dev, void* src, int src_
     return Status::InvalidArgument("copy pointers cannot be null");
   if (bytes == 0)
     return Status::InvalidArgument("copy bytes must be > 0");
-
+  // cpu mode use simple memcpy 
   if (kind_ == Device::CPU) {
     std::memcpy(dst, src, bytes);
     return Status::Ok();
@@ -168,9 +178,11 @@ StatusOr<XferHandle> MemcpyPeerCommAgent::post(XferDesc& desc) {
     return Status::InvalidArgument("bytes must be > 0");
 
   if (desc.role == XferRole::Recv)
+    // recieve side first creates the randevous xfer
     publish_recv_(desc.xfer_id, desc.local_ptr, desc.bytes, device_id());
 
   const uint64_t id = id_counter_.fetch_add(1, std::memory_order_relaxed);
+  // local worker entries, to poll on status of requests 
   xfers_[id] = Entry{
       .desc = desc,
       .role = desc.role,
@@ -182,6 +194,7 @@ StatusOr<XferHandle> MemcpyPeerCommAgent::post(XferDesc& desc) {
 }
 
 XferState MemcpyPeerCommAgent::poll_send_(Entry& entry) {
+  // send side polling of xfer transfer request
   if (entry.state != XferState::Pending)
     return entry.state;
 
@@ -226,6 +239,7 @@ XferState MemcpyPeerCommAgent::poll_recv_(Entry& entry) {
   return st;
 }
 
+// polls a particular xfer transfer request
 XferState MemcpyPeerCommAgent::poll(const XferHandle& handle) {
   auto it = xfers_.find(handle.id);
   if (it == xfers_.end())

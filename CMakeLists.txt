@@ -188,20 +188,21 @@ if(MAMBASERVE_WITH_NIXL)
     PATH_SUFFIXES include)
   find_library(NIXL_LIBRARY nixl
     HINTS ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
-    PATH_SUFFIXES lib lib64)
+    PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu lib64/x86_64-linux-gnu)
   if(NOT NIXL_INCLUDE_DIR OR NOT NIXL_LIBRARY)
     message(FATAL_ERROR "NIXL not found (set NIXL_ROOT or install libnixl)")
   endif()
-  target_include_directories(runtime PRIVATE ${NIXL_INCLUDE_DIR})
+  # PUBLIC: nixl_comm_agent.h includes nixl.h when NIXL is enabled.
+  target_include_directories(runtime PUBLIC ${NIXL_INCLUDE_DIR})
   target_link_libraries(runtime PUBLIC ${NIXL_LIBRARY} CUDA::cudart)
 
   # NIXL often needs UCX at link/runtime; pull it in when present.
   find_library(UCX_UCP_LIBRARY ucp
     HINTS ${UCX_ROOT} $ENV{UCX_ROOT} ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
-    PATH_SUFFIXES lib lib64)
+    PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
   find_library(UCX_UCS_LIBRARY ucs
     HINTS ${UCX_ROOT} $ENV{UCX_ROOT} ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
-    PATH_SUFFIXES lib lib64)
+    PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
   if(UCX_UCP_LIBRARY)
     target_link_libraries(runtime PUBLIC ${UCX_UCP_LIBRARY})
   endif()

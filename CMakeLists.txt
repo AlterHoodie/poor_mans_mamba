@@ -183,26 +183,47 @@ if(MAMBASERVE_WITH_NIXL)
   if(NOT MAMBASERVE_WITH_CUDA)
     message(FATAL_ERROR "MAMBASERVE_WITH_NIXL requires MAMBASERVE_WITH_CUDA=ON")
   endif()
+  set(_NIXL_LIB_SUFFIXES lib lib64 lib/x86_64-linux-gnu lib64/x86_64-linux-gnu)
   find_path(NIXL_INCLUDE_DIR nixl.h
     HINTS ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
     PATH_SUFFIXES include)
   find_library(NIXL_LIBRARY nixl
     HINTS ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
-    PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu lib64/x86_64-linux-gnu)
+    PATH_SUFFIXES ${_NIXL_LIB_SUFFIXES})
+  # Descriptor helpers live in libnixl_build; modern ld --as-needed won't pull it
+  # transitively from libnixl, so link it (and common companions) explicitly.
+  find_library(NIXL_BUILD_LIBRARY nixl_build
+    HINTS ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
+    PATH_SUFFIXES ${_NIXL_LIB_SUFFIXES})
+  find_library(NIXL_COMMON_LIBRARY nixl_common
+    HINTS ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
+    PATH_SUFFIXES ${_NIXL_LIB_SUFFIXES})
+  find_library(NIXL_SERDES_LIBRARY serdes
+    HINTS ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
+    PATH_SUFFIXES ${_NIXL_LIB_SUFFIXES})
   if(NOT NIXL_INCLUDE_DIR OR NOT NIXL_LIBRARY)
     message(FATAL_ERROR "NIXL not found (set NIXL_ROOT or install libnixl)")
   endif()
   # PUBLIC: nixl_comm_agent.h includes nixl.h when NIXL is enabled.
   target_include_directories(runtime PUBLIC ${NIXL_INCLUDE_DIR})
   target_link_libraries(runtime PUBLIC ${NIXL_LIBRARY} CUDA::cudart)
+  if(NIXL_BUILD_LIBRARY)
+    target_link_libraries(runtime PUBLIC ${NIXL_BUILD_LIBRARY})
+  endif()
+  if(NIXL_COMMON_LIBRARY)
+    target_link_libraries(runtime PUBLIC ${NIXL_COMMON_LIBRARY})
+  endif()
+  if(NIXL_SERDES_LIBRARY)
+    target_link_libraries(runtime PUBLIC ${NIXL_SERDES_LIBRARY})
+  endif()
 
   # NIXL often needs UCX at link/runtime; pull it in when present.
   find_library(UCX_UCP_LIBRARY ucp
     HINTS ${UCX_ROOT} $ENV{UCX_ROOT} ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
-    PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+    PATH_SUFFIXES ${_NIXL_LIB_SUFFIXES})
   find_library(UCX_UCS_LIBRARY ucs
     HINTS ${UCX_ROOT} $ENV{UCX_ROOT} ${NIXL_ROOT} $ENV{NIXL_ROOT} /usr/local /usr
-    PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+    PATH_SUFFIXES ${_NIXL_LIB_SUFFIXES})
   if(UCX_UCP_LIBRARY)
     target_link_libraries(runtime PUBLIC ${UCX_UCP_LIBRARY})
   endif()

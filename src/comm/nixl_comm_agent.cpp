@@ -193,6 +193,17 @@ XferState NixlCommAgent::poll_send_(Entry& e) {
   if (e.state != XferState::Pending)
     return e.state; // Done or Error
 
+  if (e.posted) {
+    // WRITE already posted; drive it to completion (this also sends the notif).
+    nixl_status_t st = agent_->getXferStatus(e.req);
+    if (st == NIXL_IN_PROG)
+      return XferState::Pending;
+    agent_->releaseXferReq(e.req);
+    e.req = nullptr;
+    e.state = (st == NIXL_SUCCESS) ? XferState::Done : XferState::Error;
+    return e.state;
+  }
+
   if (Status s = ensure_peers_loaded_(); !s.ok()) {
     e.state = XferState::Error;
     return e.state;
@@ -248,21 +259,20 @@ XferState NixlCommAgent::poll_send_(Entry& e) {
     return e.state;
   }
   e.posted = true;
-
-  // Ack as soon as the WRITE is posted. Cluster still waits for Recv's notif
-  // before releasing src (two migrate acks). Recv observes real completion.
-  if (st == NIXL_SUCCESS) {
-    agent_->releaseXferReq(e.req);
-    e.req = nullptr;
-  }
-  // If IN_PROG, leave e.req for shutdown() — do not release while the WRITE
-  // may still be reading src.
   {
     std::lock_guard<std::mutex> lk(cluster_->mu);
     cluster_->slots.erase(e.xfer_id);
   }
-  e.state = XferState::Done;
-  return e.state;
+
+  if (st == NIXL_SUCCESS) {
+    agent_->releaseXferReq(e.req);
+    e.req = nullptr;
+    e.state = XferState::Done;
+    return e.state;
+  }
+  // NIXL_IN_PROG: the UCX backend only flushes the WRITE and sends the
+  // completion notif from getXferStatus(), so it must be polled until done.
+  return XferState::Pending;
 }
 
 XferState NixlCommAgent::poll_recv_(Entry& e) {

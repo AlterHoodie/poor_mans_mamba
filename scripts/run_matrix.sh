@@ -21,8 +21,8 @@
 #   memcpy           MemcpyPeer
 #   nccl             NCCL, default path selection
 #   nccl_nop2p       NCCL with NCCL_P2P_DISABLE=1 (control: forces SHM/host path)
-#   nixl_cudaipc     NIXL/UCX pinned to UCX_TLS=cuda_ipc,cuda_copy,sm (P2P path)
-#   nixl_hoststaged  NIXL/UCX with UCX_TLS=cuda_copy,sm (no cuda_ipc => host staged)
+#   nixl_cudaipc     NIXL/UCX with UCX_TLS=self,tcp,sm,cuda_copy,cuda_ipc (P2P path)
+#   nixl_hoststaged  NIXL/UCX with UCX_TLS=self,tcp,sm,cuda_copy (no cuda_ipc => host staged)
 # Variants whose backend is not built simply fail to load and are skipped.
 
 set -uo pipefail
@@ -50,8 +50,11 @@ variant_spec() {
     memcpy)          echo "memcpy|" ;;
     nccl)            echo "nccl|" ;;
     nccl_nop2p)      echo "nccl|NCCL_P2P_DISABLE=1" ;;
-    nixl_cudaipc)    echo "nixl|UCX_TLS=cuda_ipc,cuda_copy,sm" ;;
-    nixl_hoststaged) echo "nixl|UCX_TLS=cuda_copy,sm" ;;
+    # self+tcp are required by NIXL for loopback/wireup/notif active messages
+    # (cuda_ipc / cuda_copy / sm have no AM-bcopy + peer-failure-handler support).
+    # Bulk data still goes over cuda_ipc / cuda_copy.
+    nixl_cudaipc)    echo "nixl|UCX_TLS=self,tcp,sm,cuda_copy,cuda_ipc" ;;
+    nixl_hoststaged) echo "nixl|UCX_TLS=self,tcp,sm,cuda_copy" ;;
     *) echo "unknown|" ;;
   esac
 }

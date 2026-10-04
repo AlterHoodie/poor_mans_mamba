@@ -1,0 +1,129 @@
+syntax = "proto3";
+package mambaserve;
+
+
+enum Code {
+    CODE_OK = 0;
+    CODE_NOT_FOUND = 1;
+    CODE_INVALID_ARGUMENT = 2;
+    CODE_OOM = 3;
+    CODE_KV_CACHE_OVERFLOW = 4;
+    CODE_RUNTIME_ERROR = 5;
+    CODE_NOTIMPLEMENTED = 6;
+}
+
+message StatusMsg { 
+    Code code = 1;
+    string message = 2;
+}
+
+enum XferRole { 
+    XFER_SEND = 0;
+    XFER_RECV = 1;
+}
+
+message PrefillCmd {
+  uint64 req_id = 1;
+  repeated int32 tokens = 2;
+  int32 max_new_tokens = 3;
+  int32 eos_id = 4;
+}
+
+message DecodeCmd {
+  uint64 req_id = 1;
+  int32 token = 2;
+}
+
+message ReleaseCmd {
+  uint64 req_id = 1;
+}
+
+message MigrateCmd {
+  uint64 req_id = 1;
+  XferRole role = 2;
+  int32 peer_device_id = 3;
+}
+
+message ShutdownCmd{}
+
+message PrefillEvent {
+  uint64 req_id = 1;
+  int32 token = 2;
+  StatusMsg status = 3;
+}
+
+message DecodeEvent {
+  uint64 req_id = 1;
+  int32 token = 2;
+  StatusMsg status = 3;
+}
+
+message ReleaseEvent {
+  uint64 req_id = 1;
+  uint64 worker_idx = 2;
+  StatusMsg status = 3;
+}
+
+message MigrateEvent {
+  uint64 req_id = 1;
+  XferRole role = 2;
+  StatusMsg status = 3;
+}
+
+message ReadyEvent {
+    uint64 worker_idx = 1;
+}
+
+message Command {
+    oneof body {
+        PrefillCmd prefill = 1;
+        DecodeCmd decode = 2;
+        ReleaseCmd release = 3;
+        MigrateCmd migrate = 4;
+        ShutdownCmd shutdown = 5;
+    }
+}
+
+message Event {
+    oneof body {
+        PrefillEvent prefill = 1;
+        DecodeEvent decode = 2;
+        ReleaseEvent release = 3;
+        MigrateEvent migrate = 4;
+        ReadyEvent ready = 5;
+    }
+}
+
+// NIXL control-plane (replaces NixlCluster shared maps)
+message NixlLocalMd {
+  int32 device_id = 1;
+  bytes md = 2;           // getLocalMD blob
+}
+message NixlSlotAnnounce {
+  uint64 xfer_id = 1;
+  uint64 dst_ptr = 2;     // GPU VA in RECV process — fine for NIXL WRITE
+  uint64 bytes = 3;
+  int32 dst_device = 4;
+}
+message NixlControl {
+  oneof body {
+    NixlLocalMd publish_md = 1;
+    NixlLocalMd peer_md = 2;      // scheduler fans out
+    NixlSlotAnnounce announce = 3;
+    NixlSlotAnnounce clear = 4;
+    bool peers_finalized = 5;
+    }
+}
+
+// One message from parent → every child at spawn (before Ready).
+// Replaces shared_ptr<NcclCluster>.
+message NcclBootstrap {
+  int32 nranks = 1;
+  int32 rank = 2;          // usually == device_id in your setup
+  bytes unique_id = 3;     // memcpy of ncclUniqueId (NCCL_UNIQUE_ID_BYTES)
+}
+message NcclControl {
+  oneof body {
+    NcclBootstrap bootstrap = 1;
+  }
+}

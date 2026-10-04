@@ -58,6 +58,24 @@ FetchContent_Declare(
     GIT_TAG main
 )
 FetchContent_MakeAvailable(tokenizers_cpp)
+set(Protobuf_PROTOC_EXECUTABLE /usr/bin/protoc CACHE FILEPATH "" FORCE)
+find_package(Protobuf REQUIRED)
+file(GLOB_RECURSE PROTO_SOURCES CONFIGURE_DEPENDS
+    "./proto/*.proto"
+)
+
+add_library(worker_proto)
+
+protobuf_generate(
+    TARGET worker_proto
+    LANGUAGE cpp
+    PROTOS
+        ${PROTO_SOURCES}
+    PROTOC_OUT_DIR 
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
+)
+target_include_directories(worker_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_link_libraries(worker_proto PUBLIC protobuf::libprotobuf)
 
 add_library(mambaserve_common INTERFACE)
 
@@ -154,6 +172,7 @@ target_link_libraries(runtime
         core
         ops
         telemetry
+        worker_proto
     PRIVATE 
         tokenizers_cpp
         safetensors-cpp::safetensors_cpp
@@ -281,4 +300,5 @@ target_link_libraries(app
         runtime
         safetensors-cpp::safetensors_cpp
         ops
+        worker_proto
 )

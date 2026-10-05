@@ -46,6 +46,16 @@ message MigrateCmd {
 
 message ShutdownCmd{}
 
+// Parent → process worker: clear local trace buffers, align epoch to the parent
+// (CLOCK_MONOTONIC is system-wide), and enable recording.
+message ResetTracesCmd {
+  int64 epoch_ns = 1;
+}
+
+// Parent → process worker: snapshot local TraceEvents + worker-owned counters,
+// emit TraceBatchEvent, then clear the local event buffers.
+message DumpTracesCmd {}
+
 message PrefillEvent {
   uint64 req_id = 1;
   int32 token = 2;
@@ -75,6 +85,29 @@ message ReadyEvent {
     StatusMsg status = 2; // worker-side init (device bind, model load, pool, comm agent)
 }
 
+// Mirrors telemetry::TraceEvent. kind is the TraceKind ordinal.
+message TraceEventMsg {
+  int64 t_ns = 1;
+  uint32 kind = 2;
+  uint64 req_id = 3;
+  int32 worker = 4;
+  int64 a = 5;
+  int64 b = 6;
+}
+
+// Worker-owned counter deltas since the last ResetTraces/DumpTraces.
+message TraceCounterDelta {
+  uint64 bytes_migrated = 1;
+  uint64 slot_rejects = 2;
+}
+
+message TraceBatchEvent {
+  uint64 worker_idx = 1;
+  int64 epoch_ns = 2; // worker Recorder epoch (absolute steady_clock ns)
+  repeated TraceEventMsg events = 3;
+  TraceCounterDelta counters = 4;
+}
+
 message Command {
     oneof body {
         PrefillCmd prefill = 1;
@@ -82,6 +115,8 @@ message Command {
         ReleaseCmd release = 3;
         MigrateCmd migrate = 4;
         ShutdownCmd shutdown = 5;
+        ResetTracesCmd reset_traces = 6;
+        DumpTracesCmd dump_traces = 7;
     }
 }
 
@@ -92,6 +127,7 @@ message Event {
         ReleaseEvent release = 3;
         MigrateEvent migrate = 4;
         ReadyEvent ready = 5;
+        TraceBatchEvent trace_batch = 6;
     }
 }
 

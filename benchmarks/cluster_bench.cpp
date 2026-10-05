@@ -383,6 +383,8 @@ RunResult execute_run(Sinks& out, const RunCfg& cfg, ClusterScheduler& sched,
   telemetry::Recorder& rec = telemetry::Recorder::instance();
   rec.reset();
   rec.enable(true);
+  // Process workers have their own Recorder; align epoch and clear stale events.
+  sched.sync_worker_traces(rec.epoch_ns());
 
   const std::string run_id = cfg.scenario + "_" + std::to_string(out.run_counter++);
   std::vector<uint64_t> ids;
@@ -413,6 +415,9 @@ RunResult execute_run(Sinks& out, const RunCfg& cfg, ClusterScheduler& sched,
   if (driver.joinable())
     driver.join();
   std::this_thread::sleep_for(std::chrono::milliseconds(30)); // let release events drain
+  if (Status st = sched.collect_worker_traces(); !st.ok())
+    std::fprintf(stderr, "[%s] collect_worker_traces: %s\n", run_id.c_str(),
+                 st.message().c_str());
   rec.enable(false);
 
   if (out.trace)
@@ -920,10 +925,6 @@ int main(int argc, char** argv) {
   const std::string worker_mode = args.str("worker-mode", "thread");
   if (worker_mode == "process") {
     g_worker_mode = WorkerMode::Process;
-    std::fprintf(stderr,
-                 "note: --worker-mode process: worker-side trace events stay in the worker "
-                 "processes, so trace-derived metrics (TTFT/ITL/migration phases) are limited "
-                 "to what the scheduler process records\n");
   } else if (worker_mode != "thread") {
     std::fprintf(stderr, "unknown --worker-mode '%s' (thread|process)\n", worker_mode.c_str());
     return 2;

@@ -83,8 +83,9 @@ std::vector<std::pair<std::string, uint64_t>> Counters::snapshot() const {
 }
 
 struct Recorder::Impl {
-  mutable std::mutex mu; // guards `buffers` (registration + reset/snapshot only)
+  mutable std::mutex mu; // guards `buffers` (registration + reset/snapshot/ingest)
   std::vector<std::unique_ptr<std::vector<TraceEvent>>> buffers;
+  std::vector<TraceEvent>* remote = nullptr; // owned by buffers; cross-process ingest
 };
 
 Recorder::Recorder() : impl_(new Impl) { epoch_ns_.store(steady_now_ns()); }
@@ -100,6 +101,16 @@ void Recorder::reset() {
     b->clear(); // capacity (and the thread_local pointers) stay valid
   counters.reset();
   epoch_ns_.store(steady_now_ns());
+}
+
+void Recorder::clear_events() {
+  std::lock_guard<std::mutex> lk(impl_->mu);
+  for (auto& b : impl_->buffers)
+    b->clear();
+}
+
+void Recorder::set_epoch_ns(int64_t epoch_ns) {
+  epoch_ns_.store(epoch_ns, std::memory_order_relaxed);
 }
 
 void Recorder::record(TraceKind kind, uint64_t req_id, int worker, int64_t a, int64_t b) {
@@ -118,6 +129,19 @@ void Recorder::record(TraceKind kind, uint64_t req_id, int worker, int64_t a, in
       .a = a,
       .b = b,
   });
+}
+
+void Recorder::ingest(std::span<const TraceEvent> events) {
+  if (events.empty())
+    return;
+  std::lock_guard<std::mutex> lk(impl_->mu);
+  if (!impl_->remote) {
+    auto buf = std::make_unique<std::vector<TraceEvent>>();
+    buf->reserve(kInitialReserve);
+    impl_->remote = buf.get();
+    impl_->buffers.push_back(std::move(buf));
+  }
+  impl_->remote->insert(impl_->remote->end(), events.begin(), events.end());
 }
 
 std::vector<TraceEvent> Recorder::snapshot() const {

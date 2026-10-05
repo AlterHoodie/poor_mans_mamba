@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,20 +22,20 @@
 namespace telemetry {
 
 enum class TraceKind : uint8_t {
-  Submit = 0,       // a = prompt tokens, b = max_new_tokens
-  PrefillStart,     // a = prompt tokens
-  PrefillEnd,       // a = 1 if ok
+  Submit = 0,   // a = prompt tokens, b = max_new_tokens
+  PrefillStart, // a = prompt tokens
+  PrefillEnd,   // a = 1 if ok
   DecodeStart,
-  DecodeEnd,        // b = 1 if ok (token index = order per req_id after PrefillEnd)
-  MigrateRequested, // worker = src, a = dst
-  MigrateBegin,     // worker = src, a = dst
+  DecodeEnd,         // b = 1 if ok (token index = order per req_id after PrefillEnd)
+  MigrateRequested,  // worker = src, a = dst
+  MigrateBegin,      // worker = src, a = dst
   MigrateXferPosted, // worker = this worker, a = role (0 send / 1 recv), b = bytes
-  MigrateXferDone,  // worker = this worker, a = role, b = 1 if ok
-  MigrateCommit,    // worker = new home
+  MigrateXferDone,   // worker = this worker, a = role, b = 1 if ok
+  MigrateCommit,     // worker = new home
   RebalanceDecision, // worker = src, a = dst, b = victim gen_len
-  Done,             // a = generated tokens
+  Done,              // a = generated tokens
   Failed,
-  Marker,           // free-form bench marker (a, b caller-defined)
+  Marker, // free-form bench marker (a, b caller-defined)
   kCount
 };
 
@@ -80,8 +81,18 @@ public:
   // Clears all buffers and counters and restarts the epoch.
   void reset();
 
+  // Clears event buffers only (keeps epoch, enable bit, and counters).
+  void clear_events();
+
+  // Aligns this process's epoch to an absolute steady_clock ns (e.g. parent epoch).
+  void set_epoch_ns(int64_t epoch_ns);
+
   // Appends to the calling thread's buffer. No-op when disabled.
   void record(TraceKind kind, uint64_t req_id, int worker, int64_t a, int64_t b);
+
+  // Appends events produced in another process (already rewritten into this epoch).
+  // Safe to call while local producers are recording (uses the recorder mutex).
+  void ingest(std::span<const TraceEvent> events);
 
   // Merged view of every thread's events, sorted by time.
   std::vector<TraceEvent> snapshot() const;

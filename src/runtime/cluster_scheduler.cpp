@@ -66,6 +66,51 @@ mambaserve::Command make_shutdown_cmd() {
   return cmd;
 }
 
+mambaserve::Command make_reset_traces_cmd(int64_t epoch_ns) {
+  mambaserve::Command cmd;
+  cmd.mutable_reset_traces()->set_epoch_ns(epoch_ns);
+  return cmd;
+}
+
+mambaserve::Command make_dump_traces_cmd() {
+  mambaserve::Command cmd;
+  cmd.mutable_dump_traces();
+  return cmd;
+}
+
+telemetry::TraceKind trace_kind_from_proto(uint32_t kind) {
+  constexpr uint32_t kMax = static_cast<uint32_t>(telemetry::TraceKind::kCount);
+  if (kind >= kMax)
+    return telemetry::TraceKind::Marker;
+  return static_cast<telemetry::TraceKind>(kind);
+}
+
+void ingest_trace_batch(const mambaserve::TraceBatchEvent& batch) {
+  telemetry::Recorder& rec = telemetry::Recorder::instance();
+  const int64_t parent_epoch = rec.epoch_ns();
+  const int64_t child_epoch = batch.epoch_ns();
+  const int64_t skew = child_epoch - parent_epoch;
+
+  std::vector<telemetry::TraceEvent> events;
+  events.reserve(static_cast<size_t>(batch.events_size()));
+  for (const mambaserve::TraceEventMsg& m : batch.events()) {
+    events.push_back(telemetry::TraceEvent{
+        .t_ns = m.t_ns() + skew,
+        .kind = trace_kind_from_proto(m.kind()),
+        .req_id = m.req_id(),
+        .worker = m.worker(),
+        .a = m.a(),
+        .b = m.b(),
+    });
+  }
+  rec.ingest(events);
+
+  if (batch.has_counters()) {
+    rec.counters.bytes_migrated += batch.counters().bytes_migrated();
+    rec.counters.slot_rejects += batch.counters().slot_rejects();
+  }
+}
+
 } // namespace
 
 ClusterScheduler::ClusterScheduler(std::unique_ptr<PlacementPolicy> policy,
@@ -90,8 +135,8 @@ Status ClusterScheduler::start(const ClusterConfig& cfg, std::vector<WorkerSlot>
     return Status::InvalidArgument("max_seq_length must be > 0");
 
   if (slots.size() != static_cast<size_t>(cfg.n_workers))
-    return Status::InvalidArgument("expected " + std::to_string(cfg.n_workers) +
-                                   " workers, got " + std::to_string(slots.size()));
+    return Status::InvalidArgument("expected " + std::to_string(cfg.n_workers) + " workers, got " +
+                                   std::to_string(slots.size()));
   for (size_t i = 0; i < slots.size(); ++i) {
     if (!slots[i].chan || (!slots[i].worker && !slots[i].process))
       return Status::InvalidArgument("worker " + std::to_string(i) +
@@ -117,7 +162,7 @@ Status ClusterScheduler::start(const ClusterConfig& cfg, std::vector<WorkerSlot>
         return fail(Status::RuntimeError("worker " + std::to_string(slot.device_id) +
                                          " exited before reporting ready"));
       const mambaserve::Envelope& env = env_or.value();
-      
+
       // if it sent a non ready message we poll it again
       if (env.body_case() != mambaserve::Envelope::kEvent ||
           env.event().body_case() != mambaserve::Event::kReady) {
@@ -185,12 +230,12 @@ void ClusterScheduler::shutdown() {
     ingress_thread_.join();
   if (event_thread_.joinable())
     event_thread_.join();
- 
+
   clear_workers_();
   transport_plane_.reset();
 }
 
-void ClusterScheduler::clear_workers_() noexcept{
+void ClusterScheduler::clear_workers_() noexcept {
   workers_.clear();
   worker_stats_.clear();
 }
@@ -258,6 +303,43 @@ Status ClusterScheduler::migrate(uint64_t req_id, size_t dst_idx) {
   return migrate_locked_(req_id, dst_idx);
 }
 
+void ClusterScheduler::sync_worker_traces(int64_t epoch_ns) {
+  if (cfg_.worker_mode != WorkerMode::Process)
+    return;
+  const mambaserve::Command cmd = make_reset_traces_cmd(epoch_ns);
+  for (size_t i = 0; i < workers_.size(); ++i)
+    send_cmd_(i, cmd);
+}
+
+Status ClusterScheduler::collect_worker_traces(double timeout_s) {
+  if (cfg_.worker_mode != WorkerMode::Process)
+    return Status::Ok();
+  if (workers_.empty())
+    return Status::Ok();
+
+  {
+    std::lock_guard<std::mutex> lk(trace_mu_);
+    pending_trace_replies_ = static_cast<int>(workers_.size());
+    trace_reply_seen_.assign(workers_.size(), false);
+  }
+
+  const mambaserve::Command cmd = make_dump_traces_cmd();
+  for (size_t i = 0; i < workers_.size(); ++i)
+    send_cmd_(i, cmd);
+
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(timeout_s));
+  std::unique_lock<std::mutex> lk(trace_mu_);
+  while (pending_trace_replies_ > 0) {
+    if (trace_cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
+      return Status::RuntimeError("timed out waiting for worker TraceBatch replies (" +
+                                  std::to_string(pending_trace_replies_) + " outstanding)");
+    }
+  }
+  return Status::Ok();
+}
+
 void ClusterScheduler::send_cmd_(size_t worker_idx, mambaserve::Command cmd) {
   if (worker_idx >= workers_.size() || !workers_[worker_idx].chan)
     return;
@@ -277,7 +359,7 @@ void ClusterScheduler::send_trsp_(size_t worker_idx, const mambaserve::Transport
 }
 
 void ClusterScheduler::Sender::send_transport(size_t worker_idx,
-                                                 const mambaserve::TransportControl& msg) {
+                                              const mambaserve::TransportControl& msg) {
   sched.send_trsp_(worker_idx, msg);
 }
 
@@ -307,11 +389,23 @@ void ClusterScheduler::ingress_loop_() {
       mambaserve::Envelope env = std::move(env_or.value());
       switch (env.body_case()) {
       case mambaserve::Envelope::kEvent:
-        {
+        // TraceBatch is harvested by collect_worker_traces; keep it off eventq_.
+        if (env.event().body_case() == mambaserve::Event::kTraceBatch) {
+          ingest_trace_batch(env.event().trace_batch());
+          {
+            std::lock_guard<std::mutex> lk(trace_mu_);
+            if (i < trace_reply_seen_.size() && !trace_reply_seen_[i]) {
+              trace_reply_seen_[i] = true;
+              if (pending_trace_replies_ > 0)
+                --pending_trace_replies_;
+              trace_cv_.notify_all();
+            }
+          }
+        } else {
           std::lock_guard<std::mutex> lk(event_mu_);
           eventq_.push_back(std::move(*env.mutable_event()));
+          event_cv_.notify_one();
         }
-        event_cv_.notify_one();
         got = true;
         break;
       case mambaserve::Envelope::kTransport:
@@ -363,6 +457,10 @@ void ClusterScheduler::handle_event_(mambaserve::Event ev) {
   case mambaserve::Event::kReady:
     LOG_DEBUG("worker %llu ready", static_cast<unsigned long long>(ev.ready().worker_idx()));
     break;
+  case mambaserve::Event::kTraceBatch:
+    // Handled in ingress_loop_ so collect_worker_traces can rendezvous on it.
+    LOG_WARN("TraceBatch reached event_loop_; dropping");
+    break;
   case mambaserve::Event::BODY_NOT_SET:
     break;
   }
@@ -371,8 +469,7 @@ void ClusterScheduler::handle_event_(mambaserve::Event ev) {
 void ClusterScheduler::continue_after_token_(Session& sess, uint64_t req_id, int32_t token) {
   // Check if we have either hit max tokens or eos token
   const bool hit_eos = token == sess.params.eos_id;
-  const bool hit_max =
-      static_cast<int>(sess.generated_tokens.size()) >= sess.params.max_new_tokens;
+  const bool hit_max = static_cast<int>(sess.generated_tokens.size()) >= sess.params.max_new_tokens;
   // if yes set phase as done, tell worker to cleanup resources
   if (hit_eos || hit_max) {
     sess.phase = SessionPhase::Done;

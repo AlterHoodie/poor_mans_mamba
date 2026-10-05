@@ -6,8 +6,8 @@
 #include "ops/cpu/reductions.h"
 #include "runtime/cache/cache_layout.h"
 #include "runtime/cache/cache_pool.h"
-#include "runtime/model_registry.h"
 #include "runtime/ipc/proto_convert.h"
+#include "runtime/model_registry.h"
 #include "telemetry/log.h"
 #include "telemetry/nvtx.h"
 #include "telemetry/recorder.h"
@@ -36,9 +36,8 @@ StatusOr<int32_t> argmax_gpu_d2h(Tensor& logits) {
     return Status::InvalidArgument("empty logits");
 
   std::vector<float> host(static_cast<size_t>(n));
-  cudaError_t err =
-      cudaMemcpy(host.data(), logits.buffer.ptr, static_cast<size_t>(n) * sizeof(float),
-                 cudaMemcpyDeviceToHost);
+  cudaError_t err = cudaMemcpy(host.data(), logits.buffer.ptr,
+                               static_cast<size_t>(n) * sizeof(float), cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) {
     return Status::RuntimeError(std::string("cudaMemcpy D2H failed: ") + cudaGetErrorString(err));
   }
@@ -111,9 +110,9 @@ mambaserve::PrefillEvent Worker::prefill_(uint64_t req_id, std::span<const int32
 
   auto it = cache_handles_.find(req_id);
   if (it == cache_handles_.end())
-    return make_prefill_event(req_id, -1,
-                              Status::NotFound("Could not find Cache Handle for req_id" +
-                                               std::to_string(req_id)));
+    return make_prefill_event(
+        req_id, -1,
+        Status::NotFound("Could not find Cache Handle for req_id" + std::to_string(req_id)));
 
   StatusOr<std::span<LayerCacheView>> views = pool_->layer_views(it->second);
   if (!views.ok())
@@ -144,9 +143,9 @@ mambaserve::DecodeEvent Worker::decode_(uint64_t req_id, const int32_t token) {
 
   auto it = cache_handles_.find(req_id);
   if (it == cache_handles_.end())
-    return make_decode_event(req_id, -1,
-                             Status::NotFound("Could not find Cache Handle for req_id" +
-                                              std::to_string(req_id)));
+    return make_decode_event(
+        req_id, -1,
+        Status::NotFound("Could not find Cache Handle for req_id" + std::to_string(req_id)));
 
   StatusOr<std::span<LayerCacheView>> views = pool_->layer_views(it->second);
   if (!views.ok())
@@ -231,8 +230,7 @@ std::optional<mambaserve::MigrateEvent> Worker::post_xfer_(const mambaserve::Mig
   if (!handle_or.ok())
     return make_migrate_event(cmd.req_id(), cmd.role(), handle_or.status());
 
-  pending_transfers_[cmd.req_id()] =
-      PendingXfer{.handle = handle_or.value(), .role = role};
+  pending_transfers_[cmd.req_id()] = PendingXfer{.handle = handle_or.value(), .role = role};
   // Backend may need to tell its peer something (e.g. NIXL Recv slot announce).
   if (auto announce = comm_agent_->make_post_announce(desc))
     emit_transport_(std::move(*announce));
@@ -345,8 +343,8 @@ Status Worker::init_() {
     return Status::RuntimeError("ModelEntry has no config");
 
   ASSIGN_OR_RETURN(runner_, entry.create_runner(*alloc_));
-  ASSIGN_OR_RETURN(pool_, create_cache_pool(*entry.cfg, alloc_.get(), cfg_.num_slots,
-                                            create_cache_layout));
+  ASSIGN_OR_RETURN(
+      pool_, create_cache_pool(*entry.cfg, alloc_.get(), cfg_.num_slots, create_cache_layout));
   // No shared transport state: backends coordinate through the parent's control plane,
   // so this works identically for a worker thread and a worker process.
   ASSIGN_OR_RETURN(comm_agent_, create_comm_agent(cfg_, device_id_, nullptr));
@@ -395,8 +393,7 @@ void Worker::poll_transfer_states_() {
           const int64_t sl = comm_agent_->xfer_seq_len(it->second.handle);
           if (Status s = pool_->set_seq_len(hit->second, sl); !s.ok()) {
             xfer_done(it->first, it->second.role, false);
-            *ev.mutable_migrate() =
-                make_migrate_event(it->first, to_proto(it->second.role), s);
+            *ev.mutable_migrate() = make_migrate_event(it->first, to_proto(it->second.role), s);
             emit_event_(std::move(ev));
             it = pending_transfers_.erase(it);
             break;
@@ -430,7 +427,7 @@ void Worker::poll_transfer_states_() {
 void Worker::handle_command_(const mambaserve::Command& cmd) {
   mambaserve::Event ev;
   switch (cmd.body_case()) {
-  
+
   case mambaserve::Command::kPrefill: {
     MS_NVTX_RANGE("prefill");
     const auto& c = cmd.prefill();
@@ -438,22 +435,23 @@ void Worker::handle_command_(const mambaserve::Command& cmd) {
     // track prefill start
     telemetry::trace(telemetry::TraceKind::PrefillStart, c.req_id(), w,
                      static_cast<int64_t>(c.tokens_size()));
-    
+
     if (auto s = register_(c.req_id()); !s.ok()) {
       if (s.code() == Code::kOOM)
         telemetry::counters().slot_rejects++;
       LOG_WARN("prefill register failed req_id=%llu worker=%d: %s",
                static_cast<unsigned long long>(c.req_id()), w, s.message().c_str());
-      
+
       // track prefill fail
       telemetry::trace(telemetry::TraceKind::PrefillEnd, c.req_id(), w, 0);
-      
+
       *ev.mutable_prefill() = make_prefill_event(c.req_id(), -1, s);
       emit_event_(std::move(ev));
       return;
     }
-    auto pref = prefill_(c.req_id(), std::span<const int32_t>(c.tokens().data(),
-                                                              static_cast<size_t>(c.tokens_size())));
+    auto pref =
+        prefill_(c.req_id(),
+                 std::span<const int32_t>(c.tokens().data(), static_cast<size_t>(c.tokens_size())));
     // track prefill end
     telemetry::trace(telemetry::TraceKind::PrefillEnd, c.req_id(), w,
                      status_ok(pref.status()) ? 1 : 0);
@@ -469,13 +467,13 @@ void Worker::handle_command_(const mambaserve::Command& cmd) {
     const int w = static_cast<int>(index_);
     // track each decode start
     telemetry::trace(telemetry::TraceKind::DecodeStart, c.req_id(), w);
-    
+
     auto dec = decode_(c.req_id(), c.token());
-    
+
     // track each decode end
     telemetry::trace(telemetry::TraceKind::DecodeEnd, c.req_id(), w, 0,
                      status_ok(dec.status()) ? 1 : 0);
-    
+
     *ev.mutable_decode() = std::move(dec);
     emit_event_(std::move(ev));
     return;
@@ -492,7 +490,7 @@ void Worker::handle_command_(const mambaserve::Command& cmd) {
     if (auto m = migrate_(c)) {
       LOG_ERROR("migrate post failed req_id=%llu worker=%zu: %s",
                 static_cast<unsigned long long>(c.req_id()), index_, m->status().message().c_str());
-      
+
       *ev.mutable_migrate() = std::move(*m);
       emit_event_(std::move(ev));
     }
@@ -501,6 +499,38 @@ void Worker::handle_command_(const mambaserve::Command& cmd) {
   case mambaserve::Command::kShutdown:
     stop_ = true;
     return;
+  case mambaserve::Command::kResetTraces: {
+    telemetry::Recorder& rec = telemetry::Recorder::instance();
+    rec.reset();
+    rec.set_epoch_ns(cmd.reset_traces().epoch_ns());
+    rec.enable(true);
+    return;
+  }
+  case mambaserve::Command::kDumpTraces: {
+    telemetry::Recorder& rec = telemetry::Recorder::instance();
+    const std::vector<telemetry::TraceEvent> snap = rec.snapshot();
+    mambaserve::Event batch_ev;
+    auto* batch = batch_ev.mutable_trace_batch();
+    batch->set_worker_idx(index_);
+    batch->set_epoch_ns(rec.epoch_ns());
+    for (const telemetry::TraceEvent& e : snap) {
+      mambaserve::TraceEventMsg* m = batch->add_events();
+      m->set_t_ns(e.t_ns);
+      m->set_kind(static_cast<uint32_t>(e.kind));
+      m->set_req_id(e.req_id);
+      m->set_worker(e.worker);
+      m->set_a(e.a);
+      m->set_b(e.b);
+    }
+    auto* ctr = batch->mutable_counters();
+    ctr->set_bytes_migrated(rec.counters.bytes_migrated.load());
+    ctr->set_slot_rejects(rec.counters.slot_rejects.load());
+    emit_event_(std::move(batch_ev));
+    rec.clear_events();
+    rec.counters.bytes_migrated = 0;
+    rec.counters.slot_rejects = 0;
+    return;
+  }
   case mambaserve::Command::BODY_NOT_SET:
     LOG_WARN("worker %zu received empty command", index_);
     return;
@@ -524,6 +554,12 @@ void Worker::loop_() {
   if (!init.ok())
     return;
   init_ok_ = true;
+
+  // Process-mode workers (Inline) own a private Recorder; enable it so Prefill/Decode/Xfer
+  // events are captured until the parent syncs epochs via ResetTracesCmd. Thread-mode
+  // workers share the parent's recorder, which cluster_bench enables itself.
+  if (!thread_.joinable())
+    telemetry::Recorder::instance().enable(true);
 
   // Backend registration info (e.g. NIXL agent metadata) goes up after Ready so the
   // parent's Ready barrier only ever sees Ready events.

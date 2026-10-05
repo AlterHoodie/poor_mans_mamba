@@ -48,6 +48,12 @@ private:
   std::thread ingress_thread_;
   bool stop_ = false;
 
+  // Process-mode TraceBatch rendezvous (ingress → collect_worker_traces).
+  std::mutex trace_mu_;
+  std::condition_variable trace_cv_;
+  int pending_trace_replies_ = 0;
+  std::vector<bool> trace_reply_seen_;
+
   // array of workers
   std::vector<WorkerSlot> workers_;
   // array of worker stats (index-aligned with workers_)
@@ -119,6 +125,15 @@ public:
   // each to report Ready, then starts scheduling. Workers are destroyed (joined/reaped)
   // on failure. The host creates them with create_cluster_workers(cfg).
   Status start(const ClusterConfig& cfg, std::vector<WorkerSlot> workers);
+
+  // Process-mode only: tell each worker to clear its local recorder and align its
+  // epoch to `epoch_ns` (usually Recorder::instance().epoch_ns() after parent reset).
+  // Thread mode is a no-op (workers already share the parent recorder).
+  void sync_worker_traces(int64_t epoch_ns);
+
+  // Process-mode only: ask each worker for a TraceBatch, rewrite into the parent
+  // epoch, and ingest into Recorder::instance(). Thread mode is a no-op.
+  Status collect_worker_traces(double timeout_s = 10.0);
 
   // shutdown all workers (waits for all requests to be done) then shutsdown
   void shutdown();

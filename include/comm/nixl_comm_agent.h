@@ -13,21 +13,22 @@
 #endif
 
 // Recv publishes the destination slot so Send can build remote WRITE descs.
+// Delivered to the Send agent over the control plane (handle_transport).
 struct SlotAnnounce {
   void* dst_ptr = nullptr;
   size_t bytes = 0;
   int dst_device = -1;
-  bool ready = false;
 };
 
-// In-process NIXL peer directory: agent metadata keyed by device_id.
+// NIXL peer directory: agent metadata keyed by device_id. Each agent owns one (private
+// per worker under ClusterScheduler, filled by peer_md / peers_finalized from the
+// parent), or several agents in one process may share one (benches/tests, see
+// TransportContext).
 struct NixlCluster {
   int n_workers = 0;
   std::mutex mu;
   // device_id -> getLocalMD blob (empty until register_slab).
   std::unordered_map<int, std::string> local_md;
-  // xfer_id -> Recv-published destination slot.
-  std::unordered_map<uint64_t, SlotAnnounce> slots;
   bool peers_finalized = false;
 };
 
@@ -42,6 +43,12 @@ public:
   StatusOr<XferHandle> post(XferDesc& desc) override;
   XferState poll(const XferHandle& handle) override;
   int64_t xfer_seq_len(const XferHandle& handle) override;
+  // After register_slab: publish this agent's metadata up to the parent (publish_md).
+  std::optional<mambaserve::TransportControl> make_register_announce() override;
+  // Recv: announce the destination slot to the Send peer via the parent.
+  std::optional<mambaserve::TransportControl> make_post_announce(const XferDesc& desc) override;
+  // Send: record/clear announces routed from the parent; also peer_md / peers_finalized.
+  Status handle_transport(const mambaserve::TransportControl& msg) override;
   void shutdown() override;
 
   static std::string agent_name(int device_id);
@@ -66,6 +73,11 @@ private:
   size_t slab_bytes_ = 0;
   bool peers_loaded_ = false;
   std::unordered_map<uint64_t, Entry> xfers_;
+
+  // xfer_id -> destination slot published by the Recv peer. Written by
+  // handle_transport (worker thread, or a peer thread in benchmarks), read by poll_send_.
+  std::mutex announce_mu_;
+  std::unordered_map<uint64_t, SlotAnnounce> announces_;
 
 #if MAMBASERVE_WITH_NIXL
   std::unique_ptr<nixlAgent> agent_;

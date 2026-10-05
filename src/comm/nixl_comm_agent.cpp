@@ -73,10 +73,10 @@ Status NixlCommAgent::ensure_peers_loaded_() {
     return Status::Ok();
   if (!agent_ || !cluster_)
     return Status::RuntimeError("NIXL agent not initialized");
-  if (!cluster_->peers_finalized)
-    return Status::RuntimeError("NIXL peers not finalized");
 
   std::lock_guard<std::mutex> lk(cluster_->mu);
+  if (!cluster_->peers_finalized)
+    return Status::RuntimeError("NIXL peers not finalized");
   for (const auto& kv : cluster_->local_md) {
     if (kv.first == device_id())
       continue;
@@ -151,8 +151,13 @@ StatusOr<XferHandle> NixlCommAgent::post(XferDesc& desc) {
     return Status::RuntimeError("NIXL slab not registered");
   if (desc.local_ptr == nullptr || desc.bytes == 0)
     return Status::InvalidArgument("NIXL xfer requires local_ptr and bytes");
-  if (!cluster_ || !cluster_->peers_finalized)
-    return Status::RuntimeError("NIXL peers not finalized");
+  if (!cluster_)
+    return Status::RuntimeError("NixlCluster missing");
+  {
+    std::lock_guard<std::mutex> lk(cluster_->mu);
+    if (!cluster_->peers_finalized)
+      return Status::RuntimeError("NIXL peers not finalized");
+  }
 
   const auto local = static_cast<const char*>(desc.local_ptr);
   const auto base = static_cast<const char*>(slab_ptr_);
@@ -161,17 +166,8 @@ StatusOr<XferHandle> NixlCommAgent::post(XferDesc& desc) {
   if (desc.peer_device_id < 0 || desc.peer_device_id == device_id())
     return Status::InvalidArgument("invalid peer_device_id for NIXL");
 
-  if (desc.role == XferRole::Recv) {
-    // acquire cluster lock
-    std::lock_guard<std::mutex> lk(cluster_->mu);
-    // to announce slot, for recieving bytes
-    cluster_->slots[desc.xfer_id] = SlotAnnounce{
-        .dst_ptr = desc.local_ptr,
-        .bytes = desc.bytes,
-        .dst_device = device_id(),
-        .ready = true,
-    };
-  }
+  // Recv's slot announce is sent to the Send peer via the scheduler's control
+  // plane (see make_post_announce), not published here.
 
   const uint64_t hid = id_counter_.fetch_add(1, std::memory_order_relaxed);
   Entry e;
@@ -211,10 +207,10 @@ XferState NixlCommAgent::poll_send_(Entry& e) {
 
   SlotAnnounce announce;
   {
-    std::lock_guard<std::mutex> lk(cluster_->mu);
-    auto it = cluster_->slots.find(e.xfer_id);
+    std::lock_guard<std::mutex> lk(announce_mu_);
+    auto it = announces_.find(e.xfer_id);
     // wait for recv to publish destination slot ptr via slot announce
-    if (it == cluster_->slots.end() || !it->second.ready)
+    if (it == announces_.end())
       return XferState::Pending;
     announce = it->second;
   }
@@ -260,8 +256,8 @@ XferState NixlCommAgent::poll_send_(Entry& e) {
   }
   e.posted = true;
   {
-    std::lock_guard<std::mutex> lk(cluster_->mu);
-    cluster_->slots.erase(e.xfer_id);
+    std::lock_guard<std::mutex> lk(announce_mu_);
+    announces_.erase(e.xfer_id);
   }
 
   if (st == NIXL_SUCCESS) {
@@ -335,7 +331,91 @@ int64_t NixlCommAgent::xfer_seq_len(const XferHandle& handle) {
   return it->second.seq_len;
 }
 
+std::optional<mambaserve::TransportControl> NixlCommAgent::make_post_announce(const XferDesc& desc) {
+  if (desc.role != XferRole::Recv)
+    return std::nullopt;
+  mambaserve::TransportControl msg;
+  auto* a = msg.mutable_nixl_ctrl()->mutable_announce();
+  a->set_xfer_id(desc.xfer_id);
+  a->set_dst_ptr(reinterpret_cast<uint64_t>(desc.local_ptr));
+  a->set_bytes(desc.bytes);
+  a->set_dst_device(device_id());
+  return msg;
+}
+
+Status NixlCommAgent::handle_transport(const mambaserve::TransportControl& msg) {
+  if (msg.body_case() != mambaserve::TransportControl::kNixlCtrl)
+    return Status::Ok();
+  const mambaserve::NixlControl& ctrl = msg.nixl_ctrl();
+
+  switch (ctrl.body_case()) {
+  case mambaserve::NixlControl::kAnnounce: {
+    const mambaserve::NixlSlotAnnounce& a = ctrl.announce();
+    std::lock_guard<std::mutex> lk(announce_mu_);
+    announces_[a.xfer_id()] = SlotAnnounce{
+        .dst_ptr = reinterpret_cast<void*>(a.dst_ptr()),
+        .bytes = static_cast<size_t>(a.bytes()),
+        .dst_device = a.dst_device(),
+    };
+    return Status::Ok();
+  }
+  case mambaserve::NixlControl::kClear: {
+    std::lock_guard<std::mutex> lk(announce_mu_);
+    announces_.erase(ctrl.clear().xfer_id());
+    return Status::Ok();
+  }
+  // Parent fans out every other worker's agent metadata, then signals that the
+  // directory is complete; peers are loaded lazily on the first post().
+  case mambaserve::NixlControl::kPeerMd: {
+    if (!cluster_)
+      return Status::RuntimeError("NixlCluster missing");
+    const mambaserve::NixlLocalMd& peer = ctrl.peer_md();
+    if (peer.device_id() == device_id())
+      return Status::Ok();
+    std::lock_guard<std::mutex> lk(cluster_->mu);
+    cluster_->local_md[peer.device_id()] = peer.md();
+    return Status::Ok();
+  }
+  case mambaserve::NixlControl::kPeersFinalized: {
+    if (!cluster_)
+      return Status::RuntimeError("NixlCluster missing");
+    if (!ctrl.peers_finalized())
+      return Status::Ok();
+    std::lock_guard<std::mutex> lk(cluster_->mu);
+    cluster_->peers_finalized = true;
+    return Status::Ok();
+  }
+  // publish_md only travels worker -> parent.
+  case mambaserve::NixlControl::kPublishMd:
+  case mambaserve::NixlControl::BODY_NOT_SET:
+    return Status::Ok();
+  }
+  return Status::Ok();
+}
+
+std::optional<mambaserve::TransportControl> NixlCommAgent::make_register_announce() {
+  if (!cluster_)
+    return std::nullopt;
+  std::string md;
+  {
+    std::lock_guard<std::mutex> lk(cluster_->mu);
+    auto it = cluster_->local_md.find(device_id());
+    if (it == cluster_->local_md.end() || it->second.empty())
+      return std::nullopt;
+    md = it->second;
+  }
+  mambaserve::TransportControl msg;
+  auto* pub = msg.mutable_nixl_ctrl()->mutable_publish_md();
+  pub->set_device_id(device_id());
+  pub->set_md(std::move(md));
+  return msg;
+}
+
 void NixlCommAgent::shutdown() {
+  {
+    std::lock_guard<std::mutex> lk(announce_mu_);
+    announces_.clear();
+  }
 #if MAMBASERVE_WITH_NIXL
   for (auto& kv : xfers_) {
     if (kv.second.req) {

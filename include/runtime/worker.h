@@ -1,103 +1,66 @@
 #pragma once
 
 #include "comm/comm_agent.h"
+#include "comm/comm_factory.h"
 #include "core/device.h"
 #include "core/status.h"
+#include "proto/worker.pb.h"
 #include "runtime/cache/cache_pool.h"
+#include "runtime/cluster_config.h"
+#include "runtime/ipc/ipc_comm.h"
 #include "runtime/runner/runner.h"
 
-#include <sys/types.h>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <thread>
 #include <unordered_map>
-#include <variant>
-#include <vector>
 
 struct GenerateParams {
   int max_new_tokens = 32;
   int eos_id = -1; // required for generate; <0 rejected
 };
 
-struct PrefillCmd{
-  uint64_t req_id;
-  std::vector<int32_t> tokens;
-  GenerateParams params;
-};
-
-struct DecodeCmd{
-  uint64_t req_id;
-  int32_t token;
-};
-
-struct ReleaseCmd{
-  uint64_t req_id;
-};
-
-struct MigrateCmd{
-  uint64_t req_id = 0;
-  XferRole role = XferRole::Send;
-  int peer_device_id = -1;
-};
-
-struct PrefillEvent{
-  uint64_t req_id;
-  const int32_t token = -1;
-  Status s;
-};
-
-struct DecodeEvent{
-  uint64_t req_id;
-  const int32_t token = -1;
-  Status s;
-};
-
-struct ReleaseEvent{
-  uint64_t req_id;
-  size_t worker_idx = 0;
-  Status s;
-};
-
-struct MigrateEvent{
-  uint64_t req_id;
-  XferRole role = XferRole::Send;
-  Status s;
-}; 
-
-using Command = std::variant<PrefillCmd, DecodeCmd, ReleaseCmd, MigrateCmd>;
-using Event   = std::variant<PrefillEvent, DecodeEvent, ReleaseEvent, MigrateEvent>;
-
-struct WorkerStat{
+struct WorkerStat {
   size_t index;
-
   int capacity;
   int inflight;
 };
 
-// Worker is responsible for managing a local runner on a device
-// has a loop, pops commands, executes them, returns event results back to control plane
-// commands : prefill, decode, release, migrate 
+// Everything a worker needs to build its own device allocator, model replica, cache
+// pool and comm agent. Only plain config + the child IPC end cross the parent/worker
+// boundary, so the same bootstrap serves a worker thread and a spawned worker process
+// (see worker_process.h).
+struct WorkerBootstrap {
+  size_t index = 0;
+  int device_id = -1;
+  ClusterConfig cfg;
+  std::unique_ptr<IpcChannel> ipc;
+};
+
+// Where a Worker's execute loop runs.
+//   Thread: the constructor starts a std::thread (thread-mode cluster workers).
+//   Inline: nothing starts; the caller drives the loop with run() (process-mode child).
+enum class WorkerRunMode { Thread, Inline };
+
+// Worker owns the child end of an IpcChannel and runs the execute loop.
+// The loop first initializes (device bind, model load, cache pool, comm agent) and
+// reports the outcome in a ReadyEvent; on failure it exits without serving commands.
 class Worker {
 private:
   size_t index_ = 0;
+  int device_id_ = -1;
+  ClusterConfig cfg_;
   std::unique_ptr<DeviceAllocator> alloc_;
   std::unique_ptr<CachePool> pool_;
   std::unique_ptr<Runner> runner_;
   std::unique_ptr<CommAgent> comm_agent_;
-  std::function<void(Event)> emit_;
+  std::unique_ptr<IpcChannel> ipc_;
 
   bool stop_ = false;
-
-  std::mutex cmd_mu_;
-  std::deque<Command> cmdq_;
-  std::condition_variable cmd_cv_;
+  bool init_ok_ = false;
   std::thread thread_;
 
   struct PendingXfer {
@@ -117,39 +80,57 @@ private:
   Status release_(uint64_t req_id);
 
   // prefill, cache the states and return new token
-  PrefillEvent prefill_(uint64_t req_id, std::span<const int32_t> tokens);
+  mambaserve::PrefillEvent prefill_(uint64_t req_id, std::span<const int32_t> tokens);
 
   // one forward pass, update cache, and return new token
-  DecodeEvent decode_(uint64_t req_id, const int32_t token);
+  mambaserve::DecodeEvent decode_(uint64_t req_id, const int32_t token);
 
   // Posts a transfer. On success stores the handle in pending_transfers_ and
   // returns nullopt (MigrateEvent is emitted later by poll_transfer_states_).
   // On immediate failure returns a MigrateEvent to emit now.
-  std::optional<MigrateEvent> migrate_(const MigrateCmd& cmd);
-  std::optional<MigrateEvent> migrate_recv_(const MigrateCmd& cmd);
-  std::optional<MigrateEvent> migrate_send_(const MigrateCmd& cmd);
-  std::optional<MigrateEvent> post_xfer_(const MigrateCmd& cmd, int64_t seq_len);
+  std::optional<mambaserve::MigrateEvent> migrate_(const mambaserve::MigrateCmd& cmd);
+  std::optional<mambaserve::MigrateEvent> migrate_recv_(const mambaserve::MigrateCmd& cmd);
+  std::optional<mambaserve::MigrateEvent> migrate_send_(const mambaserve::MigrateCmd& cmd);
+  std::optional<mambaserve::MigrateEvent> post_xfer_(const mambaserve::MigrateCmd& cmd, int64_t seq_len);
 
   // loops through all the pending transfers, when any transfer is successfull or failed
-  // it simply queues the appropriate events into the worker events
+  // it emits the appropriate MigrateEvent to the parent over ipc_
   void poll_transfer_states_();
 
-  // loop: wait on cv, pop a command, execute it, emit the resulting event.
-  // Exits once stop_ is set and the queue has drained.
+  // wraps the event in an Envelope and sends it to the parent over ipc_
+  // (no-op if ipc_ is null; send failures are logged)
+  void emit_event_(mambaserve::Event ev);
+
+  // wraps a transport control message in an Envelope and sends it to the parent
+  void emit_transport_(mambaserve::TransportControl msg);
+
+  // applies a transport control message routed from the parent to the comm agent
+  void handle_transport_(const mambaserve::TransportControl& msg);
+
+  // executes a single command from the parent and emits the resulting event(s)
+  void handle_command_(const mambaserve::Command& cmd);
+
+  // Binds the device and builds alloc_/runner_/pool_/comm_agent_ from cfg_.
+  Status init_();
+
+  // loop: receive an Envelope from the parent over ipc_, dispatch commands via
+  // handle_command_, and poll pending transfers between messages (non-blocking
+  // recv while transfers are pending, blocking otherwise).
+  // Exits once stop_ is set and no transfers are pending, or when ipc_ closes.
   void loop_();
 
 public:
-  // Spawns the worker's own processing thread; events are pushed to `emit`
-  // as they're produced (called from the worker thread).
-  Worker(size_t index, std::unique_ptr<Runner> runner, std::unique_ptr<DeviceAllocator> alloc,
-         std::unique_ptr<CachePool> pool, std::unique_ptr<CommAgent> comm_agent,
-         std::function<void(Event)> emit);
+  // Thread mode starts the worker thread immediately; model/allocator/pool/agent are
+  // built there. Inline mode only stores the bootstrap; call run().
+  explicit Worker(WorkerBootstrap boot, WorkerRunMode mode = WorkerRunMode::Thread);
+
+  // Inline mode only: runs init + the execute loop on the calling thread until the
+  // parent shuts the worker down or the channel closes. Returns 0 if init succeeded
+  // and the loop ended normally, 1 if init failed.
+  int run();
 
   Worker(const Worker&) = delete;
   Worker& operator=(const Worker&) = delete;
 
-  // Signals the loop to stop and joins the thread.
   ~Worker();
-
-  void enqueue(Command cmd);
 };

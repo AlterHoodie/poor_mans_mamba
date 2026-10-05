@@ -210,8 +210,9 @@ inline telemetry::MetaKV common_meta(const std::string& driver, const Args& args
   for (auto& e : telemetry::capture_env(transport_env_names()))
     kv.emplace_back("env." + e.first, e.second);
   kv.emplace_back("scope_note",
-                  "intra-node, single process, thread-per-worker; NIXL uses UCX over local "
-                  "GPUs (cuda_ipc or host staged), not network RDMA");
+                  "intra-node; workers are threads of one process by default (cluster_bench "
+                  "--worker-mode process spawns one process per worker); NIXL uses UCX over "
+                  "local GPUs (cuda_ipc or host staged), not network RDMA");
   return kv;
 }
 

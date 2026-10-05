@@ -14,7 +14,7 @@
 //   summary.csv        one row per run (config + metrics + counters)
 //   requests.csv       one row per request
 //   migrations.csv     one row per migration with phase breakdown + stall
-//   setup.csv          load_model time per (model, backend, workers, max_seq)
+//   setup.csv          ClusterScheduler::start time per (model, backend, workers, max_seq)
 //   trace_<run>.csv    raw trace events (disable with --trace 0)
 //   meta.json          run metadata
 //
@@ -29,6 +29,8 @@
 #include "runtime/cluster_scheduler.h"
 #include "runtime/policy/placement_policy.h"
 #include "runtime/policy/rebalance_policy.h"
+#include "worker_factory.h"
+#include "worker_process.h"
 #include "telemetry/log.h"
 #include "telemetry/recorder.h"
 
@@ -630,6 +632,9 @@ RunResult execute_run(Sinks& out, const RunCfg& cfg, ClusterScheduler& sched,
 
 // ---- model load helper -----------------------------------------------------
 
+// Set once from --worker-mode in main(); applies to every cluster the bench loads.
+WorkerMode g_worker_mode = WorkerMode::Thread;
+
 bool load_cluster(ClusterScheduler& sched, RunCfg& cfg, const std::string& model_dir, Device dev,
                   TransportBackend backend, Sinks& out) {
   ClusterConfig cc;
@@ -639,11 +644,17 @@ bool load_cluster(ClusterScheduler& sched, RunCfg& cfg, const std::string& model
   cc.num_slots = cfg.slots;
   cc.transport = backend;
   cc.max_seq_length = cfg.max_seq;
+  cc.worker_mode = g_worker_mode;
   const int64_t t0 = telemetry::steady_now_ns();
-  Status s = sched.load_model(cc);
+  Status s = Status::Ok();
+  StatusOr<std::vector<WorkerSlot>> workers_or = create_cluster_workers(cc);
+  if (workers_or.ok())
+    s = sched.start(cc, std::move(workers_or.value()));
+  else
+    s = workers_or.status();
   cfg.load_model_ms = static_cast<double>(telemetry::steady_now_ns() - t0) / 1e6;
   if (!s.ok()) {
-    std::fprintf(stderr, "load_model failed (%s, %s, w=%d, max_seq=%d): %s\n", cfg.model.c_str(),
+    std::fprintf(stderr, "start failed (%s, %s, w=%d, max_seq=%d): %s\n", cfg.model.c_str(),
                  cfg.backend.c_str(), cfg.workers, cfg.max_seq, s.message().c_str());
     return false;
   }
@@ -872,12 +883,17 @@ void scenario_rebalance(Sinks& out, const Args& args, const Common& c) {
 } // namespace
 
 int main(int argc, char** argv) {
+  // Process-mode workers re-exec this binary; serve as one if asked to.
+  if (auto rc = maybe_run_worker_process(argc, argv))
+    return *rc;
+
   Args args(argc, argv);
   if (args.has("help") || argc == 1) {
     std::puts(
         "cluster_bench --scenario scale|migrate|rebalance|all\n"
         "  --model-dirs models/falcon-h1-0.5b-base[,models/mamba2-130m-hf]\n"
         "  --device GPU|CPU --backends memcpy,nccl,nixl\n"
+        "  --worker-mode thread|process (process needs GPU + nccl or nixl)\n"
         "  --prompt-len 128 --gen-len 64 --slots 8 --repeats 5 --warmup-runs 1\n"
         "  --out-dir DIR --trace 1 --timeout-s 600 --seed 1\n"
         "scale:     --workers 1,2 --sessions 1,2,4,8,16 [--max-seq N]\n"
@@ -900,6 +916,18 @@ int main(int argc, char** argv) {
   c.warmup_runs = static_cast<int>(args.i64("warmup-runs", 1));
   c.timeout_s = args.f64("timeout-s", 600);
   c.seed = static_cast<uint32_t>(args.i64("seed", 1));
+
+  const std::string worker_mode = args.str("worker-mode", "thread");
+  if (worker_mode == "process") {
+    g_worker_mode = WorkerMode::Process;
+    std::fprintf(stderr,
+                 "note: --worker-mode process: worker-side trace events stay in the worker "
+                 "processes, so trace-derived metrics (TTFT/ITL/migration phases) are limited "
+                 "to what the scheduler process records\n");
+  } else if (worker_mode != "thread") {
+    std::fprintf(stderr, "unknown --worker-mode '%s' (thread|process)\n", worker_mode.c_str());
+    return 2;
+  }
 
   Sinks out;
   out.dir = args.str("out-dir", "results/cluster_" + bench::timestamp_str());

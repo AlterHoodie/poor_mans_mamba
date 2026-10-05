@@ -20,6 +20,7 @@
 
 #include "comm/comm_agent.h"
 #include "comm/comm_factory.h"
+#include "comm/nccl_transport_control.h"
 #include "core/device.h"
 #include "core/status.h"
 #include "telemetry/log.h"
@@ -128,6 +129,9 @@ struct Endpoint {
   int dev = 0;
   Device kind = Device::GPU;
   std::unique_ptr<CommAgent> agent;
+  // No scheduler here: stands in for the control plane by handing this agent's
+  // post-time announce (e.g. NIXL Recv slot) straight to the peer agent.
+  Endpoint* peer = nullptr;
   void* slab = nullptr;
   size_t slab_bytes = 0;
 
@@ -200,6 +204,10 @@ private:
           ok = false;
           break;
         }
+        if (peer && peer->agent) {
+          if (auto announce = agent->make_post_announce(d))
+            (void)peer->agent->handle_transport(*announce);
+        }
         handles.push_back(h.value());
       }
       std::vector<bool> done(handles.size(), false);
@@ -212,6 +220,11 @@ private:
           const XferState st = agent->poll(handles[i]);
           if (st == XferState::Pending)
             continue;
+          // Stand-in for the control plane: relay e.g. MemcpyPeer Send "copy done" to the peer.
+          if (peer && peer->agent) {
+            if (auto fin = agent->make_completion_announce(handles[i], st))
+              (void)peer->agent->handle_transport(*fin);
+          }
           if (st == XferState::Error) {
             std::fprintf(stderr, "xfer error on dev %d\n", dev);
             ok = false;
@@ -248,8 +261,8 @@ struct SetupTimes {
   double finalize_us = 0;
 };
 
-// Builds both endpoints. Agents are created on separate threads because NCCL's
-// communicator init blocks until every rank joins.
+// Builds both endpoints. NCCL's communicator init (triggered by its bootstrap
+// message) blocks until every rank joins, so ranks are bootstrapped on separate threads.
 bool setup_pair(Pair& p, TransportBackend backend, Device kind, size_t slab_bytes,
                 SetupTimes& t) {
   ClusterConfig cfg;
@@ -299,6 +312,37 @@ bool setup_pair(Pair& p, TransportBackend backend, Device kind, size_t slab_byte
     th.join();
   if (fail)
     return false;
+
+  // NCCL: no scheduler here, so play the control plane's role and hand each agent
+  // its bootstrap. ncclCommInitRank blocks until every rank joins, hence one thread per rank.
+  if (backend == TransportBackend::Nccl) {
+    auto plane_or = NcclTransportControl::create(cfg.n_workers);
+    if (!plane_or.ok()) {
+      std::fprintf(stderr, "NcclTransportControl::create: %s\n",
+                   plane_or.status().message().c_str());
+      return false;
+    }
+    NcclTransportControl& plane = *plane_or.value();
+    std::thread boots[2];
+    for (int i = 0; i < 2; ++i) {
+      boots[i] = std::thread([&, i] {
+#ifdef MAMBASERVE_WITH_CUDA
+        if (kind == Device::GPU)
+          cudaSetDevice(i);
+#endif
+        Status s = p.ep[i].agent->handle_transport(plane.make_bootstrap(i));
+        if (!s.ok()) {
+          std::fprintf(stderr, "nccl bootstrap(%d): %s\n", i, s.message().c_str());
+          fail = true;
+        }
+        (void)p.ep[i].agent->take_transport_reply();
+      });
+    }
+    for (auto& th : boots)
+      th.join();
+    if (fail)
+      return false;
+  }
   t.create_agents_us = static_cast<double>(steady_now_ns() - t0) / 1e3;
 
   t0 = steady_now_ns();
@@ -318,6 +362,8 @@ bool setup_pair(Pair& p, TransportBackend backend, Device kind, size_t slab_byte
   }
   t.finalize_us = static_cast<double>(steady_now_ns() - t0) / 1e3;
 
+  p.ep[0].peer = &p.ep[1];
+  p.ep[1].peer = &p.ep[0];
   for (int i = 0; i < 2; ++i)
     p.ep[i].start();
   return true;

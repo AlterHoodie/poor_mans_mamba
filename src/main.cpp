@@ -1,86 +1,129 @@
 #include "core/device.h"
-#include "runtime/cache/cache_layout.h"
-#include "runtime/cache/cache_pool.h"
+#include "core/status.h"
+#include "runtime/cluster_config.h"
+#include "runtime/cluster_scheduler.h"
 #include "runtime/model_registry.h"
 #include "runtime/tokenizer.h"
+#include "worker_factory.h"
 
+#include <algorithm>
+#include <chrono>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace {
+
+bool wait_all_done(ClusterScheduler& sched, const std::vector<uint64_t>& req_ids,
+                   std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    bool all_done = true;
+    for (uint64_t id : req_ids) {
+      if (!sched.poll(id).done) {
+        all_done = false;
+        break;
+      }
+    }
+    if (all_done)
+      return true;
+    if (std::chrono::steady_clock::now() >= deadline)
+      return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+}
+
+// Bring up a thread-mode cluster, submit `n_prompts` encoded prompts, wait for Done.
+Status run_cluster_demo(const std::string& model_dir, int max_seq_length, Device device,
+                        int n_workers, int n_prompts, int max_new_tokens) {
+  if (n_workers <= 0)
+    return Status::InvalidArgument("n_workers must be > 0");
+  if (n_prompts <= 0)
+    return Status::InvalidArgument("n_prompts must be > 0");
+  if (max_new_tokens <= 0)
+    return Status::InvalidArgument("max_new_tokens must be > 0");
+
+  // Host-side tokenizer only; each worker loads its own model replica.
+  auto entry_or = ModelRegistry::open(model_dir, max_seq_length);
+  if (!entry_or.ok())
+    return entry_or.status();
+  Tokenizer tokenizer(*entry_or.value().cfg, model_dir);
+  auto eos_or = tokenizer.eos_id();
+  if (!eos_or.ok())
+    return eos_or.status();
+
+  ClusterConfig cfg{
+      .model_dir = model_dir,
+      .device = device,
+      .n_workers = n_workers,
+      .num_slots = std::max(n_prompts, 1),
+      .transport = TransportBackend::MemcpyPeer,
+      .max_seq_length = max_seq_length,
+      .worker_mode = WorkerMode::Thread,
+  };
+
+  StatusOr<std::vector<WorkerSlot>> workers_or = create_cluster_workers(cfg);
+  if (!workers_or.ok())
+    return workers_or.status();
+
+  ClusterScheduler sched;
+  if (Status s = sched.start(cfg, std::move(workers_or.value())); !s.ok())
+    return s;
+
+  GenerateParams params{.max_new_tokens = max_new_tokens, .eos_id = eos_or.value()};
+
+  std::vector<uint64_t> req_ids;
+  req_ids.reserve(static_cast<size_t>(n_prompts));
+  for (int i = 0; i < n_prompts; ++i) {
+    const std::string prompt = "Hi How are you? (" + std::to_string(i) + ")";
+    auto ids_or = tokenizer.encode(prompt);
+    if (!ids_or.ok())
+      return ids_or.status();
+    StatusOr<uint64_t> id_or = sched.submit(std::move(ids_or.value()), params);
+    if (!id_or.ok())
+      return id_or.status();
+    req_ids.push_back(id_or.value());
+    std::cout << "submitted req_id=" << id_or.value() << " prompt=\"" << prompt << "\"\n";
+  }
+
+  if (!wait_all_done(sched, req_ids, std::chrono::seconds(120)))
+    return Status::RuntimeError("timed out waiting for prompts to finish");
+
+  for (uint64_t id : req_ids) {
+    Response r = sched.poll(id);
+    if (!r.s.ok())
+      return r.s;
+    auto text_or = tokenizer.decode(r.tokens);
+    if (!text_or.ok())
+      return text_or.status();
+    std::cout << "req_id=" << id << " worker=" << r.worker_idx
+              << " gen_tokens=" << r.gen_seq_len << " text=\"" << text_or.value() << "\"\n";
+  }
+
+  sched.shutdown();
+  return Status::Ok();
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
+  // app [model_dir] [max_seq] [CPU|GPU] [n_workers] [n_prompts] [max_new_tokens]
   const std::string model_dir = (argc > 1) ? argv[1] : "models/mamba2-130m-hf";
   const int max_seq_length = (argc > 2) ? std::stoi(argv[2]) : 2048;
   const Device device =
       (argc > 3 && std::string_view(argv[3]) == "GPU") ? Device::GPU : Device::CPU;
+  const int n_workers = (argc > 4) ? std::stoi(argv[4]) : 2;
+  const int n_prompts = (argc > 5) ? std::stoi(argv[5]) : 4;
+  const int max_new_tokens = (argc > 6) ? std::stoi(argv[6]) : 16;
 
-  auto entry_or = ModelRegistry::open(model_dir, max_seq_length);
-  if (!entry_or.ok()) {
-    std::cerr << entry_or.status().message() << '\n';
+  const Status s =
+      run_cluster_demo(model_dir, max_seq_length, device, n_workers, n_prompts, max_new_tokens);
+  if (!s.ok()) {
+    std::cerr << s.message() << '\n';
     return 1;
   }
-  ModelEntry entry = std::move(entry_or.value());
-  const ModelConfig& cfg = *entry.cfg;
-
-  std::unique_ptr<DeviceAllocator> alloc;
-  auto alloc_or = create_device_allocator(device, /*device_id=*/0);
-  if (!alloc_or.ok()) {
-    std::cerr << alloc_or.status().message() << '\n';
-    return 1;
-  }
-  alloc = std::move(alloc_or.value());
-
-  auto runner_or = entry.create_runner(*alloc);
-  if (!runner_or.ok()) {
-    std::cerr << runner_or.status().message() << '\n';
-    return 1;
-  }
-  std::unique_ptr<Runner> runner = std::move(runner_or.value());
-
-  auto pool_or = create_cache_pool(cfg, alloc.get(), /*num_slots=*/10, create_cache_layout);
-  if (!pool_or.ok()) {
-    std::cerr << pool_or.status().message() << '\n';
-    return 1;
-  }
-  std::unique_ptr<CachePool> pool = std::move(pool_or.value());
-
-  std::cout << "model_type=" << cfg.model_type << '\n'
-            << "layers=" << cfg.num_hidden_layers << '\n'
-            << "hidden_size=" << cfg.hidden_size << '\n';
-
-  Tokenizer tokenizer(cfg, model_dir);
-
-  std::string prompt = "Hi How are you?";
-  auto ids = tokenizer.encode(prompt);
-  if (!ids.ok()) {
-    std::cerr << ids.status().message() << '\n';
-    return 1;
-  }
-
-  auto handle_or = pool->acquire();
-  if (!handle_or.ok()) {
-    std::cerr << handle_or.status().message() << '\n';
-    return 1;
-  }
-  CacheHandle handle = std::move(handle_or.value());
-
-  auto layers_or = pool->layer_views(handle);
-  if (!layers_or.ok()) {
-    std::cerr << layers_or.status().message() << '\n';
-    return 1;
-  }
-
-  auto logits_or = [&]() -> StatusOr<Tensor> {
-    AllocatorScope scope(alloc.get());
-    return runner->prefill(ids.value(), layers_or.value());
-  }();
-  if (!logits_or.ok()) {
-    std::cerr << logits_or.status().message() << '\n';
-    return 1;
-  }
-
-  std::cout << "prefill ok; logits rank=" << logits_or.value().shape.size() << '\n';
-  (void)pool->release(handle);
   return 0;
 }

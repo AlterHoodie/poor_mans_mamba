@@ -1,6 +1,9 @@
 #include "comm/comm_factory.h"
 
 #include "comm/memcpy_peer_comm_agent.h"
+#include "comm/memcpy_transport_control.h"
+#include "comm/nccl_transport_control.h"
+#include "comm/nixl_transport_control.h"
 
 #include <string>
 #include <utility>
@@ -15,8 +18,6 @@
 #define MAMBASERVE_WITH_NIXL 0
 #endif
 
-namespace {
-
 Status validate_cluster_config(const ClusterConfig& cfg) {
   if (cfg.model_dir.empty())
     return Status::InvalidArgument("model_dir cannot be empty");
@@ -24,6 +25,14 @@ Status validate_cluster_config(const ClusterConfig& cfg) {
     return Status::InvalidArgument("n_workers must be > 0");
   if (cfg.num_slots <= 0)
     return Status::InvalidArgument("num_slots must be > 0");
+
+  if (cfg.worker_mode == WorkerMode::Process) {
+    // MemcpyPeer hands raw pointers between workers, which only works in one address space.
+    if (cfg.transport == TransportBackend::MemcpyPeer)
+      return Status::InvalidArgument("MemcpyPeer requires WorkerMode::Thread");
+    if (cfg.device == Device::CPU)
+      return Status::InvalidArgument("WorkerMode::Process requires Device::GPU with NCCL or NIXL");
+  }
 
   if (cfg.device == Device::CPU) {
     if (cfg.transport != TransportBackend::MemcpyPeer)
@@ -55,8 +64,6 @@ Status validate_cluster_config(const ClusterConfig& cfg) {
   return Status::InvalidArgument("unsupported device kind");
 }
 
-} // namespace
-
 StatusOr<std::shared_ptr<TransportContext>> create_transport_context(const ClusterConfig& cfg) {
   if (Status s = validate_cluster_config(cfg); !s.ok())
     return s;
@@ -65,18 +72,7 @@ StatusOr<std::shared_ptr<TransportContext>> create_transport_context(const Clust
   ctx->backend = cfg.transport;
   ctx->n_workers = cfg.n_workers;
 
-  if (cfg.transport == TransportBackend::Nccl) {
-#if MAMBASERVE_WITH_NCCL
-    auto nccl = std::make_shared<NcclCluster>();
-    nccl->nranks = cfg.n_workers;
-    ncclResult_t r = ncclGetUniqueId(&nccl->id);
-    if (r != ncclSuccess)
-      return Status::RuntimeError(std::string("ncclGetUniqueId: ") + ncclGetErrorString(r));
-    ctx->nccl = std::move(nccl);
-#else
-    return Status::NotImplemented("NCCL transport not enabled");
-#endif
-  } else if (cfg.transport == TransportBackend::Nixl) {
+  if (cfg.transport == TransportBackend::Nixl) {
 #if MAMBASERVE_WITH_NIXL
     auto nixl = std::make_shared<NixlCluster>();
     nixl->n_workers = cfg.n_workers;
@@ -102,9 +98,9 @@ StatusOr<std::unique_ptr<CommAgent>> create_comm_agent(const ClusterConfig& cfg,
 
   case TransportBackend::Nccl: {
 #if MAMBASERVE_WITH_NCCL
-    if (!ctx || !ctx->nccl)
-      return Status::InvalidArgument("Nccl TransportContext missing");
-    auto agent = std::make_unique<NcclCommAgent>(device_id, /*rank=*/device_id, ctx->nccl);
+    // The communicator is created later, from the NcclBootstrap the control plane pushes.
+    (void)ctx;
+    auto agent = std::make_unique<NcclCommAgent>(device_id, /*rank=*/device_id, cfg.n_workers);
     return std::unique_ptr<CommAgent>(std::move(agent));
 #else
     (void)ctx;
@@ -114,10 +110,17 @@ StatusOr<std::unique_ptr<CommAgent>> create_comm_agent(const ClusterConfig& cfg,
 
   case TransportBackend::Nixl: {
 #if MAMBASERVE_WITH_NIXL
-    if (!ctx || !ctx->nixl)
-      return Status::InvalidArgument("Nixl TransportContext missing");
-    // Metadata is published inside register_slab after registerMem.
-    return std::unique_ptr<CommAgent>(std::make_unique<NixlCommAgent>(device_id, ctx->nixl));
+    // With a shared ctx (single-process benches/tests) peers read each other's metadata
+    // from it directly. Without one (ClusterScheduler, thread or process workers) the
+    // agent keeps a private directory that the control plane fills via peer_md.
+    std::shared_ptr<NixlCluster> cluster;
+    if (ctx && ctx->nixl) {
+      cluster = ctx->nixl;
+    } else {
+      cluster = std::make_shared<NixlCluster>();
+      cluster->n_workers = cfg.n_workers;
+    }
+    return std::unique_ptr<CommAgent>(std::make_unique<NixlCommAgent>(device_id, std::move(cluster)));
 #else
     (void)ctx;
     return Status::NotImplemented("NIXL transport not enabled");
@@ -126,6 +129,24 @@ StatusOr<std::unique_ptr<CommAgent>> create_comm_agent(const ClusterConfig& cfg,
   }
 
   return Status::InvalidArgument("unknown transport backend");
+}
+
+StatusOr<std::unique_ptr<TransportControlPlane>>
+create_transport_control_plane(const ClusterConfig& cfg) {
+  switch (cfg.transport) {
+  case TransportBackend::Nixl:
+    return std::unique_ptr<TransportControlPlane>(std::make_unique<NixlTransportControl>());
+  case TransportBackend::MemcpyPeer:
+    return std::unique_ptr<TransportControlPlane>(std::make_unique<MemcpyTransportControl>());
+  case TransportBackend::Nccl: {
+    StatusOr<std::unique_ptr<NcclTransportControl>> nccl_or =
+        NcclTransportControl::create(cfg.n_workers);
+    if (!nccl_or.ok())
+      return nccl_or.status();
+    return std::unique_ptr<TransportControlPlane>(std::move(nccl_or.value()));
+  }
+  }
+  return std::unique_ptr<TransportControlPlane>(std::make_unique<NoopTransportControlPlane>());
 }
 
 Status finalize_transport_peers(const std::shared_ptr<TransportContext>& ctx) {

@@ -2,10 +2,12 @@
 
 #include "core/device.h"
 #include "core/status.h"
+#include "proto/worker.pb.h"
 
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
+#include <optional>
 
 
 enum class XferRole {Send, Recv};
@@ -52,7 +54,36 @@ class CommAgent{
         virtual XferState poll(const XferHandle& handle) = 0;
 
         // Seq_len published by the completed transfer (Recv side after copy).
-        virtual int64_t xfer_seq_len(const XferHandle& /*handle*/) { return 0; }
+        virtual int64_t xfer_seq_len(const XferHandle& ) { return 0; }
+
+        // Control-plane hooks (default: no control traffic).
+        // After register_slab() succeeded and the worker reported Ready, returns a
+        // control message the worker should send up to the parent once (e.g. NIXL
+        // publishing its agent metadata), if any.
+        virtual std::optional<mambaserve::TransportControl> make_register_announce() {
+            return std::nullopt;
+        }
+        // After a successful post(), returns a control message the worker should
+        // send up to the parent (e.g. NIXL Recv slot announce), if any.
+        virtual std::optional<mambaserve::TransportControl> make_post_announce(const XferDesc& ) {
+            return std::nullopt;
+        }
+        // Called once when a posted transfer leaves Pending (Done or Error).
+        // Returns a control message the worker should send up to the parent
+        // (e.g. MemcpyPeer Send publishing "copy done" to the Recv side), if any.
+        virtual std::optional<mambaserve::TransportControl>
+        make_completion_announce(const XferHandle& , XferState ) {
+            return std::nullopt;
+        }
+        // Apply a control message the parent routed to this worker.
+        virtual Status handle_transport(const mambaserve::TransportControl& ) {
+            return Status::Ok();
+        }
+        // Reply produced by the last handle_transport(), if any (e.g. NCCL
+        // bootstrap ack). The worker sends it up to the parent.
+        virtual std::optional<mambaserve::TransportControl> take_transport_reply() {
+            return std::nullopt;
+        }
         
         // shut the communication agent down
         virtual void shutdown() = 0;

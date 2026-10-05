@@ -3,28 +3,68 @@
 #include "comm/comm_factory.h"
 #include "core/device.h"
 #include "core/status.h"
+#include "proto/worker.pb.h"
 #include "runtime/cache/cache_layout.h"
 #include "runtime/cache/cache_pool.h"
+#include "runtime/ipc/proto_convert.h"
 #include "runtime/policy/rebalance_policy.h"
 #include "runtime/runner/runner.h"
 #include "runtime/worker.h"
 #include "telemetry/log.h"
 #include "telemetry/recorder.h"
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace {
 
-template <class... Ts>
-struct overloaded : Ts... {
-  using Ts::operator()...;
-};
-template <class... Ts>
-overloaded(Ts...) -> overloaded<Ts...>;
+mambaserve::Command make_release_cmd(uint64_t req_id) {
+  mambaserve::Command cmd;
+  cmd.mutable_release()->set_req_id(req_id);
+  return cmd;
+}
+
+mambaserve::Command make_decode_cmd(uint64_t req_id, int32_t token) {
+  mambaserve::Command cmd;
+  auto* d = cmd.mutable_decode();
+  d->set_req_id(req_id);
+  d->set_token(token);
+  return cmd;
+}
+
+mambaserve::Command make_migrate_cmd(uint64_t req_id, mambaserve::XferRole role,
+                                     int peer_device_id) {
+  mambaserve::Command cmd;
+  auto* m = cmd.mutable_migrate();
+  m->set_req_id(req_id);
+  m->set_role(role);
+  m->set_peer_device_id(peer_device_id);
+  return cmd;
+}
+
+mambaserve::Command make_prefill_cmd(uint64_t req_id, std::span<const int32_t> tokens,
+                                     const GenerateParams& params) {
+  mambaserve::Command cmd;
+  auto* pref = cmd.mutable_prefill();
+  pref->set_req_id(req_id);
+  pref->set_max_new_tokens(params.max_new_tokens);
+  pref->set_eos_id(params.eos_id);
+  for (int32_t t : tokens)
+    pref->add_tokens(t);
+  return cmd;
+}
+
+mambaserve::Command make_shutdown_cmd() {
+  mambaserve::Command cmd;
+  cmd.mutable_shutdown();
+  return cmd;
+}
 
 } // namespace
 
@@ -39,58 +79,59 @@ ClusterScheduler::ClusterScheduler(std::unique_ptr<PlacementPolicy> policy,
 
 ClusterScheduler::~ClusterScheduler() { shutdown(); }
 
-Status ClusterScheduler::load_model(const ClusterConfig& cfg) {
+Status ClusterScheduler::start(const ClusterConfig& cfg, std::vector<WorkerSlot> slots) {
   if (!workers_.empty())
     return Status::InvalidArgument("ClusterScheduler already has a loaded model");
 
-  std::shared_ptr<TransportContext> ctx;
-  ASSIGN_OR_RETURN(ctx, create_transport_context(cfg));
+  if (Status s = validate_cluster_config(cfg); !s.ok())
+    return s;
 
-  ModelEntry entry;
   if (cfg.max_seq_length <= 0)
     return Status::InvalidArgument("max_seq_length must be > 0");
-  ASSIGN_OR_RETURN(entry, ModelRegistry::open(cfg.model_dir, cfg.max_seq_length));
+
+  if (slots.size() != static_cast<size_t>(cfg.n_workers))
+    return Status::InvalidArgument("expected " + std::to_string(cfg.n_workers) +
+                                   " workers, got " + std::to_string(slots.size()));
+  for (size_t i = 0; i < slots.size(); ++i) {
+    if (!slots[i].chan || (!slots[i].worker && !slots[i].process))
+      return Status::InvalidArgument("worker " + std::to_string(i) +
+                                     " needs a channel and a worker or process");
+  }
 
   cfg_ = cfg;
-  transport_ctx_ = std::move(ctx);
 
   const int n_workers = cfg_.n_workers;
-  std::vector<WorkerSlot> slots(static_cast<size_t>(n_workers));
-  std::vector<Status> statuses(static_cast<size_t>(n_workers), Status::Ok());
-  auto build = [&](int device_id) {
-    StatusOr<WorkerSlot> slot_or = create_worker_(entry, device_id);
-    if (!slot_or.ok())
-      statuses[static_cast<size_t>(device_id)] = slot_or.status();
-    else
-      slots[static_cast<size_t>(device_id)] = std::move(slot_or.value());
+  auto fail = [&](const Status& st) {
+    slots.clear(); // joins every worker thread / reaps every worker process
+    clear_workers_();
+    return st;
   };
 
-  if (cfg_.transport == TransportBackend::Nccl && n_workers > 1) {
-    // ncclCommInitRank blocks until every rank has joined, so ranks must be
-    // created concurrently; a sequential loop would deadlock on rank 0.
-    std::vector<std::thread> builders;
-    builders.reserve(static_cast<size_t>(n_workers));
-    for (int device_id = 0; device_id < n_workers; ++device_id)
-      builders.emplace_back(build, device_id);
-    for (std::thread& t : builders)
-      t.join();
-  } else {
-    for (int device_id = 0; device_id < n_workers; ++device_id) {
-      build(device_id);
-      if (!statuses[static_cast<size_t>(device_id)].ok())
-        break;
+  // Ready barrier: ingress is not running yet, so read each channel directly.
+  // A worker always reports Ready (with its init status) before serving commands.
+  for (WorkerSlot& slot : slots) {
+    for (;;) {
+      // block on each worker slot channel till its ready
+      StatusOr<mambaserve::Envelope> env_or = slot.chan->recv();
+      if (!env_or.ok())
+        return fail(Status::RuntimeError("worker " + std::to_string(slot.device_id) +
+                                         " exited before reporting ready"));
+      const mambaserve::Envelope& env = env_or.value();
+      
+      // if it sent a non ready message we poll it again
+      if (env.body_case() != mambaserve::Envelope::kEvent ||
+          env.event().body_case() != mambaserve::Event::kReady) {
+        LOG_WARN("worker %d sent a non-ready message before ready; dropped", slot.device_id);
+        continue;
+      }
+
+      const Status st = from_proto(env.event().ready().status());
+      if (!st.ok())
+        return fail(st);
+      break;
     }
   }
 
-  for (const Status& st : statuses) {
-    if (!st.ok()) {
-      slots.clear(); // joins any already-started worker threads
-      workers_.clear();
-      worker_stats_.clear();
-      transport_ctx_.reset();
-      return st;
-    }
-  }
   for (WorkerSlot& slot : slots) {
     workers_.push_back(std::move(slot));
     worker_stats_.push_back(WorkerStat{
@@ -99,58 +140,59 @@ Status ClusterScheduler::load_model(const ClusterConfig& cfg) {
         .inflight = 0,
     });
   }
-  LOG_INFO("cluster loaded: model=%s device=%s workers=%d slots=%d transport=%d max_seq=%d",
+  LOG_INFO("cluster loaded: model=%s device=%s workers=%d slots=%d transport=%d mode=%s "
+           "max_seq=%d",
            cfg_.model_dir.c_str(), cfg_.device == Device::GPU ? "GPU" : "CPU", n_workers,
-           cfg_.num_slots, static_cast<int>(cfg_.transport), cfg_.max_seq_length);
+           cfg_.num_slots, static_cast<int>(cfg_.transport),
+           cfg_.worker_mode == WorkerMode::Process ? "process" : "thread", cfg_.max_seq_length);
 
-  if (Status s = finalize_transport_peers(transport_ctx_); !s.ok()) {
-    workers_.clear();
-    worker_stats_.clear();
-    transport_ctx_.reset();
-    return s;
+  {
+    StatusOr<std::unique_ptr<TransportControlPlane>> plane_or =
+        create_transport_control_plane(cfg_);
+    if (!plane_or.ok())
+      return fail(plane_or.status());
+    transport_plane_ = std::move(plane_or.value());
   }
 
+  stop_ = false;
+  ingress_thread_ = std::thread(&ClusterScheduler::ingress_loop_, this);
   event_thread_ = std::thread(&ClusterScheduler::event_loop_, this);
+
+  // Ingress is live: let the plane bootstrap the workers (e.g. NCCL unique id, set NIXL slab).
+  if (Status s = transport_plane_->on_cluster_ready(transport_sender_); !s.ok()) {
+    shutdown();
+    return s;
+  }
   return Status::Ok();
 }
 
-StatusOr<WorkerSlot> ClusterScheduler::create_worker_(const ModelEntry& entry, int device_id) {
-  if (device_id < 0)
-    return Status::InvalidArgument("device id cannot be less than 0");
-  if (!entry.cfg)
-    return Status::RuntimeError("ModelEntry has no config");
+void ClusterScheduler::shutdown() {
+  {
+    // stop the event loop to stop listening to extra events from workers
+    std::lock_guard<std::mutex> lk(event_mu_);
+    stop_ = true;
+  }
+  event_cv_.notify_all();
 
-  std::unique_ptr<DeviceAllocator> alloc;
-  ASSIGN_OR_RETURN(alloc, create_device_allocator(cfg_.device, device_id));
+  for (size_t i = 0; i < workers_.size(); ++i) {
+    if (!workers_[i].chan)
+      continue;
+    send_cmd_(i, make_shutdown_cmd());
+    workers_[i].chan->close();
+  }
 
-  std::unique_ptr<Runner> runner;
-  ASSIGN_OR_RETURN(runner, entry.create_runner(*alloc));
+  if (ingress_thread_.joinable())
+    ingress_thread_.join();
+  if (event_thread_.joinable())
+    event_thread_.join();
+ 
+  clear_workers_();
+  transport_plane_.reset();
+}
 
-  std::unique_ptr<CachePool> pool;
-  ASSIGN_OR_RETURN(pool,
-                   create_cache_pool(*entry.cfg, alloc.get(), cfg_.num_slots, create_cache_layout));
-
-  std::unique_ptr<CommAgent> agent;
-  ASSIGN_OR_RETURN(agent, create_comm_agent(cfg_, device_id, transport_ctx_));
-
-  // No-op for MemcpyPeer/NCCL; required for NIXL.
-  if (Status s = agent->register_slab(pool->slab_ptr(), pool->slab_bytes()); !s.ok())
-    return s;
-
-  auto emit = [this](Event ev) {
-    {
-      std::lock_guard<std::mutex> lk(event_mu_);
-      eventq_.push_back(std::move(ev));
-    }
-    event_cv_.notify_one();
-  };
-
-  WorkerSlot slot;
-  slot.device_id = device_id;
-  slot.worker = std::make_unique<Worker>(static_cast<size_t>(device_id), std::move(runner),
-                                         std::move(alloc), std::move(pool), std::move(agent),
-                                         std::move(emit));
-  return slot;
+void ClusterScheduler::clear_workers_() noexcept{
+  workers_.clear();
+  worker_stats_.clear();
 }
 
 StatusOr<uint64_t> ClusterScheduler::submit(std::vector<int32_t> tokens, GenerateParams params) {
@@ -161,7 +203,7 @@ StatusOr<uint64_t> ClusterScheduler::submit(std::vector<int32_t> tokens, Generat
   if (params.max_new_tokens <= 0)
     return Status::InvalidArgument("max_new_tokens must be > 0");
   if (workers_.empty())
-    return Status::RuntimeError("no workers loaded; call load_model first");
+    return Status::RuntimeError("no workers loaded; call start first");
 
   const uint64_t req_id = req_id_counter_.fetch_add(1, std::memory_order_relaxed);
   size_t worker_idx = 0;
@@ -189,7 +231,8 @@ StatusOr<uint64_t> ClusterScheduler::submit(std::vector<int32_t> tokens, Generat
   LOG_DEBUG("submit req_id=%llu worker=%zu prompt_tokens=%zu max_new=%d",
             static_cast<unsigned long long>(req_id), worker_idx, tokens.size(),
             params.max_new_tokens);
-  workers_[worker_idx].worker->enqueue(PrefillCmd{req_id, std::move(tokens), params});
+
+  send_cmd_(worker_idx, make_prefill_cmd(req_id, tokens, params));
   return req_id;
 }
 
@@ -208,6 +251,191 @@ Response ClusterScheduler::poll(uint64_t req_id) const {
       .done = (sess.phase == SessionPhase::Done || sess.phase == SessionPhase::Failed),
       .s = sess.s,
   };
+}
+
+Status ClusterScheduler::migrate(uint64_t req_id, size_t dst_idx) {
+  std::lock_guard<std::mutex> lk(session_mu_);
+  return migrate_locked_(req_id, dst_idx);
+}
+
+void ClusterScheduler::send_cmd_(size_t worker_idx, mambaserve::Command cmd) {
+  if (worker_idx >= workers_.size() || !workers_[worker_idx].chan)
+    return;
+  mambaserve::Envelope env;
+  *env.mutable_cmd() = std::move(cmd);
+  if (Status s = workers_[worker_idx].chan->send(env); !s.ok())
+    LOG_ERROR("send_cmd to worker %zu failed: %s", worker_idx, s.message().c_str());
+}
+
+void ClusterScheduler::send_trsp_(size_t worker_idx, const mambaserve::TransportControl& trsp) {
+  if (worker_idx >= workers_.size() || !workers_[worker_idx].chan)
+    return;
+  mambaserve::Envelope env;
+  *env.mutable_transport() = trsp;
+  if (Status s = workers_[worker_idx].chan->send(env); !s.ok())
+    LOG_ERROR("send_trsp to worker %zu failed: %s", worker_idx, s.message().c_str());
+}
+
+void ClusterScheduler::Sender::send_transport(size_t worker_idx,
+                                                 const mambaserve::TransportControl& msg) {
+  sched.send_trsp_(worker_idx, msg);
+}
+
+void ClusterScheduler::Sender::broadcast_transport(const mambaserve::TransportControl& msg) {
+  for (size_t i = 0; i < sched.workers_.size(); ++i)
+    sched.send_trsp_(i, msg);
+}
+
+size_t ClusterScheduler::Sender::n_workers() const { return sched.workers_.size(); }
+
+void ClusterScheduler::ingress_loop_() {
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lk(event_mu_);
+      if (stop_)
+        return;
+    }
+
+    bool got = false;
+    for (size_t i = 0; i < workers_.size(); ++i) {
+      WorkerSlot& slot = workers_[i];
+      if (!slot.chan)
+        continue;
+      StatusOr<mambaserve::Envelope> env_or = slot.chan->try_recv();
+      if (!env_or.ok())
+        continue;
+      mambaserve::Envelope env = std::move(env_or.value());
+      switch (env.body_case()) {
+      case mambaserve::Envelope::kEvent:
+        {
+          std::lock_guard<std::mutex> lk(event_mu_);
+          eventq_.push_back(std::move(*env.mutable_event()));
+        }
+        event_cv_.notify_one();
+        got = true;
+        break;
+      case mambaserve::Envelope::kTransport:
+        // backend protocol lives in the plane; handled inline, not via eventq_
+        if (transport_plane_)
+          transport_plane_->on_upstream(i, env.transport(), transport_sender_);
+        got = true;
+        break;
+      case mambaserve::Envelope::kCmd:
+      case mambaserve::Envelope::BODY_NOT_SET:
+        break;
+      }
+    }
+
+    if (!got)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+void ClusterScheduler::event_loop_() {
+  for (;;) {
+    std::unique_lock<std::mutex> lk(event_mu_);
+    event_cv_.wait(lk, [&]() { return !eventq_.empty() || stop_; });
+    if (eventq_.empty() && stop_)
+      return;
+    // PrefillEvent/DecodeEvent hold a const token, so Event (their variant)
+    // is move-constructible but not move-assignable; construct, don't assign.
+    mambaserve::Event ev = std::move(eventq_.front());
+    eventq_.pop_front();
+    lk.unlock();
+    handle_event_(std::move(ev));
+  }
+}
+
+void ClusterScheduler::handle_event_(mambaserve::Event ev) {
+  switch (ev.body_case()) {
+  case mambaserve::Event::kPrefill:
+    on_prefill_event_(ev.prefill());
+    break;
+  case mambaserve::Event::kDecode:
+    on_decode_event_(ev.decode());
+    break;
+  case mambaserve::Event::kRelease:
+    on_release_event_(ev.release());
+    break;
+  case mambaserve::Event::kMigrate:
+    on_migrate_event_(ev.migrate());
+    break;
+  case mambaserve::Event::kReady:
+    LOG_DEBUG("worker %llu ready", static_cast<unsigned long long>(ev.ready().worker_idx()));
+    break;
+  case mambaserve::Event::BODY_NOT_SET:
+    break;
+  }
+}
+
+void ClusterScheduler::continue_after_token_(Session& sess, uint64_t req_id, int32_t token) {
+  // Check if we have either hit max tokens or eos token
+  const bool hit_eos = token == sess.params.eos_id;
+  const bool hit_max =
+      static_cast<int>(sess.generated_tokens.size()) >= sess.params.max_new_tokens;
+  // if yes set phase as done, tell worker to cleanup resources
+  if (hit_eos || hit_max) {
+    sess.phase = SessionPhase::Done;
+    telemetry::trace(telemetry::TraceKind::Done, req_id, static_cast<int>(sess.worker_idx),
+                     static_cast<int64_t>(sess.generated_tokens.size()));
+    // migration pending and decode phase is done, then whats the use of migrating
+    // simply send a release command
+    cancel_pending_migrate_(sess);
+    send_cmd_(sess.worker_idx, make_release_cmd(req_id));
+    return;
+  }
+  // if migration pending and decode phase is not done yet, then send migration requests to
+  // both the workers using begin_migrate_
+  if (sess.migrate_pending) {
+    sess.migrate_pending = false;
+    begin_migrate_(sess, req_id, sess.migrate_dst_idx);
+    return;
+  }
+  sess.phase = SessionPhase::Decoding;
+  send_cmd_(sess.worker_idx, make_decode_cmd(req_id, token));
+  maybe_rebalance_();
+}
+
+void ClusterScheduler::begin_migrate_(Session& sess, uint64_t req_id, size_t dst_idx) {
+  const size_t src_idx = sess.worker_idx;
+  sess.phase = SessionPhase::Migrating;
+  sess.migrate_dst_idx = dst_idx;
+  sess.migrate_acks = 0;
+  // dst inflight already reserved in migrate()
+  telemetry::counters().migrates_started++;
+  telemetry::trace(telemetry::TraceKind::MigrateBegin, req_id, static_cast<int>(src_idx),
+                   static_cast<int64_t>(dst_idx));
+  LOG_DEBUG("migrate begin req_id=%llu src=%zu dst=%zu", static_cast<unsigned long long>(req_id),
+            src_idx, dst_idx);
+
+  const int src_dev = workers_[src_idx].device_id;
+  const int dst_dev = workers_[dst_idx].device_id;
+
+  // route must exist before either worker can emit control traffic for this xfer
+  transport_plane_->on_migrate_begin(req_id, src_idx, dst_idx);
+  send_cmd_(dst_idx, make_migrate_cmd(req_id, mambaserve::XFER_RECV, src_dev));
+  send_cmd_(src_idx, make_migrate_cmd(req_id, mambaserve::XFER_SEND, dst_dev));
+}
+
+void ClusterScheduler::fail_migrate_(Session& sess, uint64_t req_id, const Status& err) {
+  const size_t src_idx = sess.worker_idx;
+  const size_t dst_idx = sess.migrate_dst_idx;
+  sess.phase = SessionPhase::Failed;
+  sess.s = err;
+  telemetry::counters().migrates_failed++;
+  telemetry::trace(telemetry::TraceKind::Failed, req_id, static_cast<int>(src_idx));
+  LOG_ERROR("migrate failed req_id=%llu src=%zu dst=%zu: %s",
+            static_cast<unsigned long long>(req_id), src_idx, dst_idx, err.message().c_str());
+  transport_plane_->on_migrate_end(req_id);
+  send_cmd_(src_idx, make_release_cmd(req_id));
+  send_cmd_(dst_idx, make_release_cmd(req_id));
+}
+
+void ClusterScheduler::cancel_pending_migrate_(Session& sess) {
+  if (!sess.migrate_pending)
+    return;
+  worker_stats_[sess.migrate_dst_idx].inflight--;
+  sess.migrate_pending = false;
 }
 
 Status ClusterScheduler::migrate_locked_(uint64_t req_id, size_t dst_idx) {
@@ -239,11 +467,6 @@ Status ClusterScheduler::migrate_locked_(uint64_t req_id, size_t dst_idx) {
   LOG_DEBUG("migrate requested req_id=%llu src=%zu dst=%zu",
             static_cast<unsigned long long>(req_id), sess.worker_idx, dst_idx);
   return Status::Ok();
-}
-
-Status ClusterScheduler::migrate(uint64_t req_id, size_t dst_idx) {
-  std::lock_guard<std::mutex> lk(session_mu_);
-  return migrate_locked_(req_id, dst_idx);
 }
 
 void ClusterScheduler::maybe_rebalance_() {
@@ -279,134 +502,31 @@ void ClusterScheduler::maybe_rebalance_() {
   (void)migrate_locked_(decision->victim_req_id, decision->dst_idx);
 }
 
-void ClusterScheduler::begin_migrate_(Session& sess, uint64_t req_id, size_t dst_idx) {
-  const size_t src_idx = sess.worker_idx;
-  sess.phase = SessionPhase::Migrating;
-  sess.migrate_dst_idx = dst_idx;
-  sess.migrate_acks = 0;
-  // dst inflight already reserved in migrate()
-  telemetry::counters().migrates_started++;
-  telemetry::trace(telemetry::TraceKind::MigrateBegin, req_id, static_cast<int>(src_idx),
-                   static_cast<int64_t>(dst_idx));
-  LOG_DEBUG("migrate begin req_id=%llu src=%zu dst=%zu", static_cast<unsigned long long>(req_id),
-            src_idx, dst_idx);
-
-  const int src_dev = workers_[src_idx].device_id;
-  const int dst_dev = workers_[dst_idx].device_id;
-
-  workers_[dst_idx].worker->enqueue(MigrateCmd{
-      .req_id = req_id,
-      .role = XferRole::Recv,
-      .peer_device_id = src_dev,
-  });
-  workers_[src_idx].worker->enqueue(MigrateCmd{
-      .req_id = req_id,
-      .role = XferRole::Send,
-      .peer_device_id = dst_dev,
-  });
-}
-
-void ClusterScheduler::fail_migrate_(Session& sess, uint64_t req_id, const Status& err) {
-  const size_t src_idx = sess.worker_idx;
-  const size_t dst_idx = sess.migrate_dst_idx;
-  sess.phase = SessionPhase::Failed;
-  sess.s = err;
-  telemetry::counters().migrates_failed++;
-  telemetry::trace(telemetry::TraceKind::Failed, req_id, static_cast<int>(src_idx));
-  LOG_ERROR("migrate failed req_id=%llu src=%zu dst=%zu: %s",
-            static_cast<unsigned long long>(req_id), src_idx, dst_idx, err.message().c_str());
-  workers_[src_idx].worker->enqueue(ReleaseCmd{req_id});
-  workers_[dst_idx].worker->enqueue(ReleaseCmd{req_id});
-}
-
-void ClusterScheduler::cancel_pending_migrate_(Session& sess) {
-  if (!sess.migrate_pending)
-    return;
-  worker_stats_[sess.migrate_dst_idx].inflight--;
-  sess.migrate_pending = false;
-}
-
-void ClusterScheduler::continue_after_token_(Session& sess, uint64_t req_id, int32_t token) {
-  Worker& worker = *workers_[sess.worker_idx].worker;
-  // Check if we have either hit max tokens or eos token
-  const bool hit_eos = token == sess.params.eos_id;
-  const bool hit_max =
-      static_cast<int>(sess.generated_tokens.size()) >= sess.params.max_new_tokens;
-  // if yes set phase as done, tell worker to cleanup resources
-  if (hit_eos || hit_max) {
-    sess.phase = SessionPhase::Done;
-    telemetry::trace(telemetry::TraceKind::Done, req_id, static_cast<int>(sess.worker_idx),
-                     static_cast<int64_t>(sess.generated_tokens.size()));
-    // migration pending and decode phase is done, then whats the use of migrating
-    // simply send a release command
-    cancel_pending_migrate_(sess);
-    worker.enqueue(ReleaseCmd{req_id});
-    return;
-  }
-  // if migration pending and decode phase is not done yet, then send migration requests to
-  // both the workers using begin_migrate_
-  if (sess.migrate_pending) {
-    sess.migrate_pending = false;
-    begin_migrate_(sess, req_id, sess.migrate_dst_idx);
-    return;
-  }
-  // if not migration pending and decode phase is not done yet let it decode more
-  sess.phase = SessionPhase::Decoding;
-  worker.enqueue(DecodeCmd{req_id, token});
-  maybe_rebalance_();
-}
-
-void ClusterScheduler::event_loop_() {
-  for (;;) {
-    std::unique_lock<std::mutex> lk(event_mu_);
-    event_cv_.wait(lk, [&]() { return !eventq_.empty() || stop_; });
-    if (eventq_.empty() && stop_)
-      return;
-    // PrefillEvent/DecodeEvent hold a const token, so Event (their variant)
-    // is move-constructible but not move-assignable; construct, don't assign.
-    Event ev = std::move(eventq_.front());
-    eventq_.pop_front();
-    lk.unlock();
-    handle_event_(std::move(ev));
-  }
-}
-
-void ClusterScheduler::handle_event_(Event ev) {
-  std::visit(overloaded{
-                 [&](PrefillEvent& e) { on_prefill_event_(e); },
-                 [&](DecodeEvent& e) { on_decode_event_(e); },
-                 [&](ReleaseEvent& e) { on_release_event_(e); },
-                 [&](MigrateEvent& e) { on_migrate_event_(e); },
-             },
-             ev);
-}
-
-void ClusterScheduler::on_prefill_event_(const PrefillEvent& ev) {
+void ClusterScheduler::on_prefill_event_(const mambaserve::PrefillEvent& ev) {
   std::lock_guard<std::mutex> lk(session_mu_);
-  auto it = sessions_.find(ev.req_id);
+  auto it = sessions_.find(ev.req_id());
   if (it == sessions_.end())
     return; // unknown/late event
   Session& sess = it->second;
-  Worker& worker = *workers_[sess.worker_idx].worker;
+  Status st = from_proto(ev.status());
 
-  if (!ev.s.ok()) {
+  if (!st.ok()) {
     sess.phase = SessionPhase::Failed;
-    sess.s = ev.s;
-    telemetry::trace(telemetry::TraceKind::Failed, ev.req_id, static_cast<int>(sess.worker_idx));
-    LOG_WARN("prefill failed req_id=%llu worker=%zu: %s", static_cast<unsigned long long>(ev.req_id),
-             sess.worker_idx, ev.s.message().c_str());
-    // Tell worker to release resources for that request
-    worker.enqueue(ReleaseCmd{ev.req_id});
+    sess.s = st;
+    telemetry::trace(telemetry::TraceKind::Failed, ev.req_id(), static_cast<int>(sess.worker_idx));
+    LOG_WARN("prefill failed req_id=%llu worker=%zu: %s",
+             static_cast<unsigned long long>(ev.req_id()), sess.worker_idx, st.message().c_str());
+    send_cmd_(sess.worker_idx, make_release_cmd(ev.req_id()));
     return;
   }
 
-  sess.generated_tokens.push_back(ev.token);
-  continue_after_token_(sess, ev.req_id, ev.token);
+  sess.generated_tokens.push_back(ev.token());
+  continue_after_token_(sess, ev.req_id(), ev.token());
 }
 
-void ClusterScheduler::on_decode_event_(const DecodeEvent& ev) {
+void ClusterScheduler::on_decode_event_(const mambaserve::DecodeEvent& ev) {
   std::lock_guard<std::mutex> lk(session_mu_);
-  auto it = sessions_.find(ev.req_id);
+  auto it = sessions_.find(ev.req_id());
   if (it == sessions_.end())
     return; // unknown/late event
   Session& sess = it->second;
@@ -415,43 +535,43 @@ void ClusterScheduler::on_decode_event_(const DecodeEvent& ev) {
   if (sess.phase == SessionPhase::Migrating)
     return;
 
-  Worker& worker = *workers_[sess.worker_idx].worker;
+  Status st = from_proto(ev.status());
 
-  if (!ev.s.ok()) {
+  if (!st.ok()) {
     // KV cache overflow ends the session with a partial result, not a hard failure.
-    if (ev.s.code() == Code::kKvCacheOverflow) {
+    if (st.code() == Code::kKvCacheOverflow) {
       sess.phase = SessionPhase::Done;
       telemetry::counters().kv_overflows++;
-      telemetry::trace(telemetry::TraceKind::Done, ev.req_id, static_cast<int>(sess.worker_idx),
+      telemetry::trace(telemetry::TraceKind::Done, ev.req_id(), static_cast<int>(sess.worker_idx),
                        static_cast<int64_t>(sess.generated_tokens.size()));
     } else {
       sess.phase = SessionPhase::Failed;
-      sess.s = ev.s;
-      telemetry::trace(telemetry::TraceKind::Failed, ev.req_id,
+      sess.s = st;
+      telemetry::trace(telemetry::TraceKind::Failed, ev.req_id(),
                        static_cast<int>(sess.worker_idx));
       LOG_WARN("decode failed req_id=%llu worker=%zu: %s",
-               static_cast<unsigned long long>(ev.req_id), sess.worker_idx,
-               ev.s.message().c_str());
+               static_cast<unsigned long long>(ev.req_id()), sess.worker_idx, st.message().c_str());
     }
-    worker.enqueue(ReleaseCmd{ev.req_id});
+    send_cmd_(sess.worker_idx, make_release_cmd(ev.req_id()));
     return;
   }
 
-  sess.generated_tokens.push_back(ev.token);
-  continue_after_token_(sess, ev.req_id, ev.token);
+  sess.generated_tokens.push_back(ev.token());
+  continue_after_token_(sess, ev.req_id(), ev.token());
 }
 
-void ClusterScheduler::on_migrate_event_(const MigrateEvent& ev) {
+void ClusterScheduler::on_migrate_event_(const mambaserve::MigrateEvent& ev) {
   std::lock_guard<std::mutex> lk(session_mu_);
-  auto it = sessions_.find(ev.req_id);
+  auto it = sessions_.find(ev.req_id());
   if (it == sessions_.end())
     return;
   Session& sess = it->second;
   if (sess.phase != SessionPhase::Migrating)
     return;
 
-  if (!ev.s.ok()) {
-    fail_migrate_(sess, ev.req_id, ev.s);
+  Status st = from_proto(ev.status());
+  if (!st.ok()) {
+    fail_migrate_(sess, ev.req_id(), st);
     return;
   }
 
@@ -461,64 +581,53 @@ void ClusterScheduler::on_migrate_event_(const MigrateEvent& ev) {
     return;
 
   // Both sides done — release src slot; commit home on ReleaseEvent.
-  workers_[sess.worker_idx].worker->enqueue(ReleaseCmd{ev.req_id});
+  send_cmd_(sess.worker_idx, make_release_cmd(ev.req_id()));
 }
 
-void ClusterScheduler::on_release_event_(const ReleaseEvent& ev) {
+void ClusterScheduler::on_release_event_(const mambaserve::ReleaseEvent& ev) {
   std::lock_guard<std::mutex> lk(session_mu_);
-  auto it = sessions_.find(ev.req_id);
+  auto it = sessions_.find(ev.req_id());
   if (it == sessions_.end())
     return; // unknown/late event
   Session& sess = it->second;
+  const size_t worker_idx = static_cast<size_t>(ev.worker_idx());
 
   if (sess.phase == SessionPhase::Migrating) {
     // Src cleanup after successful xfer transfer — commit sticky home to dst.
-    if (ev.worker_idx != sess.worker_idx)
-      return; // ignore unexpected (e.g. spurious) release
+    if (worker_idx != sess.worker_idx)
+      return;
     worker_stats_[sess.worker_idx].inflight--;
     sess.worker_idx = sess.migrate_dst_idx;
     // dst inflight already reserved in begin_migrate_
     sess.phase = SessionPhase::Decoding;
     sess.migrate_acks = 0;
     telemetry::counters().migrates_completed++;
-    telemetry::trace(telemetry::TraceKind::MigrateCommit, ev.req_id,
+    telemetry::trace(telemetry::TraceKind::MigrateCommit, ev.req_id(),
                      static_cast<int>(sess.worker_idx));
-    LOG_DEBUG("migrate commit req_id=%llu home=%zu", static_cast<unsigned long long>(ev.req_id),
+    LOG_DEBUG("migrate commit req_id=%llu home=%zu", static_cast<unsigned long long>(ev.req_id()),
               sess.worker_idx);
+    transport_plane_->on_migrate_end(ev.req_id());
     if (sess.generated_tokens.empty()) {
       sess.phase = SessionPhase::Failed;
       sess.s = Status::RuntimeError("migrate commit with empty token history");
-      workers_[sess.worker_idx].worker->enqueue(ReleaseCmd{ev.req_id});
+      send_cmd_(sess.worker_idx, make_release_cmd(ev.req_id()));
       return;
     }
     const int32_t last = sess.generated_tokens.back();
-    workers_[sess.worker_idx].worker->enqueue(DecodeCmd{ev.req_id, last});
+    send_cmd_(sess.worker_idx, make_decode_cmd(ev.req_id(), last));
     return;
   }
 
   if (sess.phase == SessionPhase::Failed) {
     // Fail path releases both src and dst; debit whichever worker reported.
-    if (ev.worker_idx < worker_stats_.size())
-      worker_stats_[ev.worker_idx].inflight--;
+    if (worker_idx < worker_stats_.size())
+      worker_stats_[worker_idx].inflight--;
     return;
   }
 
   // Normal Done/Failed terminal release.
-  if (ev.worker_idx < worker_stats_.size())
-    worker_stats_[ev.worker_idx].inflight--;
+  if (worker_idx < worker_stats_.size())
+    worker_stats_[worker_idx].inflight--;
   else
     worker_stats_[sess.worker_idx].inflight--;
-}
-
-void ClusterScheduler::shutdown() {
-  {
-    // stop the event loop to stop listening to extra events from workers
-    std::lock_guard<std::mutex> lk(event_mu_);
-    stop_ = true;
-  }
-  event_cv_.notify_all();
-  if (event_thread_.joinable())
-    event_thread_.join();
-  workers_.clear(); // each Worker's dtor stops + joins its own thread
-  worker_stats_.clear();
 }

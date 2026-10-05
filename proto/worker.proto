@@ -72,6 +72,7 @@ message MigrateEvent {
 
 message ReadyEvent {
     uint64 worker_idx = 1;
+    StatusMsg status = 2; // worker-side init (device bind, model load, pool, comm agent)
 }
 
 message Command {
@@ -122,8 +123,52 @@ message NcclBootstrap {
   int32 rank = 2;          // usually == device_id in your setup
   bytes unique_id = 3;     // memcpy of ncclUniqueId (NCCL_UNIQUE_ID_BYTES)
 }
+// Worker → parent: result of ncclCommInitRank for the rank in `rank`.
+message NcclBootstrapAck {
+  int32 rank = 1;
+  bool ok = 2;
+  string error = 3;
+}
 message NcclControl {
   oneof body {
     NcclBootstrap bootstrap = 1;
+    NcclBootstrapAck bootstrap_ack = 2;
+  }
+}
+
+// MemcpyPeer control-plane (replaces the process-static rendezvous map).
+message MemcpySlotAnnounce {
+  uint64 xfer_id = 1;
+  uint64 dst_ptr = 2;     // destination slot in the RECV worker
+  uint64 bytes = 3;
+  int32 dst_device = 4;
+}
+message MemcpyXferDone {
+  uint64 xfer_id = 1;
+  int64 seq_len = 2;
+  bool ok = 3;
+}
+message MemcpyControl {
+  oneof body {
+    MemcpySlotAnnounce announce = 1;  // Recv → Send
+    MemcpySlotAnnounce clear = 2;
+    MemcpyXferDone done = 3;          // Send → Recv, after the copy
+  }
+}
+
+message TransportControl {
+  oneof body {
+    NixlControl nixl_ctrl = 1;
+    NcclControl nccl_ctrl = 2;
+    MemcpyControl memcpy_ctrl = 3;
+  }
+}
+
+
+message Envelope {
+  oneof body {
+    Event event = 1;
+    Command cmd = 2;
+    TransportControl transport = 3;
   }
 }

@@ -163,7 +163,13 @@ file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE COMM_SOURCES CONFIGURE_DEPENDS
     "src/comm/*.cpp"
 )
-add_library(runtime ${RUNTIME_SOURCES} ${COMM_SOURCES})
+# Worker hosting (thread/process creation + re-exec entry hook) lives next to the host
+# mains rather than under src/runtime; it still builds into the runtime library.
+set(WORKER_HOST_SOURCES
+    src/worker_process.cpp
+    src/worker_factory.cpp
+)
+add_library(runtime ${RUNTIME_SOURCES} ${COMM_SOURCES} ${WORKER_HOST_SOURCES})
 target_link_libraries(runtime
     PUBLIC 
         mambaserve_common

@@ -9,13 +9,28 @@
 # Stages: env paths transport scale migrate rebalance logcheck nsys analyze
 #
 # Knobs (environment variables):
-#   BIN_DIR   directory with transport_bench / cluster_bench   (build-cuda/benchmarks)
-#   MODELS    comma separated model dirs   (models/falcon-h1-0.5b-base,models/mamba2-130m-hf)
-#   DEVICE    GPU | CPU                    (GPU)
-#   REPEATS   measured repeats per config  (5)
-#   MAX_SEQS  slot sizes for the migrate sweep (512,1024,2048,4096)
-#   VARIANTS  transport variants to run (see below)
-#   OUT       output root
+#   BIN_DIR              directory with transport_bench / cluster_bench   (build-cuda/benchmarks)
+#   MODELS               comma separated model dirs   (models/falcon-h1-0.5b-base,models/mamba2-130m-hf)
+#   DEVICE               GPU | CPU                    (GPU)
+#   REPEATS              measured repeats per config  (5)
+#   MAX_SEQS             slot sizes for the migrate sweep (512,1024,2048,4096)
+#   VARIANTS             transport variants to run (see below)
+#   OUT                  output root
+#   BG_SESSIONS          background sessions for migrate busy load (2)
+#   MIGRATIONS           forced migrates of the primary session (3)
+#   SESSIONS_REBALANCE   concurrent sessions in rebalance (8)
+#   THRESHOLDS           rebalance thresholds when *_on (2,4)
+#   REBALANCE_MAX_SEQ    max-seq for rebalance stage (2048)
+#   PROMPT_LEN / GEN_LEN prompt / decode length (128 / 64)
+#
+# A100-80GB stress example (falcon-h1-0.5b ~100MiB/slot @2048, ~170MiB @4096,
+# ~316MiB @8192; each worker preallocates SESSIONS slots):
+#   STAGES=migrate,rebalance,analyze \
+#   BG_SESSIONS=48 SESSIONS_REBALANCE=64 THRESHOLDS=1,2 \
+#   MAX_SEQS=2048,4096,8192 REBALANCE_MAX_SEQ=8192 \
+#   MIGRATIONS=5 GEN_LEN=128 REPEATS=3 \
+#   VARIANTS=memcpy,nccl,nccl_nop2p,nixl_cudaipc,nixl_hoststaged \
+#   scripts/run_matrix.sh
 #
 # Transport variants (name -> backend + env):
 #   memcpy           MemcpyPeer
@@ -42,6 +57,11 @@ STAGES="${STAGES:-env,paths,transport,scale,migrate,rebalance,logcheck,analyze}"
 OUT="${OUT:-$ROOT/results/$(date +%Y%m%d_%H%M%S)}"
 PROMPT_LEN="${PROMPT_LEN:-128}"
 GEN_LEN="${GEN_LEN:-64}"
+BG_SESSIONS="${BG_SESSIONS:-2}"
+MIGRATIONS="${MIGRATIONS:-3}"
+SESSIONS_REBALANCE="${SESSIONS_REBALANCE:-8}"
+THRESHOLDS="${THRESHOLDS:-2,4}"
+REBALANCE_MAX_SEQ="${REBALANCE_MAX_SEQ:-2048}"
 
 mkdir -p "$OUT"
 cd "$ROOT"
@@ -153,7 +173,7 @@ if have_stage migrate; then
     log "cluster_bench migrate: $v (worker-mode $wm)"
     run_with_env "$envs" "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" \
       --model-dirs "$MODELS" --backends "$backend" --worker-mode "$wm" --max-seq "$MAX_SEQS" --loads idle,busy \
-      --bg-sessions 2 --migrate-at 8 --migrate-every 8 --migrations 3 \
+      --bg-sessions "$BG_SESSIONS" --migrate-at 8 --migrate-every 8 --migrations "$MIGRATIONS" \
       --prompt-len "$PROMPT_LEN" --gen-len "$GEN_LEN" --repeats "$REPEATS" \
       --out-dir "$OUT/migrate/$v" 2>&1 | tee "$OUT/migrate_$v.log" >/dev/null || log "  (failed: $v)"
   done
@@ -165,8 +185,9 @@ if have_stage rebalance; then
     wm="$(worker_mode_for "$backend")"
     log "cluster_bench rebalance: $v (worker-mode $wm)"
     run_with_env "$envs" "$BIN_DIR/cluster_bench" --scenario rebalance --device "$DEVICE" \
-      --model-dirs "$MODELS" --backends "$backend" --worker-mode "$wm" --max-seq 2048 \
-      --sessions-rebalance 8 --configs pinned_off,pinned_on,balanced_off --thresholds 2,4 \
+      --model-dirs "$MODELS" --backends "$backend" --worker-mode "$wm" --max-seq "$REBALANCE_MAX_SEQ" \
+      --sessions-rebalance "$SESSIONS_REBALANCE" --configs pinned_off,pinned_on,balanced_off \
+      --thresholds "$THRESHOLDS" \
       --prompt-len "$PROMPT_LEN" --gen-len "$GEN_LEN" --repeats "$REPEATS" \
       --out-dir "$OUT/rebalance/$v" 2>&1 | tee "$OUT/rebalance_$v.log" >/dev/null || log "  (failed: $v)"
   done
@@ -179,7 +200,7 @@ if have_stage logcheck; then
     log "logcheck: MAMBASERVE_LOG=$lvl"
     MAMBASERVE_LOG="$lvl" "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" \
       --model-dirs "$first_model" --backends memcpy --worker-mode "$(worker_mode_for memcpy)" \
-      --max-seq 2048 --loads busy --bg-sessions 2 \
+      --max-seq 2048 --loads busy --bg-sessions "$BG_SESSIONS" \
       --prompt-len "$PROMPT_LEN" --gen-len "$GEN_LEN" --repeats "$REPEATS" \
       --out-dir "$OUT/logcheck/$lvl" > "$OUT/logcheck_$lvl.log" 2>&1 || log "  (failed: $lvl)"
   done

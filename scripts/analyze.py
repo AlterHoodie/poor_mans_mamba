@@ -380,6 +380,18 @@ def report_meta(root, out_lines):
     keys = ["git_hash", "timestamp", "hostname", "kernel", "nproc", "cpu_model", "nvcc_version",
             "nccl_version", "ucx_version", "built_with_nccl", "built_with_nixl", "scope_note"]
     out_lines.append(md_table(["key", "value"], [[k, m.get(k, "")] for k in keys if k in m]))
+    # Worker mode differs per variant (thread for memcpy, process for nccl/nixl), so list
+    # it for every cluster_bench run rather than only the first.
+    wm_rows = []
+    for v, path in metas:
+        if os.path.basename(path) != "meta.json":
+            continue
+        with open(path) as f:
+            mv = json.load(f)
+        wm_rows.append([v, mv.get("arg.backends", ""), mv.get("arg.worker-mode", "thread")])
+    if wm_rows:
+        out_lines.append("Worker mode per cluster_bench run:\n")
+        out_lines.append(md_table(["variant", "backends", "worker-mode"], wm_rows))
     if m.get("nvidia_smi_gpus"):
         out_lines.append("GPUs:\n\n```\n" + m["nvidia_smi_gpus"] + "\n```\n")
     if m.get("nvidia_smi_topo"):
@@ -408,8 +420,10 @@ def main():
 
     lines = ["# MambaServe benchmark report\n",
              f"Source: `{os.path.abspath(args.root)}`\n",
-             "> Scope: intra-node, single process, thread-per-worker. NIXL uses UCX between local "
-             "GPUs (cuda_ipc or host staged); results are not network RDMA numbers.\n"]
+             "> Scope: intra-node. cluster_bench uses each backend's native worker mode: "
+             "memcpy runs thread-per-worker, NCCL and NIXL run process-per-worker. NIXL uses UCX "
+             "between local GPUs (cuda_ipc or host staged); results are not network RDMA "
+             "numbers.\n"]
     report_meta(args.root, lines)
     report_transport(args.root, lines, plt, out_dir)
     cluster = load_cluster(args.root)

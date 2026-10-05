@@ -94,7 +94,7 @@ cmake --build build-cuda --target transport_bench cluster_bench
 scripts/run_matrix.sh            # full matrix on a 2-GPU VM -> results/<timestamp>/report.md
 ```
 
-`scripts/run_matrix.sh` runs per transport variant (`memcpy`, `nccl`, `nccl_nop2p`, `nixl_cudaipc`, `nixl_hoststaged`), records the NCCL/UCX path actually chosen (`paths` stage), compares `MAMBASERVE_LOG=off` vs `debug` (`logcheck` stage), and calls `scripts/analyze.py` for the report. Use `STAGES=...`, `DEVICE=CPU REPEATS=1` for subsets or a no-GPU smoke test.
+`scripts/run_matrix.sh` runs per transport variant (`memcpy`, `nccl`, `nccl_nop2p`, `nixl_cudaipc`, `nixl_hoststaged`), records the NCCL/UCX path actually chosen (`paths` stage), compares `MAMBASERVE_LOG=off` vs `debug` (`logcheck` stage), and calls `scripts/analyze.py` for the report. Cluster stages use each backend's native worker mode (`thread` for memcpy, `process` for nccl/nixl). Use `STAGES=...`, `DEVICE=CPU REPEATS=1` for subsets or a no-GPU smoke test.
 
 **Telemetry.** `MAMBASERVE_LOG=debug|info|warn|error|off` (default `warn`) controls logging. The trace recorder (`include/telemetry/recorder.h`) stamps submit, prefill, every decode, and each migrate phase per thread with no shared lock; `cluster_bench` enables it and derives TTFT, ITL, migrate wait/transfer/ack/stall, and background-session interference from it. Counters (bytes migrated, rebalance decisions, slot rejects, ...) land in `summary.csv`. NVTX ranges for Nsight Systems are compiled in with `-DMAMBASERVE_WITH_NVTX=ON`.
 

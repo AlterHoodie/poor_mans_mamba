@@ -24,6 +24,10 @@
 #   nixl_cudaipc     NIXL/UCX with UCX_TLS=self,tcp,sm,cuda_copy,cuda_ipc (P2P path)
 #   nixl_hoststaged  NIXL/UCX with UCX_TLS=self,tcp,sm,cuda_copy (no cuda_ipc => host staged)
 # Variants whose backend is not built simply fail to load and are skipped.
+#
+# cluster_bench worker mode is the native one per backend (not configurable):
+#   memcpy -> --worker-mode thread    (raw pointers, one address space)
+#   nccl, nixl -> --worker-mode process
 
 set -uo pipefail
 
@@ -56,6 +60,15 @@ variant_spec() {
     nixl_cudaipc)    echo "nixl|UCX_TLS=self,tcp,sm,cuda_copy,cuda_ipc" ;;
     nixl_hoststaged) echo "nixl|UCX_TLS=self,tcp,sm,cuda_copy" ;;
     *) echo "unknown|" ;;
+  esac
+}
+
+# backend -> native cluster_bench worker mode (thread|process)
+worker_mode_for() {
+  case "$1" in
+    memcpy) echo thread ;;
+    nccl|nixl) echo process ;;
+    *) echo thread ;;
   esac
 }
 
@@ -126,9 +139,9 @@ if have_stage transport; then
 fi
 
 if have_stage scale; then
-  log "cluster_bench scale"
+  log "cluster_bench scale (worker-mode $(worker_mode_for memcpy))"
   "$BIN_DIR/cluster_bench" --scenario scale --device "$DEVICE" --model-dirs "$MODELS" \
-    --backends memcpy --workers 1,2 --sessions 1,2,4,8,16 --prompt-len "$PROMPT_LEN" \
+    --backends memcpy --worker-mode "$(worker_mode_for memcpy)" --workers 1,2 --sessions 1,2,4,8,16 --prompt-len "$PROMPT_LEN" \
     --gen-len "$GEN_LEN" --repeats "$REPEATS" --out-dir "$OUT/scale" \
     2>&1 | tee "$OUT/scale.log" >/dev/null || log "  (scale failed)"
 fi
@@ -136,9 +149,10 @@ fi
 if have_stage migrate; then
   for v in "${VARIANT_LIST[@]}"; do
     IFS='|' read -r backend envs <<< "$(variant_spec "$v")"
-    log "cluster_bench migrate: $v"
+    wm="$(worker_mode_for "$backend")"
+    log "cluster_bench migrate: $v (worker-mode $wm)"
     run_with_env "$envs" "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" \
-      --model-dirs "$MODELS" --backends "$backend" --max-seq "$MAX_SEQS" --loads idle,busy \
+      --model-dirs "$MODELS" --backends "$backend" --worker-mode "$wm" --max-seq "$MAX_SEQS" --loads idle,busy \
       --bg-sessions 2 --migrate-at 8 --migrate-every 8 --migrations 3 \
       --prompt-len "$PROMPT_LEN" --gen-len "$GEN_LEN" --repeats "$REPEATS" \
       --out-dir "$OUT/migrate/$v" 2>&1 | tee "$OUT/migrate_$v.log" >/dev/null || log "  (failed: $v)"
@@ -148,9 +162,10 @@ fi
 if have_stage rebalance; then
   for v in "${VARIANT_LIST[@]}"; do
     IFS='|' read -r backend envs <<< "$(variant_spec "$v")"
-    log "cluster_bench rebalance: $v"
+    wm="$(worker_mode_for "$backend")"
+    log "cluster_bench rebalance: $v (worker-mode $wm)"
     run_with_env "$envs" "$BIN_DIR/cluster_bench" --scenario rebalance --device "$DEVICE" \
-      --model-dirs "$MODELS" --backends "$backend" --max-seq 2048 \
+      --model-dirs "$MODELS" --backends "$backend" --worker-mode "$wm" --max-seq 2048 \
       --sessions-rebalance 8 --configs pinned_off,pinned_on,balanced_off --thresholds 2,4 \
       --prompt-len "$PROMPT_LEN" --gen-len "$GEN_LEN" --repeats "$REPEATS" \
       --out-dir "$OUT/rebalance/$v" 2>&1 | tee "$OUT/rebalance_$v.log" >/dev/null || log "  (failed: $v)"
@@ -163,7 +178,8 @@ if have_stage logcheck; then
   for lvl in off debug; do
     log "logcheck: MAMBASERVE_LOG=$lvl"
     MAMBASERVE_LOG="$lvl" "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" \
-      --model-dirs "$first_model" --backends memcpy --max-seq 2048 --loads busy --bg-sessions 2 \
+      --model-dirs "$first_model" --backends memcpy --worker-mode "$(worker_mode_for memcpy)" \
+      --max-seq 2048 --loads busy --bg-sessions 2 \
       --prompt-len "$PROMPT_LEN" --gen-len "$GEN_LEN" --repeats "$REPEATS" \
       --out-dir "$OUT/logcheck/$lvl" > "$OUT/logcheck_$lvl.log" 2>&1 || log "  (failed: $lvl)"
   done
@@ -176,11 +192,12 @@ if have_stage nsys; then
   if command -v nsys >/dev/null; then
     for v in "${VARIANT_LIST[@]}"; do
       IFS='|' read -r backend envs <<< "$(variant_spec "$v")"
-      log "nsys: $v"
+      wm="$(worker_mode_for "$backend")"
+      log "nsys: $v (worker-mode $wm)"
       mkdir -p "$OUT/nsys"
       run_with_env "$envs" nsys profile -t cuda,nvtx,osrt -o "$OUT/nsys/$v" --force-overwrite true \
         "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" --model-dirs "${MODELS%%,*}" \
-        --backends "$backend" --max-seq 2048 --loads busy --bg-sessions 2 --repeats 1 \
+        --backends "$backend" --worker-mode "$wm" --max-seq 2048 --loads busy --bg-sessions 2 --repeats 1 \
         --warmup-runs 1 --out-dir "$OUT/nsys/run_$v" > "$OUT/nsys_$v.log" 2>&1 || log "  (failed: $v)"
     done
   else

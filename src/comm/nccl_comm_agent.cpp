@@ -1,5 +1,6 @@
 #include "comm/nccl_comm_agent.h"
 
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -15,34 +16,74 @@ Status nccl_to_status(ncclResult_t r, const char* what) {
 } // namespace
 #endif
 
-NcclCommAgent::NcclCommAgent(int device_id, int rank, std::shared_ptr<NcclCluster> cluster)
-    : CommAgent(device_id), rank_(rank), cluster_(std::move(cluster)) {
-#if MAMBASERVE_WITH_NCCL
-  if (!cluster_ || cluster_->nranks <= 0)
-    return;
-  if (rank_ < 0 || rank_ >= cluster_->nranks)
-    return;
-
-  // Parameter `device_id` shadows CommAgent::device_id(); use this-> explicitly.
-  if (cudaSetDevice(this->device_id()) != cudaSuccess)
-    return;
-  if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
-    stream_ = nullptr;
-    return;
-  }
-  if (ncclCommInitRank(&comm_, cluster_->nranks, cluster_->id, rank_) != ncclSuccess) {
-    cudaStreamDestroy(stream_);
-    stream_ = nullptr;
-    comm_ = nullptr;
-  }
-#else
-  (void)rank_;
-#endif
-}
+// Communicator init is deferred to handle_transport(NcclBootstrap).
+NcclCommAgent::NcclCommAgent(int device_id, int rank, int nranks)
+    : CommAgent(device_id), rank_(rank), nranks_(nranks) {}
 
 NcclCommAgent::~NcclCommAgent() { shutdown(); }
 
 Status NcclCommAgent::register_slab(void*, size_t) { return Status::Ok(); }
+
+#if MAMBASERVE_WITH_NCCL
+Status NcclCommAgent::init_comm_(const mambaserve::NcclBootstrap& boot) {
+  if (comm_)
+    return Status::InvalidArgument("NCCL communicator already initialized");
+  if (boot.nranks() <= 0 || boot.rank() < 0 || boot.rank() >= boot.nranks())
+    return Status::InvalidArgument("invalid NCCL bootstrap rank/nranks");
+  if (boot.rank() != rank_ || boot.nranks() != nranks_)
+    return Status::InvalidArgument("NCCL bootstrap does not match this agent's rank/nranks");
+
+  ncclUniqueId id;
+  if (boot.unique_id().size() != sizeof(id.internal))
+    return Status::InvalidArgument("NCCL bootstrap unique_id has wrong size");
+  std::memcpy(id.internal, boot.unique_id().data(), sizeof(id.internal));
+
+  if (cudaSetDevice(device_id()) != cudaSuccess)
+    return Status::RuntimeError("cudaSetDevice failed");
+  if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
+    stream_ = nullptr;
+    return Status::RuntimeError("cudaStreamCreate failed");
+  }
+  // Blocks until every rank has joined.
+  ncclResult_t r = ncclCommInitRank(&comm_, boot.nranks(), id, boot.rank());
+  if (r != ncclSuccess) {
+    cudaStreamDestroy(stream_);
+    stream_ = nullptr;
+    comm_ = nullptr;
+    return nccl_to_status(r, "ncclCommInitRank");
+  }
+  return Status::Ok();
+}
+#endif
+
+Status NcclCommAgent::handle_transport(const mambaserve::TransportControl& msg) {
+  if (msg.body_case() != mambaserve::TransportControl::kNcclCtrl)
+    return Status::Ok();
+  const mambaserve::NcclControl& ctrl = msg.nccl_ctrl();
+  if (ctrl.body_case() != mambaserve::NcclControl::kBootstrap)
+    return Status::Ok();
+
+#if !MAMBASERVE_WITH_NCCL
+  Status st = Status::NotImplemented("NCCL transport not enabled (build with MAMBASERVE_WITH_NCCL=ON)");
+#else
+  Status st = init_comm_(ctrl.bootstrap());
+#endif
+
+  mambaserve::TransportControl reply;
+  auto* ack = reply.mutable_nccl_ctrl()->mutable_bootstrap_ack();
+  ack->set_rank(rank_);
+  ack->set_ok(st.ok());
+  if (!st.ok())
+    ack->set_error(st.message());
+  reply_ = std::move(reply);
+  return st;
+}
+
+std::optional<mambaserve::TransportControl> NcclCommAgent::take_transport_reply() {
+  std::optional<mambaserve::TransportControl> out = std::move(reply_);
+  reply_.reset();
+  return out;
+}
 
 StatusOr<XferHandle> NcclCommAgent::post(XferDesc& desc) {
 #if !MAMBASERVE_WITH_NCCL
@@ -50,10 +91,10 @@ StatusOr<XferHandle> NcclCommAgent::post(XferDesc& desc) {
   return Status::NotImplemented("NCCL transport not enabled (build with MAMBASERVE_WITH_NCCL=ON)");
 #else
   if (!comm_ || !stream_)
-    return Status::RuntimeError("NcclCommAgent not initialized");
+    return Status::RuntimeError("NcclCommAgent not bootstrapped (no NcclBootstrap received)");
   if (desc.local_ptr == nullptr || desc.bytes == 0)
     return Status::InvalidArgument("NCCL xfer requires local_ptr and bytes");
-  if (!cluster_ || desc.peer_device_id < 0 || desc.peer_device_id >= cluster_->nranks)
+  if (desc.peer_device_id < 0 || desc.peer_device_id >= nranks_)
     return Status::InvalidArgument("invalid peer_device_id for NCCL");
 
   const int peer = desc.peer_device_id;

@@ -9,99 +9,10 @@
 #include <cuda_runtime.h>
 #endif
 
-std::mutex MemcpyPeerCommAgent::rendezvous_mu_;
-std::unordered_map<uint64_t, MemcpyPeerCommAgent::Rendezvous> MemcpyPeerCommAgent::rendezvous_;
-
 MemcpyPeerCommAgent::MemcpyPeerCommAgent(int device_id, Device kind)
     : CommAgent(device_id), kind_(kind) {}
 
 MemcpyPeerCommAgent::~MemcpyPeerCommAgent() { shutdown(); }
-
-void MemcpyPeerCommAgent::publish_recv_(uint64_t xfer_id, void* dst, size_t bytes, int dst_dev) {
-  // acquires lock 
-  std::lock_guard<std::mutex> lk(rendezvous_mu_);
-  // creates a new randezvous entry so later on send can poll on this xfer id 
-  // and initiate a copy
-  Rendezvous& rz = rendezvous_[xfer_id];
-  rz.dst_ptr = dst;
-  rz.bytes = bytes;
-  rz.dst_device = dst_dev;
-  rz.phase = Phase::Ready;
-}
-
-MemcpyPeerCommAgent::ClaimCopy MemcpyPeerCommAgent::try_claim_copy_(uint64_t xfer_id,
-                                                                   size_t fallback_bytes) {
-  // acquire lock
-  std::lock_guard<std::mutex> lk(rendezvous_mu_);
-  Rendezvous& rz = rendezvous_[xfer_id];
-  
-  // check phase of recv side whether its ready with dst ptr and and bytes
-  ClaimCopy out;
-  switch (rz.phase) {
-  // recv side could not set dst ptr and bytes for some reason
-  case Phase::Failed:
-    out.claim = Claim::Error;
-    return out;
-  // waiting for recv side to post dst ptr and bytes
-  case Phase::WaitingRecv:
-  // copying the bytes, never runs currently cause its sync - will be useful when copy is async
-  case Phase::Copying:
-    out.claim = Claim::Pending;
-    return out;
-  // copy done 
-  case Phase::Done:
-    out.claim = Claim::Done;
-    out.seq_len = rz.seq_len;
-    return out;
-  // recv side has posted valid dst ptr and bytes, can begin copying into it
-  case Phase::Ready:
-    rz.phase = Phase::Copying;
-    out.claim = Claim::DoCopy;
-    out.dst = rz.dst_ptr;
-    out.bytes = rz.bytes != 0 ? rz.bytes : fallback_bytes;
-    out.dst_dev = rz.dst_device;
-    return out;
-  }
-  out.claim = Claim::Error;
-  return out;
-}
-
-void MemcpyPeerCommAgent::finish_copy_(uint64_t xfer_id, int64_t seq_len, bool ok) {
-  std::lock_guard<std::mutex> lk(rendezvous_mu_);
-  auto it = rendezvous_.find(xfer_id);
-  if (it == rendezvous_.end())
-    return;
-  Rendezvous& rz = it->second;
-  if (!ok) {
-    rz.phase = Phase::Failed;
-    return;
-  }
-  rz.seq_len = seq_len;
-  rz.phase = Phase::Done;
-}
-
-XferState MemcpyPeerCommAgent::poll_recv_state_(uint64_t xfer_id, int64_t* seq_len_out) {
-  std::lock_guard<std::mutex> lk(rendezvous_mu_);
-  auto it = rendezvous_.find(xfer_id);
-  if (it == rendezvous_.end())
-    return XferState::Pending;
-
-  Rendezvous& rz = it->second;
-  switch (rz.phase) {
-  case Phase::Failed:
-    return XferState::Error;
-  case Phase::Done:
-    if (seq_len_out)
-      *seq_len_out = rz.seq_len;
-    rendezvous_.erase(it);
-    return XferState::Done;
-  case Phase::WaitingRecv:
-  case Phase::Ready:
-  case Phase::Copying:
-    return XferState::Pending;
-  }
-  return XferState::Error;
-}
 
 Status MemcpyPeerCommAgent::register_slab(void* /*ptr*/, size_t /*bytes*/) {
   return Status::Ok();
@@ -146,7 +57,7 @@ Status MemcpyPeerCommAgent::do_copy_(void* dst, int dst_dev, void* src, int src_
     return Status::InvalidArgument("copy pointers cannot be null");
   if (bytes == 0)
     return Status::InvalidArgument("copy bytes must be > 0");
-  // cpu mode use simple memcpy 
+  // cpu mode use simple memcpy
   if (kind_ == Device::CPU) {
     std::memcpy(dst, src, bytes);
     return Status::Ok();
@@ -185,12 +96,10 @@ StatusOr<XferHandle> MemcpyPeerCommAgent::post(XferDesc& desc) {
   if (desc.bytes == 0)
     return Status::InvalidArgument("bytes must be > 0");
 
-  if (desc.role == XferRole::Recv)
-    // recieve side first creates the randevous xfer
-    publish_recv_(desc.xfer_id, desc.local_ptr, desc.bytes, device_id());
-
   const uint64_t id = id_counter_.fetch_add(1, std::memory_order_relaxed);
-  // local worker entries, to poll on status of requests 
+  // local worker entries, to poll on status of requests
+  // (Recv's slot reaches Send via make_post_announce; Send's completion reaches
+  // Recv via make_completion_announce - both routed by the control plane)
   xfers_[id] = Entry{
       .desc = desc,
       .role = desc.role,
@@ -206,23 +115,19 @@ XferState MemcpyPeerCommAgent::poll_send_(Entry& entry) {
   if (entry.state != XferState::Pending)
     return entry.state;
 
-  ClaimCopy claim = try_claim_copy_(entry.xfer_id, entry.desc.bytes);
-  switch (claim.claim) {
-  case Claim::Pending:
-    return XferState::Pending;
-  case Claim::Error:
-    entry.state = XferState::Error;
-    return entry.state;
-  case Claim::Done:
-    entry.seq_len = claim.seq_len;
-    entry.state = XferState::Done;
-    return entry.state;
-  case Claim::DoCopy:
-    break;
+  // wait for the Recv side to announce its destination slot
+  Announce ann;
+  {
+    std::lock_guard<std::mutex> lk(ctrl_mu_);
+    auto it = announces_.find(entry.xfer_id);
+    if (it == announces_.end())
+      return XferState::Pending;
+    ann = it->second;
+    announces_.erase(it);
   }
 
-  Status copy = do_copy_(claim.dst, claim.dst_dev, entry.desc.local_ptr, device_id(), claim.bytes);
-  finish_copy_(entry.xfer_id, entry.desc.seq_len, copy.ok());
+  const size_t bytes = ann.bytes != 0 ? ann.bytes : entry.desc.bytes;
+  Status copy = do_copy_(ann.dst_ptr, ann.dst_device, entry.desc.local_ptr, device_id(), bytes);
   if (!copy.ok()) {
     entry.state = XferState::Error;
     return entry.state;
@@ -236,15 +141,24 @@ XferState MemcpyPeerCommAgent::poll_recv_(Entry& entry) {
   if (entry.state != XferState::Pending)
     return entry.state;
 
-  int64_t seq_len = 0;
-  const XferState st = poll_recv_state_(entry.xfer_id, &seq_len);
-  if (st == XferState::Done) {
-    entry.seq_len = seq_len;
-    entry.state = XferState::Done;
-  } else if (st == XferState::Error) {
-    entry.state = XferState::Error;
+  // wait for the Send side to report that the copy finished
+  Completion done;
+  {
+    std::lock_guard<std::mutex> lk(ctrl_mu_);
+    auto it = completions_.find(entry.xfer_id);
+    if (it == completions_.end())
+      return XferState::Pending;
+    done = it->second;
+    completions_.erase(it);
   }
-  return st;
+
+  if (!done.ok) {
+    entry.state = XferState::Error;
+    return entry.state;
+  }
+  entry.seq_len = done.seq_len;
+  entry.state = XferState::Done;
+  return entry.state;
 }
 
 // polls a particular xfer transfer request
@@ -264,4 +178,72 @@ int64_t MemcpyPeerCommAgent::xfer_seq_len(const XferHandle& handle) {
   return it->second.seq_len;
 }
 
-void MemcpyPeerCommAgent::shutdown() { xfers_.clear(); }
+std::optional<mambaserve::TransportControl>
+MemcpyPeerCommAgent::make_post_announce(const XferDesc& desc) {
+  if (desc.role != XferRole::Recv)
+    return std::nullopt;
+  mambaserve::TransportControl msg;
+  auto* a = msg.mutable_memcpy_ctrl()->mutable_announce();
+  a->set_xfer_id(desc.xfer_id);
+  a->set_dst_ptr(reinterpret_cast<uint64_t>(desc.local_ptr));
+  a->set_bytes(desc.bytes);
+  a->set_dst_device(device_id());
+  return msg;
+}
+
+std::optional<mambaserve::TransportControl>
+MemcpyPeerCommAgent::make_completion_announce(const XferHandle& handle, XferState state) {
+  if (state == XferState::Pending)
+    return std::nullopt;
+  auto it = xfers_.find(handle.id);
+  if (it == xfers_.end())
+    return std::nullopt;
+  Entry& entry = it->second;
+  if (entry.role != XferRole::Send || entry.completion_sent)
+    return std::nullopt;
+  entry.completion_sent = true;
+
+  mambaserve::TransportControl msg;
+  auto* d = msg.mutable_memcpy_ctrl()->mutable_done();
+  d->set_xfer_id(entry.xfer_id);
+  d->set_seq_len(entry.seq_len);
+  d->set_ok(state == XferState::Done);
+  return msg;
+}
+
+Status MemcpyPeerCommAgent::handle_transport(const mambaserve::TransportControl& msg) {
+  if (msg.body_case() != mambaserve::TransportControl::kMemcpyCtrl)
+    return Status::Ok();
+  const mambaserve::MemcpyControl& ctrl = msg.memcpy_ctrl();
+
+  std::lock_guard<std::mutex> lk(ctrl_mu_);
+  switch (ctrl.body_case()) {
+  case mambaserve::MemcpyControl::kAnnounce: {
+    const auto& a = ctrl.announce();
+    announces_[a.xfer_id()] = Announce{
+        .dst_ptr = reinterpret_cast<void*>(a.dst_ptr()),
+        .bytes = static_cast<size_t>(a.bytes()),
+        .dst_device = a.dst_device(),
+    };
+    break;
+  }
+  case mambaserve::MemcpyControl::kClear:
+    announces_.erase(ctrl.clear().xfer_id());
+    break;
+  case mambaserve::MemcpyControl::kDone: {
+    const auto& d = ctrl.done();
+    completions_[d.xfer_id()] = Completion{.seq_len = d.seq_len(), .ok = d.ok()};
+    break;
+  }
+  case mambaserve::MemcpyControl::BODY_NOT_SET:
+    break;
+  }
+  return Status::Ok();
+}
+
+void MemcpyPeerCommAgent::shutdown() {
+  xfers_.clear();
+  std::lock_guard<std::mutex> lk(ctrl_mu_);
+  announces_.clear();
+  completions_.clear();
+}

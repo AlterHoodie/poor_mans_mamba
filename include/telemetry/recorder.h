@@ -7,7 +7,7 @@
 // The recorder is disabled by default; trace() is then one relaxed load.
 //
 // Threading contract: enable()/reset()/snapshot()/dump_csv() must only be
-// called while no producer is recording (before load_model or after shutdown).
+// called while no producer is recording (before start or after shutdown).
 
 #include "core/status.h"
 

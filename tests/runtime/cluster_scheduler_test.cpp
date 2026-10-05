@@ -2,6 +2,7 @@
 #include "core/status.h"
 #include "runtime/cluster_config.h"
 #include "runtime/cluster_scheduler.h"
+#include "runtime/cluster_test_util.h"
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -44,9 +45,20 @@ bool wait_all_done(ClusterScheduler& sched, const std::vector<uint64_t>& req_ids
 
 } // namespace
 
+TEST(ClusterScheduler, LoadModelFailsViaWorkerReadyOnBadModelDir) {
+  ClusterScheduler sched;
+  ClusterConfig cfg = cpu_cfg(2);
+  cfg.model_dir = "/nonexistent/model/dir";
+  Status s = start_cluster(sched, cfg);
+  EXPECT_FALSE(s.ok());
+
+  // A failed load leaves the scheduler reusable.
+  EXPECT_TRUE(start_cluster(sched, cpu_cfg(1)).ok());
+}
+
 TEST(ClusterScheduler, RunsConcurrentSessionsOnOneWorker) {
   ClusterScheduler sched;
-  ASSERT_TRUE(sched.load_model(cpu_cfg(1)).ok());
+  ASSERT_TRUE(start_cluster(sched, cpu_cfg(1)).ok());
 
   // eos_id is set to an id that greedy decoding on this checkpoint is very
   // unlikely to emit, so every session ends via max_new_tokens.
@@ -74,7 +86,7 @@ TEST(ClusterScheduler, RunsConcurrentSessionsOnOneWorker) {
 
 TEST(ClusterScheduler, PlacesAcrossTwoWorkers) {
   ClusterScheduler sched;
-  ASSERT_TRUE(sched.load_model(cpu_cfg(2)).ok());
+  ASSERT_TRUE(start_cluster(sched, cpu_cfg(2)).ok());
 
   GenerateParams params{.max_new_tokens = 3, .eos_id = 50287};
 
@@ -105,7 +117,7 @@ TEST(ClusterScheduler, PlacesAcrossTwoWorkers) {
 
 TEST(ClusterScheduler, RejectsWhenAllWorkersFull) {
   ClusterScheduler sched;
-  ASSERT_TRUE(sched.load_model(cpu_cfg(1, 1)).ok());
+  ASSERT_TRUE(start_cluster(sched, cpu_cfg(1, 1)).ok());
 
   GenerateParams params{.max_new_tokens = 16, .eos_id = 50287};
 
@@ -121,7 +133,7 @@ TEST(ClusterScheduler, RejectsWhenAllWorkersFull) {
 
 TEST(ClusterScheduler, RejectsEmptyTokens) {
   ClusterScheduler sched;
-  ASSERT_TRUE(sched.load_model(cpu_cfg(1)).ok());
+  ASSERT_TRUE(start_cluster(sched, cpu_cfg(1)).ok());
 
   GenerateParams params{.max_new_tokens = 3, .eos_id = 0};
   StatusOr<uint64_t> id_or = sched.submit({}, params);
@@ -130,7 +142,7 @@ TEST(ClusterScheduler, RejectsEmptyTokens) {
 
 TEST(ClusterScheduler, RejectsMissingEos) {
   ClusterScheduler sched;
-  ASSERT_TRUE(sched.load_model(cpu_cfg(1)).ok());
+  ASSERT_TRUE(start_cluster(sched, cpu_cfg(1)).ok());
 
   GenerateParams params{.max_new_tokens = 3, .eos_id = -1};
   StatusOr<uint64_t> id_or = sched.submit({1, 2}, params);
@@ -139,7 +151,7 @@ TEST(ClusterScheduler, RejectsMissingEos) {
 
 TEST(ClusterScheduler, PollUnknownReqIdIsNotFound) {
   ClusterScheduler sched;
-  ASSERT_TRUE(sched.load_model(cpu_cfg(1)).ok());
+  ASSERT_TRUE(start_cluster(sched, cpu_cfg(1)).ok());
 
   Response r = sched.poll(/*req_id=*/12345);
   EXPECT_FALSE(r.s.ok());
@@ -147,7 +159,7 @@ TEST(ClusterScheduler, PollUnknownReqIdIsNotFound) {
 
 TEST(ClusterScheduler, MigratesSessionToOtherWorker) {
   ClusterScheduler sched;
-  ASSERT_TRUE(sched.load_model(cpu_cfg(2)).ok());
+  ASSERT_TRUE(start_cluster(sched, cpu_cfg(2)).ok());
 
   // Long enough that we can migrate mid-flight before max_new_tokens.
   GenerateParams params{.max_new_tokens = 8, .eos_id = 50287};
@@ -191,7 +203,7 @@ TEST(ClusterScheduler, GoldenContinuationAfterMigrate) {
   std::vector<int32_t> baseline;
   {
     ClusterScheduler sched;
-    ASSERT_TRUE(sched.load_model(cpu_cfg(1)).ok());
+    ASSERT_TRUE(start_cluster(sched, cpu_cfg(1)).ok());
     StatusOr<uint64_t> id_or = sched.submit(prompt, params);
     ASSERT_TRUE(id_or.ok()) << id_or.status().message();
     ASSERT_TRUE(wait_all_done(sched, {id_or.value()}, std::chrono::seconds(60)));
@@ -202,7 +214,7 @@ TEST(ClusterScheduler, GoldenContinuationAfterMigrate) {
   }
 
   ClusterScheduler sched;
-  ASSERT_TRUE(sched.load_model(cpu_cfg(2)).ok());
+  ASSERT_TRUE(start_cluster(sched, cpu_cfg(2)).ok());
   StatusOr<uint64_t> id_or = sched.submit(prompt, params);
   ASSERT_TRUE(id_or.ok()) << id_or.status().message();
   const uint64_t req_id = id_or.value();

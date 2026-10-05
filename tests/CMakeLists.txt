@@ -28,7 +28,7 @@ target_link_libraries(tests
         core
         runtime
         ops
-        GTest::gtest_main
+        GTest::gtest
 )
 target_compile_definitions(tests PRIVATE
     MAMBA_TEST_MODEL_DIR="${PROJECT_SOURCE_DIR}/models/mamba2-130m-hf"

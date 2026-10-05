@@ -2,6 +2,7 @@
 #include "core/status.h"
 #include "runtime/cluster_config.h"
 #include "runtime/cluster_scheduler.h"
+#include "runtime/cluster_test_util.h"
 
 #include <gtest/gtest.h>
 
@@ -69,7 +70,7 @@ TEST(NixlMigrate, MigratesSessionToOtherWorker) {
       .num_slots = 8,
       .transport = TransportBackend::Nixl,
   };
-  Status loaded = sched.load_model(cfg);
+  Status loaded = start_cluster(sched, cfg);
   ASSERT_TRUE(loaded.ok()) << loaded.message();
 
   GenerateParams params{.max_new_tokens = 8, .eos_id = 50287};

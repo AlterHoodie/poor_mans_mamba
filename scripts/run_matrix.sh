@@ -5,8 +5,9 @@
 #   scripts/run_matrix.sh                       # everything
 #   STAGES=transport,migrate scripts/run_matrix.sh
 #   DEVICE=CPU STAGES=scale REPEATS=1 scripts/run_matrix.sh   # smoke test, no GPU
+#   DEVICE=CPU BIN_DIR=build/benchmarks VARIANTS=memcpy STAGES=perf scripts/run_matrix.sh
 #
-# Stages: env paths transport scale migrate rebalance logcheck nsys analyze
+# Stages: env paths transport scale migrate rebalance logcheck nsys perf analyze
 #
 # Knobs (environment variables):
 #   BIN_DIR              directory with transport_bench / cluster_bench   (build-cuda/benchmarks)
@@ -22,6 +23,11 @@
 #   THRESHOLDS           rebalance thresholds when *_on (2,4)
 #   REBALANCE_MAX_SEQ    max-seq for rebalance stage (2048)
 #   PROMPT_LEN / GEN_LEN prompt / decode length (128 / 64)
+#   PERF                 perf binary (auto-resolved; needed on WSL where /usr/bin/perf is a stub)
+#   PERF_CALL_GRAPH      dwarf | fp | lbr                  (dwarf)
+#   PERF_FREQ            sample frequency Hz               (99)
+#   PERF_MAX_SEQ         max-seq for the perf stage        (512)
+#   PERF_STAT            1 to also run perf stat (2nd pass) (0)
 #
 # A100-80GB stress example (falcon-h1-0.5b ~100MiB/slot @2048, ~170MiB @4096,
 # ~316MiB @8192; each worker preallocates SESSIONS slots):
@@ -62,11 +68,36 @@ MIGRATIONS="${MIGRATIONS:-3}"
 SESSIONS_REBALANCE="${SESSIONS_REBALANCE:-8}"
 THRESHOLDS="${THRESHOLDS:-2,4}"
 REBALANCE_MAX_SEQ="${REBALANCE_MAX_SEQ:-2048}"
+PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf}"
+PERF_FREQ="${PERF_FREQ:-99}"
+PERF_MAX_SEQ="${PERF_MAX_SEQ:-512}"
+PERF_STAT="${PERF_STAT:-0}"
 
 mkdir -p "$OUT"
 cd "$ROOT"
 
 have_stage() { [[ ",$STAGES," == *",$1,"* ]]; }
+
+# /usr/bin/perf on WSL is often a stub that looks for a matching microsoft kernel
+# tools package. Prefer an explicit PERF=, else a working linux-tools binary.
+resolve_perf() {
+  local cand
+  if [[ -n "${PERF:-}" ]]; then
+    echo "$PERF"
+    return 0
+  fi
+  if command -v perf >/dev/null 2>&1 && perf version >/dev/null 2>&1; then
+    echo "perf"
+    return 0
+  fi
+  for cand in /usr/lib/linux-tools/*/perf; do
+    if [[ -x "$cand" ]] && "$cand" version >/dev/null 2>&1; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
 
 # variant -> "backend|ENV=VAL ENV2=VAL2"
 variant_spec() {
@@ -223,6 +254,61 @@ if have_stage nsys; then
     done
   else
     log "nsys not found; skipping"
+  fi
+fi
+
+if have_stage perf; then
+  # Host CPU sample of a short migrate run. Complements nsys (GPU) and the telemetry
+  # CSVs (phase durations): flame-ish stacks show where scheduler/worker burn cycles
+  # or sit in poll/IPC. Distorts latency — keep as a diagnostic stage, not the full matrix.
+  if PERF_BIN="$(resolve_perf)"; then
+    log "perf: using $PERF_BIN ($($PERF_BIN version 2>/dev/null | head -1))"
+    mkdir -p "$OUT/perf"
+    for v in "${VARIANT_LIST[@]}"; do
+      IFS='|' read -r backend envs <<< "$(variant_spec "$v")"
+      wm="$(worker_mode_for "$backend")"
+      # CPU path only has memcpy; skip GPU-only backends instead of failing loudly.
+      if [[ "$DEVICE" == "CPU" && "$backend" != "memcpy" ]]; then
+        log "perf: skip $v (CPU only supports memcpy)"
+        continue
+      fi
+      log "perf: $v (worker-mode $wm, call-graph $PERF_CALL_GRAPH)"
+      data="$OUT/perf/$v.data"
+      # Child tasks inherit counters by default (omit -i/--no-inherit), so process-mode
+      # workers are included without --follow-forks (not available on older perf).
+      # cpu-clock works without PMU access (common on VMs/WSL). Cap frequency — dwarf
+      # stacks at the default ~4 kHz can write multi-GB perf.data on CPU migrate runs.
+      run_with_env "$envs" "$PERF_BIN" record -e cpu-clock -F "$PERF_FREQ" \
+        --call-graph "$PERF_CALL_GRAPH" -o "$data" -- \
+        "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" \
+        --model-dirs "${MODELS%%,*}" --backends "$backend" --worker-mode "$wm" \
+        --max-seq "$PERF_MAX_SEQ" --loads busy --bg-sessions "$BG_SESSIONS" \
+        --migrate-at 8 --migrate-every 8 --migrations "$MIGRATIONS" \
+        --prompt-len "$PROMPT_LEN" --gen-len "$GEN_LEN" --repeats 1 --warmup-runs 1 \
+        --out-dir "$OUT/perf/run_$v" > "$OUT/perf_${v}.log" 2>&1 || {
+        log "  (failed: $v)"; continue
+      }
+      "$PERF_BIN" report -i "$data" --stdio --no-children --percent-limit 0.5 \
+        > "$OUT/perf/$v.report.txt" 2>>"$OUT/perf_${v}.log" || log "  (report failed: $v)"
+      if command -v stackcollapse-perf.pl >/dev/null && command -v flamegraph.pl >/dev/null; then
+        "$PERF_BIN" script -i "$data" 2>>"$OUT/perf_${v}.log" \
+          | stackcollapse-perf.pl 2>/dev/null \
+          | flamegraph.pl --title "cluster_bench migrate $v ($DEVICE)" \
+          > "$OUT/perf/$v.svg" 2>>"$OUT/perf_${v}.log" || log "  (flamegraph failed: $v)"
+      fi
+      if [[ "$PERF_STAT" == "1" ]]; then
+        "$PERF_BIN" stat -e cpu-clock,task-clock,context-switches,page-faults \
+          -o "$OUT/perf/$v.stat.txt" -- \
+          "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" \
+          --model-dirs "${MODELS%%,*}" --backends "$backend" --worker-mode "$wm" \
+          --max-seq "$PERF_MAX_SEQ" --loads busy --bg-sessions "$BG_SESSIONS" \
+          --migrate-at 8 --migrate-every 8 --migrations "$MIGRATIONS" \
+          --prompt-len "$PROMPT_LEN" --gen-len "$GEN_LEN" --repeats 1 --warmup-runs 0 \
+          --out-dir "$OUT/perf/stat_$v" >>"$OUT/perf_${v}.log" 2>&1 || log "  (stat failed: $v)"
+      fi
+    done
+  else
+    log "perf not found (on WSL install linux-tools and/or set PERF=/usr/lib/linux-tools/*/perf); skipping"
   fi
 fi
 

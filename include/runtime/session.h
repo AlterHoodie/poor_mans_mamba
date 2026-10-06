@@ -15,9 +15,14 @@ struct Session {
   GenerateParams params;
   SessionPhase phase = SessionPhase::Prefilling;
   Status s = Status::Ok();
+  size_t prompt_len = 0;
+  size_t seq_len = 0;
   size_t worker_idx = 0;
+  void* slot_ptr = nullptr; // cluster level bookeeping of slot_ptr
   size_t migrate_dst_idx = 0;
+  void* migrate_slot_ptr = nullptr; // cluter level bookeeping of slot_ptr during migration
   int migrate_acks = 0;
+
   // When set, the next decode boundary starts migrate instead of another Decode.
   bool migrate_pending = false;
 };

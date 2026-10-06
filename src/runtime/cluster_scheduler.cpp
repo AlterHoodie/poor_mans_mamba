@@ -38,13 +38,17 @@ mambaserve::Command make_decode_cmd(uint64_t req_id, int32_t token) {
   return cmd;
 }
 
-mambaserve::Command make_migrate_cmd(uint64_t req_id, mambaserve::XferRole role,
-                                     int peer_device_id) {
+mambaserve::Command make_migrate_cmd(uint64_t req_id, mambaserve::XferRole role, int peer_device_id,
+                                     void* src_ptr = nullptr, size_t seq_len = 0) {
   mambaserve::Command cmd;
   auto* m = cmd.mutable_migrate();
   m->set_req_id(req_id);
   m->set_role(role);
   m->set_peer_device_id(peer_device_id);
+  if (src_ptr)
+    m->set_src_ptr(reinterpret_cast<uint64_t>(src_ptr));
+  if (seq_len)
+    m->set_seq_len(seq_len);
   return cmd;
 }
 
@@ -267,6 +271,7 @@ StatusOr<uint64_t> ClusterScheduler::submit(std::vector<int32_t> tokens, Generat
     Session sess;
     sess.params = params;
     sess.worker_idx = worker_idx;
+    sess.prompt_len = tokens.size();
     sessions_.emplace(req_id, std::move(sess));
   }
 
@@ -508,9 +513,8 @@ void ClusterScheduler::begin_migrate_(Session& sess, uint64_t req_id, size_t dst
   const int src_dev = workers_[src_idx].device_id;
   const int dst_dev = workers_[dst_idx].device_id;
 
-  // route must exist before either worker can emit control traffic for this xfer
-  transport_plane_->on_migrate_begin(req_id, src_idx, dst_idx);
-  send_cmd_(dst_idx, make_migrate_cmd(req_id, mambaserve::XFER_RECV, src_dev));
+  send_cmd_(dst_idx,
+            make_migrate_cmd(req_id, mambaserve::XFER_RECV, src_dev, sess.slot_ptr, sess.seq_len));
   send_cmd_(src_idx, make_migrate_cmd(req_id, mambaserve::XFER_SEND, dst_dev));
 }
 
@@ -523,7 +527,7 @@ void ClusterScheduler::fail_migrate_(Session& sess, uint64_t req_id, const Statu
   telemetry::trace(telemetry::TraceKind::Failed, req_id, static_cast<int>(src_idx));
   LOG_ERROR("migrate failed req_id=%llu src=%zu dst=%zu: %s",
             static_cast<unsigned long long>(req_id), src_idx, dst_idx, err.message().c_str());
-  transport_plane_->on_migrate_end(req_id);
+
   send_cmd_(src_idx, make_release_cmd(req_id));
   send_cmd_(dst_idx, make_release_cmd(req_id));
 }
@@ -613,10 +617,14 @@ void ClusterScheduler::on_prefill_event_(const mambaserve::PrefillEvent& ev) {
     telemetry::trace(telemetry::TraceKind::Failed, ev.req_id(), static_cast<int>(sess.worker_idx));
     LOG_WARN("prefill failed req_id=%llu worker=%zu: %s",
              static_cast<unsigned long long>(ev.req_id()), sess.worker_idx, st.message().c_str());
+    // send release command
     send_cmd_(sess.worker_idx, make_release_cmd(ev.req_id()));
     return;
   }
-
+  // update sess slot pointer and slot idx
+  sess.slot_ptr = reinterpret_cast<void*>(ev.slot_ptr());
+  // update seq_len
+  sess.seq_len = sess.prompt_len + 1;
   sess.generated_tokens.push_back(ev.token());
   continue_after_token_(sess, ev.req_id(), ev.token());
 }
@@ -654,6 +662,7 @@ void ClusterScheduler::on_decode_event_(const mambaserve::DecodeEvent& ev) {
   }
 
   sess.generated_tokens.push_back(ev.token());
+  sess.seq_len++;
   continue_after_token_(sess, ev.req_id(), ev.token());
 }
 
@@ -671,7 +680,8 @@ void ClusterScheduler::on_migrate_event_(const mambaserve::MigrateEvent& ev) {
     fail_migrate_(sess, ev.req_id(), st);
     return;
   }
-
+  if (ev.slot_ptr())
+    sess.migrate_slot_ptr = reinterpret_cast<void*>(ev.slot_ptr());
   sess.migrate_acks++;
   // acks done only by one side
   if (sess.migrate_acks < 2)
@@ -694,22 +704,29 @@ void ClusterScheduler::on_release_event_(const mambaserve::ReleaseEvent& ev) {
     if (worker_idx != sess.worker_idx)
       return;
     worker_stats_[sess.worker_idx].inflight--;
+
+    // update sess slot pointer and slot idx to new dst
     sess.worker_idx = sess.migrate_dst_idx;
+    sess.slot_ptr = sess.migrate_slot_ptr;
+
     // dst inflight already reserved in begin_migrate_
     sess.phase = SessionPhase::Decoding;
     sess.migrate_acks = 0;
+
     telemetry::counters().migrates_completed++;
     telemetry::trace(telemetry::TraceKind::MigrateCommit, ev.req_id(),
                      static_cast<int>(sess.worker_idx));
     LOG_DEBUG("migrate commit req_id=%llu home=%zu", static_cast<unsigned long long>(ev.req_id()),
               sess.worker_idx);
-    transport_plane_->on_migrate_end(ev.req_id());
+
     if (sess.generated_tokens.empty()) {
       sess.phase = SessionPhase::Failed;
       sess.s = Status::RuntimeError("migrate commit with empty token history");
       send_cmd_(sess.worker_idx, make_release_cmd(ev.req_id()));
       return;
     }
+
+    // resume decode on new worker
     const int32_t last = sess.generated_tokens.back();
     send_cmd_(sess.worker_idx, make_decode_cmd(ev.req_id(), last));
     return;

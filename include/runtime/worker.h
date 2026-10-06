@@ -91,7 +91,7 @@ private:
   std::optional<mambaserve::MigrateEvent> migrate_(const mambaserve::MigrateCmd& cmd);
   std::optional<mambaserve::MigrateEvent> migrate_recv_(const mambaserve::MigrateCmd& cmd);
   std::optional<mambaserve::MigrateEvent> migrate_send_(const mambaserve::MigrateCmd& cmd);
-  std::optional<mambaserve::MigrateEvent> post_xfer_(const mambaserve::MigrateCmd& cmd, int64_t seq_len);
+  std::optional<mambaserve::MigrateEvent> post_xfer_(const mambaserve::MigrateCmd& cmd);
 
   // loops through all the pending transfers, when any transfer is successfull or failed
   // it emits the appropriate MigrateEvent to the parent over ipc_

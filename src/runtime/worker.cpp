@@ -57,11 +57,14 @@ StatusOr<int32_t> argmax_gpu_d2h(Tensor& logits) {
 #endif
 }
 
-mambaserve::PrefillEvent make_prefill_event(uint64_t req_id, int32_t token, const Status& s) {
+mambaserve::PrefillEvent make_prefill_event(uint64_t req_id, int32_t token, const Status& s,
+                                            void* slot_ptr = nullptr) {
   mambaserve::PrefillEvent ev;
   ev.set_req_id(req_id);
   ev.set_token(token);
   *ev.mutable_status() = to_proto(s);
+  if (slot_ptr)
+    ev.set_slot_ptr(reinterpret_cast<uint64_t>(slot_ptr));
   return ev;
 }
 
@@ -74,11 +77,13 @@ mambaserve::DecodeEvent make_decode_event(uint64_t req_id, int32_t token, const 
 }
 
 mambaserve::MigrateEvent make_migrate_event(uint64_t req_id, mambaserve::XferRole role,
-                                            const Status& s) {
+                                            const Status& s, void* slot_ptr = nullptr) {
   mambaserve::MigrateEvent ev;
   ev.set_req_id(req_id);
   ev.set_role(role);
   *ev.mutable_status() = to_proto(s);
+  if (slot_ptr)
+    ev.set_slot_ptr(reinterpret_cast<uint64_t>(slot_ptr));
   return ev;
 }
 
@@ -131,8 +136,12 @@ mambaserve::PrefillEvent Worker::prefill_(uint64_t req_id, std::span<const int32
   StatusOr<int32_t> sampled = sample_(prefill.value());
   if (!sampled.ok())
     return make_prefill_event(req_id, -1, sampled.status());
+  StatusOr<void*> slot_ptr = pool_->slot_ptr(it->second);
+  if (!slot_ptr.ok())
+    return make_prefill_event(req_id, -1, slot_ptr.status());
 
-  return make_prefill_event(req_id, sampled.value(), Status::Ok());
+  // slot_ptr is for cluster level bookeeping
+  return make_prefill_event(req_id, sampled.value(), Status::Ok(), slot_ptr.value());
 }
 
 mambaserve::DecodeEvent Worker::decode_(uint64_t req_id, const int32_t token) {
@@ -203,8 +212,7 @@ Status Worker::release_(uint64_t req_id) {
   return s;
 }
 
-std::optional<mambaserve::MigrateEvent> Worker::post_xfer_(const mambaserve::MigrateCmd& cmd,
-                                                           int64_t seq_len) {
+std::optional<mambaserve::MigrateEvent> Worker::post_xfer_(const mambaserve::MigrateCmd& cmd) {
   const XferRole role = from_proto(cmd.role());
   auto hit = cache_handles_.find(cmd.req_id());
   if (hit == cache_handles_.end())
@@ -218,35 +226,55 @@ std::optional<mambaserve::MigrateEvent> Worker::post_xfer_(const mambaserve::Mig
 
   XferDesc desc{
       .local_ptr = slot_or.value(),
-      .remote_ptr = nullptr,
+      .remote_ptr = reinterpret_cast<void*>(cmd.src_ptr()), // null for Send
       .bytes = pool_->slot_bytes(),
       .peer_device_id = cmd.peer_device_id(),
       .role = role,
       .xfer_id = cmd.req_id(),
-      .seq_len = seq_len,
+      .seq_len = cmd.seq_len(),
   };
 
-  StatusOr<XferHandle> handle_or = comm_agent_->post(desc);
-  if (!handle_or.ok())
-    return make_migrate_event(cmd.req_id(), cmd.role(), handle_or.status());
+  StatusOr<PostResult> post_or = comm_agent_->post(desc);
+  if (!post_or.ok())
+    return make_migrate_event(cmd.req_id(), cmd.role(), post_or.status());
 
-  pending_transfers_[cmd.req_id()] = PendingXfer{.handle = handle_or.value(), .role = role};
-  // Backend may need to tell its peer something (e.g. NIXL Recv slot announce).
-  if (auto announce = comm_agent_->make_post_announce(desc))
-    emit_transport_(std::move(*announce));
+  const PostResult& pr = post_or.value();
   telemetry::trace(telemetry::TraceKind::MigrateXferPosted, cmd.req_id(), static_cast<int>(index_),
                    role == XferRole::Recv ? 1 : 0, static_cast<int64_t>(desc.bytes));
-  LOG_DEBUG("migrate xfer posted req_id=%llu worker=%zu role=%s peer=%d bytes=%zu",
+  LOG_DEBUG("migrate xfer posted req_id=%llu worker=%zu role=%s peer=%d bytes=%zu state=%d",
             static_cast<unsigned long long>(cmd.req_id()), index_,
-            role == XferRole::Recv ? "recv" : "send", cmd.peer_device_id(), desc.bytes);
-  return std::nullopt;
+            role == XferRole::Recv ? "recv" : "send", cmd.peer_device_id(), desc.bytes,
+            static_cast<int>(pr.state));
+
+  if (pr.state == XferState::Pending) {
+    pending_transfers_[cmd.req_id()] = PendingXfer{.handle = pr.handle, .role = role};
+    return std::nullopt;
+  }
+
+  // Done/Error at post: ack immediately (no pending_transfers_ entry).
+  void* slot_ptr = nullptr;
+  Status book = Status::Ok();
+  if (pr.state == XferState::Error) {
+    book =
+        Status::RuntimeError("transfer failed at post for req_id: " + std::to_string(cmd.req_id()));
+  } else if (role == XferRole::Recv) {
+    slot_ptr = slot_or.value();
+  }
+  if (book.ok() && role == XferRole::Recv)
+    telemetry::counters().bytes_migrated += pool_->slot_bytes();
+  telemetry::trace(telemetry::TraceKind::MigrateXferDone, cmd.req_id(), static_cast<int>(index_),
+                   role == XferRole::Recv ? 1 : 0, book.ok() ? 1 : 0);
+  return make_migrate_event(cmd.req_id(), cmd.role(), book, book.ok() ? slot_ptr : nullptr);
 }
 
 std::optional<mambaserve::MigrateEvent> Worker::migrate_recv_(const mambaserve::MigrateCmd& cmd) {
   // Recv: register a fresh slot for the incoming cache, then post.
   if (Status s = register_(cmd.req_id()); !s.ok())
     return make_migrate_event(cmd.req_id(), cmd.role(), s);
-  return post_xfer_(cmd, /*seq_len=*/0);
+  if (Status s = pool_->set_seq_len(cache_handles_[cmd.req_id()], cmd.seq_len()); !s.ok()) {
+    return make_migrate_event(cmd.req_id(), cmd.role(), s);
+  }
+  return post_xfer_(cmd);
 }
 
 std::optional<mambaserve::MigrateEvent> Worker::migrate_send_(const mambaserve::MigrateCmd& cmd) {
@@ -260,7 +288,7 @@ std::optional<mambaserve::MigrateEvent> Worker::migrate_send_(const mambaserve::
   StatusOr<int64_t> sl = pool_->seq_len(hit->second);
   if (!sl.ok())
     return make_migrate_event(cmd.req_id(), cmd.role(), sl.status());
-  return post_xfer_(cmd, sl.value());
+  return post_xfer_(cmd);
 }
 
 std::optional<mambaserve::MigrateEvent> Worker::migrate_(const mambaserve::MigrateCmd& cmd) {
@@ -366,7 +394,7 @@ void Worker::poll_transfer_states_() {
   auto xfer_done = [&](uint64_t req_id, XferRole role, bool ok) {
     telemetry::trace(TraceKind::MigrateXferDone, req_id, static_cast<int>(index_),
                      role == XferRole::Recv ? 1 : 0, ok ? 1 : 0);
-    if (ok && role == XferRole::Send && pool_)
+    if (ok && role == XferRole::Recv && pool_)
       telemetry::counters().bytes_migrated += pool_->slot_bytes();
     LOG_DEBUG("migrate xfer done req_id=%llu worker=%zu role=%s ok=%d",
               static_cast<unsigned long long>(req_id), index_,
@@ -375,34 +403,29 @@ void Worker::poll_transfer_states_() {
 
   for (auto it = pending_transfers_.begin(); it != pending_transfers_.end();) {
     XferState state = comm_agent_->poll(it->second.handle);
-    // Backend may need to tell its peer the transfer finished (e.g. MemcpyPeer
-    // Send -> Recv). Sent before our MigrateEvent so the peer is never behind us.
-    if (state != XferState::Pending) {
-      if (auto done = comm_agent_->make_completion_announce(it->second.handle, state))
-        emit_transport_(std::move(*done));
-    }
     switch (state) {
     case XferState::Pending:
       ++it;
       break;
     case XferState::Done: {
       mambaserve::Event ev;
+      void* slot_ptr = nullptr;
+      Status book = Status::Ok();
+
       if (it->second.role == XferRole::Recv) {
         auto hit = cache_handles_.find(it->first);
-        if (hit != cache_handles_.end()) {
-          const int64_t sl = comm_agent_->xfer_seq_len(it->second.handle);
-          if (Status s = pool_->set_seq_len(hit->second, sl); !s.ok()) {
-            xfer_done(it->first, it->second.role, false);
-            *ev.mutable_migrate() = make_migrate_event(it->first, to_proto(it->second.role), s);
-            emit_event_(std::move(ev));
-            it = pending_transfers_.erase(it);
-            break;
-          }
+        if (hit == cache_handles_.end()) {
+          book = Status::NotFound("recv done missing cache handle");
+        } else if (auto sp = pool_->slot_ptr(hit->second); !sp.ok()) {
+          book = sp.status();
+        } else {
+          slot_ptr = sp.value();
         }
       }
-      xfer_done(it->first, it->second.role, true);
+      const bool ok = book.ok();
+      xfer_done(it->first, it->second.role, ok);
       *ev.mutable_migrate() =
-          make_migrate_event(it->first, to_proto(it->second.role), Status::Ok());
+          make_migrate_event(it->first, to_proto(it->second.role), book, ok ? slot_ptr : nullptr);
       emit_event_(std::move(ev));
       it = pending_transfers_.erase(it);
       break;

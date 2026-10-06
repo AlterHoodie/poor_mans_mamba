@@ -6,8 +6,5 @@ compile_commands.json
 
 docs/
 
-results/
-
-results_1/
-
+results*/
 __pycache__/

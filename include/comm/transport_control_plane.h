@@ -36,10 +36,6 @@ public:
   // bootstrap traffic via the sender and block until workers ack.
   // A non-OK status fails ClusterScheduler::start.
   virtual Status on_cluster_ready(TransportSender& /*sender*/) { return Status::Ok(); }
-
-  // Migrate src_idx -> dst_idx for xfer_id is about to start / has finished.
-  virtual void on_migrate_begin(uint64_t /*xfer_id*/, size_t /*src_idx*/, size_t /*dst_idx*/) {}
-  virtual void on_migrate_end(uint64_t /*xfer_id*/) {}
 };
 
 // For backends with no parent-routed control traffic (fallback / tests).

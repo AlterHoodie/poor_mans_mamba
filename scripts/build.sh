@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build UCX + Abseil + NIXL + NCCL deps, then the CUDA project (transport/cluster benches).
+# Build UCX + Abseil + NIXL + NCCL deps (+ system protobuf), then the CUDA project
+# (transport/cluster benches).
 #
 #   scripts/build.sh
 #   DEPS=/workspace/deps CMAKE_CUDA_ARCHITECTURES=80 scripts/build.sh
@@ -143,12 +144,21 @@ if [[ "$SKIP_APT" != "1" ]]; then
       build-essential autoconf automake libtool pkg-config \
       cmake ninja-build git curl \
       libnuma-dev libgflags-dev \
+      protobuf-compiler libprotobuf-dev \
       python3-pip python3-venv || true
     # Ubuntu's Abseil is too old for NIXL; never use it.
     apt-get remove -y -qq libabsl-dev libabsl20210324 2>/dev/null || true
   fi
   pip3 install -q --upgrade meson ninja pybind11
 fi
+
+# CMakeLists.txt pins Protobuf_PROTOC_EXECUTABLE to /usr/bin/protoc and
+# find_package(Protobuf REQUIRED) — need the system packages above.
+if ! command -v protoc >/dev/null 2>&1; then
+  echo "ERROR: protoc not found (install protobuf-compiler, or unset SKIP_APT)"
+  exit 1
+fi
+log "protoc: $(command -v protoc) ($(protoc --version 2>/dev/null || echo '?'))"
 
 # ---------- 3) NCCL (pip wheel) ----------
 pip3 install -q nvidia-nccl-cu12

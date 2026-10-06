@@ -8,8 +8,8 @@
 #include <unordered_map>
 
 #if MAMBASERVE_WITH_NCCL
-#include <nccl.h>
 #include <cuda_runtime.h>
+#include <nccl.h>
 #endif
 
 // GPU point-to-point migrate via ncclSend / ncclRecv on a shared communicator.
@@ -26,7 +26,7 @@ public:
   ~NcclCommAgent() override;
 
   Status register_slab(void* ptr, size_t bytes) override;
-  StatusOr<XferHandle> post(XferDesc& desc) override;
+  StatusOr<PostResult> post(XferDesc& desc) override;
   XferState poll(const XferHandle& handle) override;
   int64_t xfer_seq_len(const XferHandle& handle) override;
   // Init the communicator from NcclBootstrap; the ack is left for take_transport_reply().

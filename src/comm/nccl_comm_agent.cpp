@@ -64,7 +64,8 @@ Status NcclCommAgent::handle_transport(const mambaserve::TransportControl& msg) 
     return Status::Ok();
 
 #if !MAMBASERVE_WITH_NCCL
-  Status st = Status::NotImplemented("NCCL transport not enabled (build with MAMBASERVE_WITH_NCCL=ON)");
+  Status st =
+      Status::NotImplemented("NCCL transport not enabled (build with MAMBASERVE_WITH_NCCL=ON)");
 #else
   Status st = init_comm_(ctrl.bootstrap());
 #endif
@@ -85,7 +86,7 @@ std::optional<mambaserve::TransportControl> NcclCommAgent::take_transport_reply(
   return out;
 }
 
-StatusOr<XferHandle> NcclCommAgent::post(XferDesc& desc) {
+StatusOr<PostResult> NcclCommAgent::post(XferDesc& desc) {
 #if !MAMBASERVE_WITH_NCCL
   (void)desc;
   return Status::NotImplemented("NCCL transport not enabled (build with MAMBASERVE_WITH_NCCL=ON)");
@@ -171,7 +172,7 @@ StatusOr<XferHandle> NcclCommAgent::post(XferDesc& desc) {
   e.done_event = ev;
   e.seq_dev = seq_dev;
   xfers_[hid] = e;
-  return XferHandle{hid};
+  return PostResult{.handle = {.id = hid}, .state = initial};
 #endif
 }
 

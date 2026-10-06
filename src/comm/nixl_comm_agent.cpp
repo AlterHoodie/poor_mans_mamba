@@ -1,5 +1,7 @@
 #include "comm/nixl_comm_agent.h"
 
+#include "proto/worker.pb.h"
+
 #include <cstring>
 #include <string>
 #include <utility>
@@ -53,21 +55,6 @@ Status NixlCommAgent::init_backend_() {
   return Status::Ok();
 }
 
-nixl_blob_t NixlCommAgent::pack_notif_(uint64_t xfer_id, int64_t seq_len) {
-  nixl_blob_t blob(sizeof(uint64_t) + sizeof(int64_t), '\0');
-  std::memcpy(blob.data(), &xfer_id, sizeof(uint64_t));
-  std::memcpy(blob.data() + sizeof(uint64_t), &seq_len, sizeof(int64_t));
-  return blob;
-}
-
-bool NixlCommAgent::unpack_notif_(const nixl_blob_t& blob, uint64_t* xfer_id, int64_t* seq_len) {
-  if (blob.size() < sizeof(uint64_t) + sizeof(int64_t) || !xfer_id || !seq_len)
-    return false;
-  std::memcpy(xfer_id, blob.data(), sizeof(uint64_t));
-  std::memcpy(seq_len, blob.data() + sizeof(uint64_t), sizeof(int64_t));
-  return true;
-}
-
 Status NixlCommAgent::ensure_peers_loaded_() {
   if (peers_loaded_)
     return Status::Ok();
@@ -110,7 +97,7 @@ Status NixlCommAgent::register_slab(void* ptr, size_t bytes) {
   // desc to register one entier gpu slab
   slab_desc_ = nixlBlobDesc(reinterpret_cast<uintptr_t>(ptr), bytes,
                             static_cast<uint64_t>(device_id()), nixl_blob_t{});
-  // create a list container for vram descriptors 
+  // create a list container for vram descriptors
   nixl_reg_dlist_t dlist(VRAM_SEG);
   // add the blob to the list
   dlist.addDesc(slab_desc_);
@@ -140,108 +127,35 @@ Status NixlCommAgent::register_slab(void* ptr, size_t bytes) {
 #endif
 }
 
-StatusOr<XferHandle> NixlCommAgent::post(XferDesc& desc) {
-#if !MAMBASERVE_WITH_NIXL
-  (void)desc;
-  return Status::NotImplemented("NIXL transport not enabled (build with MAMBASERVE_WITH_NIXL=ON)");
-#else
-  if (!agent_ || !backend_)
-    return Status::RuntimeError("NIXL agent/backend not initialized");
-  if (slab_ptr_ == nullptr || slab_bytes_ == 0)
-    return Status::RuntimeError("NIXL slab not registered");
-  if (desc.local_ptr == nullptr || desc.bytes == 0)
-    return Status::InvalidArgument("NIXL xfer requires local_ptr and bytes");
-  if (!cluster_)
-    return Status::RuntimeError("NixlCluster missing");
-  {
-    std::lock_guard<std::mutex> lk(cluster_->mu);
-    if (!cluster_->peers_finalized)
-      return Status::RuntimeError("NIXL peers not finalized");
-  }
-
-  const auto local = static_cast<const char*>(desc.local_ptr);
-  const auto base = static_cast<const char*>(slab_ptr_);
-  if (local < base || local + desc.bytes > base + slab_bytes_)
-    return Status::InvalidArgument("NIXL local_ptr outside registered slab");
-  if (desc.peer_device_id < 0 || desc.peer_device_id == device_id())
-    return Status::InvalidArgument("invalid peer_device_id for NIXL");
-
-  // Recv's slot announce is sent to the Send peer via the scheduler's control
-  // plane (see make_post_announce), not published here.
-
-  const uint64_t hid = id_counter_.fetch_add(1, std::memory_order_relaxed);
-  Entry e;
-  e.role = desc.role;
-  e.state = XferState::Pending;
-  e.seq_len = desc.seq_len;
-  e.xfer_id = desc.xfer_id;
-  e.local_ptr = desc.local_ptr;
-  e.bytes = desc.bytes;
-  e.peer_device_id = desc.peer_device_id;
-  xfers_[hid] = e;
-  return XferHandle{hid};
-#endif
-}
-
 #if MAMBASERVE_WITH_NIXL
-
-XferState NixlCommAgent::poll_send_(Entry& e) {
-  if (e.state != XferState::Pending)
-    return e.state; // Done or Error
-
-  if (e.posted) {
-    // WRITE already posted; drive it to completion (this also sends the notif).
-    nixl_status_t st = agent_->getXferStatus(e.req);
-    if (st == NIXL_IN_PROG)
-      return XferState::Pending;
-    agent_->releaseXferReq(e.req);
-    e.req = nullptr;
-    e.state = (st == NIXL_SUCCESS) ? XferState::Done : XferState::Error;
-    return e.state;
-  }
-
+XferState NixlCommAgent::create_xfer_req_(Entry& e) {
   if (Status s = ensure_peers_loaded_(); !s.ok()) {
     e.state = XferState::Error;
     return e.state;
   }
-
-  SlotAnnounce announce;
-  {
-    std::lock_guard<std::mutex> lk(announce_mu_);
-    auto it = announces_.find(e.xfer_id);
-    // wait for recv to publish destination slot ptr via slot announce
-    if (it == announces_.end())
-      return XferState::Pending;
-    announce = it->second;
-  }
-
-  if (announce.bytes != e.bytes) {
+  if (e.remote_ptr == nullptr) {
     e.state = XferState::Error;
     return e.state;
   }
-
   if (cudaSetDevice(device_id()) != cudaSuccess) {
     e.state = XferState::Error;
     return e.state;
   }
 
-  nixl_xfer_dlist_t src(VRAM_SEG);
-  nixlBasicDesc src_desc(reinterpret_cast<uintptr_t>(e.local_ptr), e.bytes,
-                         static_cast<uint64_t>(device_id()));
-  src.addDesc(src_desc);
+  // local = destination (this Recv worker); remote = source on Send peer.
+  nixl_xfer_dlist_t local(VRAM_SEG);
+  local.addDesc(nixlBasicDesc(reinterpret_cast<uintptr_t>(e.local_ptr), e.bytes,
+                              static_cast<uint64_t>(device_id())));
 
-  nixl_xfer_dlist_t dst(VRAM_SEG);
-  nixlBasicDesc dst_desc(reinterpret_cast<uintptr_t>(announce.dst_ptr), announce.bytes,
-                         static_cast<uint64_t>(announce.dst_device));
-  dst.addDesc(dst_desc);
+  nixl_xfer_dlist_t remote(VRAM_SEG);
+  remote.addDesc(nixlBasicDesc(reinterpret_cast<uintptr_t>(e.remote_ptr), e.bytes,
+                               static_cast<uint64_t>(e.peer_device_id)));
 
   nixl_opt_args_t extra;
   extra.backends.push_back(backend_);
-  extra.notif = pack_notif_(e.xfer_id, e.seq_len);
 
-  const std::string remote = agent_name(e.peer_device_id);
-  nixl_status_t st =
-      agent_->createXferReq(NIXL_WRITE, src, dst, remote, e.req, &extra);
+  const std::string remote_agent = agent_name(e.peer_device_id);
+  nixl_status_t st = agent_->createXferReq(NIXL_READ, local, remote, remote_agent, e.req, &extra);
   if (st != NIXL_SUCCESS) {
     e.state = XferState::Error;
     return e.state;
@@ -255,10 +169,6 @@ XferState NixlCommAgent::poll_send_(Entry& e) {
     return e.state;
   }
   e.posted = true;
-  {
-    std::lock_guard<std::mutex> lk(announce_mu_);
-    announces_.erase(e.xfer_id);
-  }
 
   if (st == NIXL_SUCCESS) {
     agent_->releaseXferReq(e.req);
@@ -266,45 +176,76 @@ XferState NixlCommAgent::poll_send_(Entry& e) {
     e.state = XferState::Done;
     return e.state;
   }
-  // NIXL_IN_PROG: the UCX backend only flushes the WRITE and sends the
-  // completion notif from getXferStatus(), so it must be polled until done.
-  return XferState::Pending;
+  // NIXL_IN_PROG: flush/completion is driven by getXferStatus().
+  e.state = XferState::Pending;
+  return e.state;
+}
+#endif
+
+StatusOr<PostResult> NixlCommAgent::post(XferDesc& desc) {
+#if !MAMBASERVE_WITH_NIXL
+  (void)desc;
+  return Status::NotImplemented("NIXL transport not enabled (build with MAMBASERVE_WITH_NIXL=ON)");
+#else
+  if (!agent_ || !backend_)
+    return Status::RuntimeError("NIXL agent/backend not initialized");
+  if (slab_ptr_ == nullptr || slab_bytes_ == 0)
+    return Status::RuntimeError("NIXL slab not registered");
+  if (desc.local_ptr == nullptr || desc.bytes == 0)
+    return Status::InvalidArgument("NIXL xfer requires local_ptr and bytes");
+  if (!cluster_)
+    return Status::RuntimeError("NixlCluster missing");
+
+  const auto local = static_cast<const char*>(desc.local_ptr);
+  const auto base = static_cast<const char*>(slab_ptr_);
+  if (local < base || local + desc.bytes > base + slab_bytes_)
+    return Status::InvalidArgument("NIXL local_ptr outside registered slab");
+  if (desc.peer_device_id < 0 || desc.peer_device_id == device_id())
+    return Status::InvalidArgument("invalid peer_device_id for NIXL");
+
+  // Nothing to post send-side for nixl
+  if (desc.role == XferRole::Send)
+    return PostResult{.handle = {}, .state = XferState::Done};
+
+  if (desc.remote_ptr == nullptr)
+    return Status::InvalidArgument("NIXL Recv requires remote_ptr (src slot)");
+
+  const uint64_t hid = id_counter_.fetch_add(1, std::memory_order_relaxed);
+  Entry& e = xfers_[hid];
+  e.role = desc.role;
+  e.state = XferState::Pending;
+  e.seq_len = desc.seq_len;
+  e.xfer_id = desc.xfer_id;
+  e.local_ptr = desc.local_ptr;
+  e.remote_ptr = desc.remote_ptr;
+  e.bytes = desc.bytes;
+  e.peer_device_id = desc.peer_device_id;
+  e.req = nullptr;
+  e.posted = false;
+
+  e.state = create_xfer_req_(e);
+  return PostResult{.handle = {.id = hid}, .state = e.state};
+#endif
 }
 
+#if MAMBASERVE_WITH_NIXL
+
 XferState NixlCommAgent::poll_recv_(Entry& e) {
-  // recv polls just waits and listens to new completion notifs
   if (e.state != XferState::Pending)
     return e.state;
 
-  nixl_notifs_t notifs;
-  // drain new notifs
-  nixl_status_t st = agent_->getNotifs(notifs);
-  if (st != NIXL_SUCCESS) {
+  if (!e.posted || e.req == nullptr) {
     e.state = XferState::Error;
     return e.state;
   }
-  for (auto& kv : notifs) {
-    for (auto& blob : kv.second)
-      // keep track of pending notifs
-      pending_notifs_.emplace_back(kv.first, std::move(blob));
-  }
 
-  const std::string peer = agent_name(e.peer_device_id);
-  for (auto it = pending_notifs_.begin(); it != pending_notifs_.end(); ++it) {
-    if (it->first != peer)
-      continue;
-    uint64_t xid = 0;
-    int64_t sl = 0;
-    // not completly transfered
-    if (!unpack_notif_(it->second, &xid, &sl) || xid != e.xfer_id)
-      continue;
-    // if completely transfered
-    e.seq_len = sl;
-    e.state = XferState::Done;
-    pending_notifs_.erase(it);
-    return e.state;
-  }
-  return XferState::Pending;
+  nixl_status_t st = agent_->getXferStatus(e.req);
+  if (st == NIXL_IN_PROG)
+    return XferState::Pending;
+  agent_->releaseXferReq(e.req);
+  e.req = nullptr;
+  e.state = (st == NIXL_SUCCESS) ? XferState::Done : XferState::Error;
+  return e.state;
 }
 
 #endif // MAMBASERVE_WITH_NIXL
@@ -317,10 +258,7 @@ XferState NixlCommAgent::poll(const XferHandle& handle) {
   auto it = xfers_.find(handle.id);
   if (it == xfers_.end())
     return XferState::Error;
-  Entry& e = it->second;
-  if (e.role == XferRole::Recv)
-    return poll_recv_(e);
-  return poll_send_(e);
+  return poll_recv_(it->second);
 #endif
 }
 
@@ -331,39 +269,12 @@ int64_t NixlCommAgent::xfer_seq_len(const XferHandle& handle) {
   return it->second.seq_len;
 }
 
-std::optional<mambaserve::TransportControl> NixlCommAgent::make_post_announce(const XferDesc& desc) {
-  if (desc.role != XferRole::Recv)
-    return std::nullopt;
-  mambaserve::TransportControl msg;
-  auto* a = msg.mutable_nixl_ctrl()->mutable_announce();
-  a->set_xfer_id(desc.xfer_id);
-  a->set_dst_ptr(reinterpret_cast<uint64_t>(desc.local_ptr));
-  a->set_bytes(desc.bytes);
-  a->set_dst_device(device_id());
-  return msg;
-}
-
 Status NixlCommAgent::handle_transport(const mambaserve::TransportControl& msg) {
   if (msg.body_case() != mambaserve::TransportControl::kNixlCtrl)
     return Status::Ok();
   const mambaserve::NixlControl& ctrl = msg.nixl_ctrl();
 
   switch (ctrl.body_case()) {
-  case mambaserve::NixlControl::kAnnounce: {
-    const mambaserve::NixlSlotAnnounce& a = ctrl.announce();
-    std::lock_guard<std::mutex> lk(announce_mu_);
-    announces_[a.xfer_id()] = SlotAnnounce{
-        .dst_ptr = reinterpret_cast<void*>(a.dst_ptr()),
-        .bytes = static_cast<size_t>(a.bytes()),
-        .dst_device = a.dst_device(),
-    };
-    return Status::Ok();
-  }
-  case mambaserve::NixlControl::kClear: {
-    std::lock_guard<std::mutex> lk(announce_mu_);
-    announces_.erase(ctrl.clear().xfer_id());
-    return Status::Ok();
-  }
   // Parent fans out every other worker's agent metadata, then signals that the
   // directory is complete; peers are loaded lazily on the first post().
   case mambaserve::NixlControl::kPeerMd: {
@@ -412,10 +323,6 @@ std::optional<mambaserve::TransportControl> NixlCommAgent::make_register_announc
 }
 
 void NixlCommAgent::shutdown() {
-  {
-    std::lock_guard<std::mutex> lk(announce_mu_);
-    announces_.clear();
-  }
 #if MAMBASERVE_WITH_NIXL
   for (auto& kv : xfers_) {
     if (kv.second.req) {
@@ -444,7 +351,6 @@ void NixlCommAgent::shutdown() {
     }
   }
 
-  pending_notifs_.clear();
   backend_ = nullptr;
   agent_.reset();
 #else

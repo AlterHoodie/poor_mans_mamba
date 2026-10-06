@@ -510,10 +510,14 @@ void Worker::handle_command_(const mambaserve::Command& cmd) {
   case mambaserve::Command::kMigrate: {
     MS_NVTX_RANGE("migrate_post");
     const auto& c = cmd.migrate();
+    // nullopt = async Pending (ack later). Otherwise Done/Error at post — emit now.
+    // MemcpyPeer is Done-at-post with Ok; only log real failures.
     if (auto m = migrate_(c)) {
-      LOG_ERROR("migrate post failed req_id=%llu worker=%zu: %s",
-                static_cast<unsigned long long>(c.req_id()), index_, m->status().message().c_str());
-
+      if (!status_ok(m->status())) {
+        LOG_ERROR("migrate post failed req_id=%llu worker=%zu: %s",
+                  static_cast<unsigned long long>(c.req_id()), index_,
+                  m->status().message().c_str());
+      }
       *ev.mutable_migrate() = std::move(*m);
       emit_event_(std::move(ev));
     }

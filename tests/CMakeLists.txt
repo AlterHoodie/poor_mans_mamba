@@ -30,9 +30,13 @@ target_link_libraries(tests
         ops
         GTest::gtest
 )
+set(MAMBA_TEST_MODEL_DIR "${PROJECT_SOURCE_DIR}/models/mamba2-130m-hf"
+    CACHE PATH "Model dir for Mamba2 unit / migrate tests")
+set(MAMBA_TEST_FALCON_DIR "${PROJECT_SOURCE_DIR}/models/falcon-h1-0.5b-base"
+    CACHE PATH "Model dir for Falcon-H1 unit tests")
 target_compile_definitions(tests PRIVATE
-    MAMBA_TEST_MODEL_DIR="${PROJECT_SOURCE_DIR}/models/mamba2-130m-hf"
-    MAMBA_TEST_FALCON_DIR="${PROJECT_SOURCE_DIR}/models/falcon-h1-0.5b-base"
+    MAMBA_TEST_MODEL_DIR="${MAMBA_TEST_MODEL_DIR}"
+    MAMBA_TEST_FALCON_DIR="${MAMBA_TEST_FALCON_DIR}"
 )
 
 if(MAMBASERVE_WITH_CUDA)

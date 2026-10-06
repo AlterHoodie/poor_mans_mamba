@@ -196,22 +196,33 @@ private:
       t_recv_done_ns = 0;
       t_start_ns = steady_now_ns();
       std::vector<XferHandle> handles;
+      std::vector<bool> done;
       handles.reserve(descs.size());
+      done.reserve(descs.size());
+      size_t remaining = 0;
       for (XferDesc& d : descs) {
-        StatusOr<XferHandle> h = agent->post(d);
+        StatusOr<PostResult> h = agent->post(d);
         if (!h.ok()) {
           std::fprintf(stderr, "post failed: %s\n", h.status().message().c_str());
           ok = false;
           break;
         }
-        if (peer && peer->agent) {
-          if (auto announce = agent->make_post_announce(d))
-            (void)peer->agent->handle_transport(*announce);
+        if (h.value().state == XferState::Error) {
+          std::fprintf(stderr, "xfer error at post on dev %d\n", dev);
+          ok = false;
+          break;
         }
-        handles.push_back(h.value());
+        if (h.value().state == XferState::Done) {
+          handles.push_back(h.value().handle);
+          done.push_back(true);
+          if (d.role == XferRole::Recv)
+            t_recv_done_ns = steady_now_ns();
+          continue;
+        }
+        handles.push_back(h.value().handle);
+        done.push_back(false);
+        ++remaining;
       }
-      std::vector<bool> done(handles.size(), false);
-      size_t remaining = ok ? handles.size() : 0;
       const int64_t deadline = steady_now_ns() + 60'000'000'000LL;
       while (remaining > 0 && ok) {
         for (size_t i = 0; i < handles.size(); ++i) {
@@ -220,11 +231,6 @@ private:
           const XferState st = agent->poll(handles[i]);
           if (st == XferState::Pending)
             continue;
-          // Stand-in for the control plane: relay e.g. MemcpyPeer Send "copy done" to the peer.
-          if (peer && peer->agent) {
-            if (auto fin = agent->make_completion_announce(handles[i], st))
-              (void)peer->agent->handle_transport(*fin);
-          }
           if (st == XferState::Error) {
             std::fprintf(stderr, "xfer error on dev %d\n", dev);
             ok = false;
@@ -409,16 +415,20 @@ IterResult run_iter(Pair& p, size_t bytes, size_t region_stride, bool bidir) {
                         .xfer_id = fwd,
                         .seq_len = 1});
   d1.push_back(XferDesc{.local_ptr = s1,
+                        .remote_ptr = s0,
                         .bytes = bytes,
                         .peer_device_id = 0,
                         .role = XferRole::Recv,
-                        .xfer_id = fwd});
+                        .xfer_id = fwd,
+                        .seq_len = 1});
   if (bidir) {
     d0.push_back(XferDesc{.local_ptr = s0 + region_stride,
+                          .remote_ptr = s1 + region_stride,
                           .bytes = bytes,
                           .peer_device_id = 1,
                           .role = XferRole::Recv,
-                          .xfer_id = rev});
+                          .xfer_id = rev,
+                          .seq_len = 1});
     d1.push_back(XferDesc{.local_ptr = s1 + region_stride,
                           .bytes = bytes,
                           .peer_device_id = 0,

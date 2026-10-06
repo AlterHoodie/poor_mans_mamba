@@ -128,31 +128,15 @@ struct RecordingTransportSender final : TransportSender {
   size_t n_workers() const override { return n; }
 };
 
-TEST(MemcpyTransportControl, RoutesAnnounceAndDoneBetweenMigrateEndpoints) {
+TEST(MemcpyTransportControl, IsNoop) {
   MemcpyTransportControl plane;
   RecordingTransportSender sender;
-  constexpr uint64_t kXfer = 7;
-  constexpr size_t kSrc = 0, kDst = 1;
-  plane.on_migrate_begin(kXfer, kSrc, kDst);
-
-  mambaserve::TransportControl announce;
-  announce.mutable_memcpy_ctrl()->mutable_announce()->set_xfer_id(kXfer);
-  plane.on_upstream(kDst, announce, sender); // Recv -> Send
-  ASSERT_EQ(sender.sent.size(), 1u);
-  EXPECT_EQ(sender.sent[0].worker, kSrc);
-
-  mambaserve::TransportControl done;
-  done.mutable_memcpy_ctrl()->mutable_done()->set_xfer_id(kXfer);
-  plane.on_upstream(kSrc, done, sender); // Send -> Recv
-  ASSERT_EQ(sender.sent.size(), 2u);
-  EXPECT_EQ(sender.sent[1].worker, kDst);
-
-  plane.on_migrate_end(kXfer);
-  plane.on_upstream(kDst, announce, sender); // route gone: dropped
-  EXPECT_EQ(sender.sent.size(), 2u);
+  mambaserve::TransportControl empty;
+  plane.on_upstream(1, empty, sender);
+  EXPECT_TRUE(sender.sent.empty());
 }
 
-TEST(MemcpyPeerCommAgent, CopiesSlotViaControlMessages) {
+TEST(MemcpyPeerCommAgent, RecvCopiesFromRemotePtr) {
   MemcpyPeerCommAgent send(0, Device::CPU);
   MemcpyPeerCommAgent recv(1, Device::CPU);
 
@@ -161,59 +145,40 @@ TEST(MemcpyPeerCommAgent, CopiesSlotViaControlMessages) {
     src[i] = static_cast<uint8_t>(i + 1);
   constexpr uint64_t kXfer = 42;
 
-  XferDesc rd{.local_ptr = dst.data(), .bytes = dst.size(), .peer_device_id = 0,
-              .role = XferRole::Recv, .xfer_id = kXfer};
-  XferDesc sd{.local_ptr = src.data(), .bytes = src.size(), .peer_device_id = 1,
-              .role = XferRole::Send, .xfer_id = kXfer, .seq_len = 5};
+  XferDesc sd{.local_ptr = src.data(),
+              .bytes = src.size(),
+              .peer_device_id = 1,
+              .role = XferRole::Send,
+              .xfer_id = kXfer,
+              .seq_len = 5};
+  XferDesc rd{.local_ptr = dst.data(),
+              .remote_ptr = src.data(),
+              .bytes = dst.size(),
+              .peer_device_id = 0,
+              .role = XferRole::Recv,
+              .xfer_id = kXfer,
+              .seq_len = 5};
 
-  auto rh = recv.post(rd);
   auto sh = send.post(sd);
-  ASSERT_TRUE(rh.ok());
+  auto rh = recv.post(rd);
   ASSERT_TRUE(sh.ok());
-
-  // Nothing routed yet: neither side can progress.
-  EXPECT_EQ(send.poll(sh.value()), XferState::Pending);
-  EXPECT_EQ(recv.poll(rh.value()), XferState::Pending);
-
-  // Control plane: Recv announce -> Send.
-  auto announce = recv.make_post_announce(rd);
-  ASSERT_TRUE(announce.has_value());
-  EXPECT_FALSE(send.make_post_announce(sd).has_value());
-  ASSERT_TRUE(send.handle_transport(*announce).ok());
-
-  EXPECT_EQ(send.poll(sh.value()), XferState::Done);
+  ASSERT_TRUE(rh.ok());
+  EXPECT_EQ(sh.value().state, XferState::Done);
+  EXPECT_EQ(rh.value().state, XferState::Done);
   EXPECT_EQ(dst, src);
-  // Recv still waits for the Send's completion message.
-  EXPECT_EQ(recv.poll(rh.value()), XferState::Pending);
-
-  // Control plane: Send done -> Recv.
-  auto done = send.make_completion_announce(sh.value(), XferState::Done);
-  ASSERT_TRUE(done.has_value());
-  EXPECT_FALSE(send.make_completion_announce(sh.value(), XferState::Done).has_value());
-  ASSERT_TRUE(recv.handle_transport(*done).ok());
-
-  EXPECT_EQ(recv.poll(rh.value()), XferState::Done);
-  EXPECT_EQ(recv.xfer_seq_len(rh.value()), 5);
+  EXPECT_EQ(recv.xfer_seq_len(rh.value().handle), 5);
 }
 
-TEST(MemcpyPeerCommAgent, SendErrorPropagatesToRecv) {
-  MemcpyPeerCommAgent send(0, Device::CPU);
+TEST(MemcpyPeerCommAgent, RecvRequiresRemotePtr) {
   MemcpyPeerCommAgent recv(1, Device::CPU);
   std::vector<uint8_t> buf(8, 1);
-  constexpr uint64_t kXfer = 9;
-
-  XferDesc rd{.local_ptr = buf.data(), .bytes = buf.size(), .role = XferRole::Recv,
-              .xfer_id = kXfer};
-  XferDesc sd{.local_ptr = buf.data(), .bytes = buf.size(), .role = XferRole::Send,
-              .xfer_id = kXfer};
+  XferDesc rd{.local_ptr = buf.data(),
+              .bytes = buf.size(),
+              .peer_device_id = 0,
+              .role = XferRole::Recv,
+              .xfer_id = 9};
   auto rh = recv.post(rd);
-  auto sh = send.post(sd);
-  ASSERT_TRUE(rh.ok() && sh.ok());
-
-  auto done = send.make_completion_announce(sh.value(), XferState::Error);
-  ASSERT_TRUE(done.has_value());
-  ASSERT_TRUE(recv.handle_transport(*done).ok());
-  EXPECT_EQ(recv.poll(rh.value()), XferState::Error);
+  EXPECT_FALSE(rh.ok());
 }
 
 TEST(NcclTransportControl, BootstrapsEveryRankAndWaitsForAcks) {
@@ -313,20 +278,14 @@ TEST(NixlTransportControl, TimesOutWhenAWorkerNeverPublishes) {
   EXPECT_TRUE(sender.sent.empty());
 }
 
-TEST(NixlTransportControl, RoutesAnnounceBetweenMigrateEndpoints) {
+TEST(NixlTransportControl, IgnoresNonPublishUpstream) {
   NixlTransportControl plane;
   RecordingTransportSender sender;
-  plane.on_migrate_begin(5, /*src=*/0, /*dst=*/1);
-
-  mambaserve::TransportControl announce;
-  announce.mutable_nixl_ctrl()->mutable_announce()->set_xfer_id(5);
-  plane.on_upstream(1, announce, sender);
-  ASSERT_EQ(sender.sent.size(), 1u);
-  EXPECT_EQ(sender.sent[0].worker, 0u);
-
-  plane.on_migrate_end(5);
-  plane.on_upstream(1, announce, sender);
-  EXPECT_EQ(sender.sent.size(), 1u);
+  mambaserve::TransportControl peer;
+  peer.mutable_nixl_ctrl()->mutable_peer_md()->set_device_id(1);
+  peer.mutable_nixl_ctrl()->mutable_peer_md()->set_md("x");
+  plane.on_upstream(1, peer, sender);
+  EXPECT_TRUE(sender.sent.empty());
 }
 
 TEST(WorkerMode, ProcessModeRejectsMemcpyPeer) {

@@ -7,7 +7,7 @@
 #   DEVICE=CPU STAGES=scale REPEATS=1 scripts/run_matrix.sh   # smoke test, no GPU
 #   DEVICE=CPU BIN_DIR=build/benchmarks VARIANTS=memcpy STAGES=perf scripts/run_matrix.sh
 #
-# Stages: env paths transport scale migrate rebalance logcheck nsys perf analyze
+# Stages: env paths transport scale migrate rebalance logcheck nsys ncu perf analyze
 #
 # Knobs (environment variables):
 #   BIN_DIR              directory with transport_bench / cluster_bench   (build-cuda/benchmarks)
@@ -28,6 +28,13 @@
 #   PERF_FREQ            sample frequency Hz               (99)
 #   PERF_MAX_SEQ         max-seq for the perf stage        (512)
 #   PERF_STAT            1 to also run perf stat (2nd pass) (0)
+#   NCU                  ncu binary                       (ncu on PATH)
+#   NCU_MAX_SEQ          max-seq for the ncu stage         (2048)
+#   NCU_LAUNCH_COUNT     matching launches to profile/pass (8)
+#   NCU_SECTIONS         comma-separated ncu sections
+#                        (LaunchStats,Occupancy,SpeedOfLight)
+#   NCU_TRANSPORT_REGEX  kernel regex for transport pass   (ncclDevKernel)
+#   NCU_DECODE_REGEX     kernel regex for decode SM sample (mamba2_ssm_scan)
 #
 # A100-80GB stress example (falcon-h1-0.5b ~100MiB/slot @2048, ~170MiB @4096,
 # ~316MiB @8192; each worker preallocates SESSIONS slots):
@@ -72,6 +79,11 @@ PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf}"
 PERF_FREQ="${PERF_FREQ:-99}"
 PERF_MAX_SEQ="${PERF_MAX_SEQ:-512}"
 PERF_STAT="${PERF_STAT:-0}"
+NCU_MAX_SEQ="${NCU_MAX_SEQ:-2048}"
+NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-8}"
+NCU_SECTIONS="${NCU_SECTIONS:-LaunchStats,Occupancy,SpeedOfLight}"
+NCU_TRANSPORT_REGEX="${NCU_TRANSPORT_REGEX:-ncclDevKernel}"
+NCU_DECODE_REGEX="${NCU_DECODE_REGEX:-mamba2_ssm_scan}"
 
 mkdir -p "$OUT"
 cd "$ROOT"
@@ -97,6 +109,37 @@ resolve_perf() {
     fi
   done
   return 1
+}
+
+# Prefer NCU=, else ncu on PATH, else a versioned install under /opt/nvidia.
+resolve_ncu() {
+  local cand
+  if [[ -n "${NCU:-}" ]]; then
+    echo "$NCU"
+    return 0
+  fi
+  if command -v ncu >/dev/null 2>&1; then
+    echo "ncu"
+    return 0
+  fi
+  for cand in /opt/nvidia/nsight-compute/*/ncu /usr/local/cuda/bin/ncu; do
+    if [[ -x "$cand" ]]; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Build repeated --section args from a comma-separated NCU_SECTIONS list.
+ncu_section_args() {
+  local IFS=',' section
+  local -a args=()
+  for section in $NCU_SECTIONS; do
+    [[ -n "$section" ]] || continue
+    args+=(--section "$section")
+  done
+  printf '%s\n' "${args[@]}"
 }
 
 # variant -> "backend|ENV=VAL ENV2=VAL2"
@@ -254,6 +297,59 @@ if have_stage nsys; then
     done
   else
     log "nsys not found; skipping"
+  fi
+fi
+
+if have_stage ncu; then
+  # Nsight Compute: per-kernel SM throughput / occupancy. Complements nsys (timeline /
+  # overlap). Replay serializes profiled launches — use for mechanism (does NCCL
+  # SendRecv burn SMs? what's decode occupancy?), not live migrate-vs-decode overlap.
+  # Opt-in only; not in the default STAGES list.
+  if [[ "$DEVICE" != "GPU" ]]; then
+    log "ncu: skip (DEVICE=$DEVICE; needs GPU)"
+  elif NCU_BIN="$(resolve_ncu)"; then
+    log "ncu: using $NCU_BIN ($("$NCU_BIN" --version 2>/dev/null | head -1))"
+    mkdir -p "$OUT/ncu"
+    mapfile -t NCU_SECTION_ARGS < <(ncu_section_args)
+    for v in "${VARIANT_LIST[@]}"; do
+      IFS='|' read -r backend envs <<< "$(variant_spec "$v")"
+      wm="$(worker_mode_for "$backend")"
+      # Two filtered passes so decode launches do not exhaust NCU_LAUNCH_COUNT before
+      # any NCCL kernel, and non-NCCL backends still get a decode SM sample.
+      for pass in transport decode; do
+        if [[ "$pass" == "transport" ]]; then
+          # NIXL/memcpy move bytes on copy engines — no ncclDevKernel; expect empty-ish.
+          if [[ "$backend" != "nccl" ]]; then
+            log "ncu: skip $v/$pass (no NCCL kernels for backend=$backend)"
+            continue
+          fi
+          kregex="$NCU_TRANSPORT_REGEX"
+        else
+          kregex="$NCU_DECODE_REGEX"
+        fi
+        log "ncu: $v/$pass (regex=$kregex, launch-count=$NCU_LAUNCH_COUNT, worker-mode $wm)"
+        out_base="$OUT/ncu/${v}_${pass}"
+        run_with_env "$envs" "$NCU_BIN" --target-processes all --replay-mode application \
+          --kernel-name-base demangled --kernel-name "regex:${kregex}" \
+          --launch-count "$NCU_LAUNCH_COUNT" \
+          "${NCU_SECTION_ARGS[@]}" \
+          -o "$out_base" --force-overwrite \
+          "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" \
+          --model-dirs "${MODELS%%,*}" --backends "$backend" --worker-mode "$wm" \
+          --max-seq "$NCU_MAX_SEQ" --loads busy --bg-sessions 2 --repeats 1 \
+          --warmup-runs 1 --out-dir "$OUT/ncu/run_${v}_${pass}" \
+          > "$OUT/ncu_${v}_${pass}.log" 2>&1 || {
+          log "  (failed: $v/$pass)"; continue
+        }
+        # CSV summary for diffing across variants without opening the GUI.
+        if [[ -f "${out_base}.ncu-rep" ]]; then
+          "$NCU_BIN" --import "${out_base}.ncu-rep" --csv --page details \
+            > "${out_base}.csv" 2>>"$OUT/ncu_${v}_${pass}.log" || log "  (csv export failed: $v/$pass)"
+        fi
+      done
+    done
+  else
+    log "ncu not found (install Nsight Compute or set NCU=/path/to/ncu); skipping"
   fi
 fi
 

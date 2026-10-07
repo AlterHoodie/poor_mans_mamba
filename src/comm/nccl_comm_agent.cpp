@@ -40,6 +40,8 @@ Status NcclCommAgent::init_comm_(const mambaserve::NcclBootstrap& boot) {
 
   if (cudaSetDevice(device_id()) != cudaSuccess)
     return Status::RuntimeError("cudaSetDevice failed");
+
+  // create seperate cuda stream for nccl
   if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
     stream_ = nullptr;
     return Status::RuntimeError("cudaStreamCreate failed");

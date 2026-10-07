@@ -193,16 +193,42 @@ Rebalance (`pinned_on` threshold 2, 16 sessions; short run):
 * **First migration still has a wire-up cost.** Idle first xfer is ~34-40 ms for NIXL (steady ~1.2 ms), from the lazy `loadRemoteMD`. NCCL does its setup at bootstrap (first xfer ~4-6 ms).
 * **Rebalance is on par with NCCL.** NIXL `pinned_on` reaches 1.53x vs 1.50x for NCCL with a lower median per-migration stall (156 ms vs 195 ms, with 12 vs 10 migrations). Only one short run per backend, so treat the difference as noise-level.
 * **`nixl_hoststaged` is still a configuration artifact.** Xfer is better than before (idle ~395 ms to ~220 ms) but still scales with slot size (127 to 220 ms idle, 215 to 340 ms busy over 46-100 MiB) and is the only variant that slows background ITL (1.09-1.13x).
-* **nsys companion** (3 sessions, 1 timed run): steady cuda_ipc xfer ~1.1 ms vs ~20 ms NCCL, host-staged ~445 ms. Profiles were recorded with Nsight Systems 2026.5.1, so open them with 2026.5.1 or newer. Numbers include profiler overhead.
+* **nsys companion** (3 sessions, 1 timed run): steady cuda_ipc xfer ~1.1 ms vs ~20 ms NCCL, host-staged ~445 ms. Numbers include profiler overhead. What the timeline shows is in [Nsight Systems: how the bytes move](#nsight-systems-how-the-bytes-move).
+
+### Nsight Systems: how the bytes move
+
+`nsys` gives the timeline (which stream, which engine, when). `ncu` is the per-kernel tool for SM throughput and occupancy; `scripts/run_matrix.sh` has an opt-in `ncu` stage for that. Neither replaces `migrations.csv`, which is the stall accounting.
+
+Capture with `STAGES=nsys scripts/run_matrix.sh` on a build with `-DMAMBASERVE_WITH_NVTX=ON`. Reports need Nsight Systems 2026.5.1 or newer to open. App ranges (`prefill`, `decode`, `migrate_post`) only appear with NVTX on. NCCL ships its own NVTX ranges, so `ncclSend`/`ncclRecv` show up by name. NIXL does not: its NVTX trace plugin (`libtrace_backend_nvtx.so`) was not found, so there is no NIXL row to look for.
+
+Each worker has two CUDA streams in the timeline. The default stream carries decode (`mamba2_ssm_scan`, attention, GEMV, RoPE). A second stream (for example stream 14) carries only transport: the `NcclCommAgent` stream for NCCL, the peer copy for NIXL.
+
+What a ~100 MiB (104,583,168 B) slot move looks like:
+
+| Backend | What to click | Engine | GPU time |
+|---|---|---|---|
+| NCCL P2P | `ncclDevKernel_SendRecv` on the GPU kernel row | SM kernel (grid 16, block 640, ~31% theoretical occupancy) | ~16 ms |
+| NIXL cuda_ipc | Memory, `PtoP memcpy`, channel type `Async Memcpy` | Copy engine / DMA, ~200 GiB/s | ~0.5 ms |
+| NIXL host-staged | Long host-to-device / device-to-host chain | Host bounce (UCX without `cuda_ipc`) | hundreds of ms |
+
+Reading tips:
+
+* **NCCL posts two messages per migrate**: an 8 B `seq_len` header, then the slot. Click the one with the 104,583,168 B message size. The host `ncclSend`/`ncclRecv` ranges and the "kernel launcher" tooltip are microseconds (enqueue only); the transfer is the `ncclDevKernel_SendRecv` bar on the GPU row. Send acks at post time, so the recv side is the one that visibly waits.
+* **NIXL has no transport kernel.** The `PtoP memcpy` bar is the transfer, and every steady-state bar looks the same (same size, same duration). The first migration is slower from lazy `loadRemoteMD` and UCX wire-up.
+* **GPU time vs host `xfer_us`.** The ~0.5 ms `PtoP memcpy` is the wire; the ~1.1 ms steady `xfer_us` in `migrations.csv` adds the worker's 1 ms poll tick before it notices completion. Use nsys for the copy and the CSV for the end-to-end host view.
+* **Why stall still matches across backends.** Stall is roughly `wait_boundary` (the in-flight decode must finish so the slot stops changing; the CPU being idle during the kernel does not make the slot safe to copy) plus `xfer` plus `commit_ack`. `commit_ack` runs from recv completion to commit, and includes the src `Release` round trip, which queues behind `Decode` commands on the single-threaded worker loop. Both are protocol and decode-length costs shared by NCCL and NIXL, so a 0.5 ms copy vs a 16 ms kernel barely moves the total.
+* **Overlap has not been shown yet.** In the 2-background-session capture the transfer mostly sits in a gap between decode bursts, so decode and transfer do not overlap. The copy-engine vs SM contention question (NCCL `SendRecv` taking SMs from decode, NIXL not) needs a busy capture with 16-32 background sessions; see next step 6. The migrating session itself never overlaps its own decode by design.
+* **Bad paths.** `nccl_nop2p` is NCCL over shared host memory (~14 GB/s class). `nixl_hoststaged` drops `cuda_ipc` from `UCX_TLS` and falls back to a much slower host path (~0.24 GB/s), so it is a configuration artifact, not a fair NIXL number.
+* **Allocator churn.** The default `nsys stats` shows ~293k `cudaMalloc`/`cudaFree` pairs from per-op temporaries on the decode path. A scratch allocator would trim host API time and some ITL, but it does not address `wait_boundary` or `commit_ack`, so it is not the migrate-stall lever.
 
 **Planned next steps**
 
 1. ~~Receiver-driven READ~~ (done): the src pointer rides in the migrate command, the receiver posts `NIXL_READ`, and agent metadata is published over the cluster transport control plane. Busy xfer dropped from ~322 ms to ~16 ms.
 2. Run transport progress (`getXferStatus`, `getNotifs`, control messages) off the decode loop, or prioritize it over `Decode`. Lower priority now that the announce no longer queues behind `Decode`; busy stall is dominated by `wait_boundary` and `commit_ack`, which are the same for NCCL and NIXL.
 3. A/B the agent progress thread (`cfg(false)`) on `balanced_off`; NIXL decode is still ~5-6% slower than NCCL.
-4. Eagerly `loadRemoteMD` after `peers_finalized` and do one warm-up transfer, to remove the ~34-40 ms first-migration cost.
-5. Run the `paths` and `transport` stages, record the UCX version, and fix the `nixl_hoststaged` `UCX_TLS`.
-6. Stress the NCCL-vs-NIXL contention question: re-run `migrate` for `nccl` and `nixl_cudaipc` with 32-48 background sessions (and larger `--max-seq` or a bigger model). 8 to 16 sessions only scaled stall with ITL and did not separate the two backends.
+4. Eagerly `loadRemoteMD` after `peers_finalized` and do one warm-up transfer, to remove the ~34-40 ms first-migration cost. NCCL pays its equivalent at `ncclCommInitRank` during bootstrap, which is why its first migrate is already warm.
+5. Run the `paths` and `transport` stages, record the UCX version, and fix the `nixl_hoststaged` `UCX_TLS`. Compare against `nccl_nop2p` (NCCL over shared host memory) as the sane no-P2P reference; host-staged is far below it only because `cuda_ipc` is missing.
+6. Stress the NCCL-vs-NIXL contention question: re-run `migrate` for `nccl` and `nixl_cudaipc` with 32-48 background sessions (and larger `--max-seq` or a bigger model). 8 to 16 sessions only scaled stall with ITL and did not separate the two backends. Capture nsys at that load too (the `nsys` stage currently hard-codes `--bg-sessions 2`): the question is whether decode bars stretch while NCCL `SendRecv` holds SMs, versus NIXL `PtoP memcpy` on the copy engine.
 7. Re-run `rebalance` to completion for all variants (the fuller matrix was cut short mid-rebalance), with more than one repeat.
 
 ## Status

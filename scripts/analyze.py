@@ -205,6 +205,97 @@ def report_scale(cluster, out_lines):
         out_lines.append(md_table(["model", "sessions", "speedup", "efficiency"], eff))
 
 
+PEER_VARIANTS = frozenset({"nccl", "nccl_nop2p", "nixl_cudaipc"})
+
+
+def _variant_key(variant):
+    return os.path.basename(variant)
+
+
+def _filter_migrate_series(points, load, peer_only):
+    """Return [(key, model, pts)] for a load; optionally restrict to PEER_VARIANTS."""
+    series = []
+    for (v, model, ld), pts in sorted(points.items()):
+        if ld != load:
+            continue
+        key = _variant_key(v)
+        if peer_only and key not in PEER_VARIANTS:
+            continue
+        series.append((key, model, sorted(pts, key=lambda p: p["bytes"])))
+    return series
+
+
+def _plot_metric_lines(plt, out_dir, series, metric, ylabel, title, fname):
+    if not series:
+        return None
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    for key, model, pts in series:
+        ax.plot([p["bytes"] / 2**20 for p in pts], [p[metric] for p in pts],
+                marker="o", label=f"{key}:{model}")
+    ax.set(xlabel="slot bytes (MiB)", ylabel=ylabel, xscale="log", title=title)
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, fname), dpi=120)
+    plt.close(fig)
+    return fname
+
+
+def _plot_stage_stacks(plt, out_dir, series, title, fname):
+    """Stacked bars of wait_boundary / xfer / commit_ack per variant×slot-size."""
+    if not series:
+        return None
+    # Collect unique sizes across all series (stable sorted).
+    sizes = sorted({p["bytes"] for _, _, pts in series for p in pts})
+    if not sizes:
+        return None
+    stages = ("wait_boundary_ms", "xfer_ms", "commit_ack_ms")
+    stage_labels = ("wait_boundary", "xfer", "commit_ack")
+    stage_colors = ("#4C72B0", "#DD8452", "#55A868")
+    n_var = len(series)
+    n_size = len(sizes)
+    # Group bars by size; within each size, one bar per variant.
+    width = 0.8 / max(n_var, 1)
+    fig, ax = plt.subplots(figsize=(max(7.0, 1.6 * n_size), 4.5))
+    x_base = list(range(n_size))
+    from matplotlib.patches import Rectangle
+
+    ymax = 0.0
+    labeled = set()
+    for vi, (key, model, pts) in enumerate(series):
+        by_bytes = {p["bytes"]: p for p in pts}
+        bottoms = [0.0] * n_size
+        xs = [x_base[i] + (vi - (n_var - 1) / 2) * width for i in range(n_size)]
+        for stage, label, color in zip(stages, stage_labels, stage_colors):
+            heights = [by_bytes[s][stage] if s in by_bytes else 0.0 for s in sizes]
+            for x, h, b in zip(xs, heights, bottoms):
+                if h <= 0:
+                    continue
+                leg = label if label not in labeled else None
+                if leg:
+                    labeled.add(label)
+                ax.add_patch(Rectangle(
+                    (x - width / 2, b), width, h,
+                    facecolor=color, edgecolor="black", linewidth=1.0, label=leg))
+            bottoms = [b + h for b, h in zip(bottoms, heights)]
+        # Variant name above the tallest stack for this size group.
+        for i, s in enumerate(sizes):
+            if s in by_bytes:
+                total = sum(by_bytes[s][st] for st in stages)
+                ymax = max(ymax, total)
+                ax.text(xs[i], total, key, ha="center", va="bottom", fontsize=6,
+                        rotation=90, clip_on=False)
+    ax.set_xticks(x_base)
+    ax.set_xticklabels([f"{s / 2**20:.0f} MiB" for s in sizes])
+    ax.set_xlim(-0.6, n_size - 0.4)
+    ax.set_ylim(0, ymax * 1.28 if ymax > 0 else 1.0)
+    ax.set(xlabel="slot bytes", ylabel="ms", title=title)
+    ax.legend(fontsize=7, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, fname), dpi=120)
+    plt.close(fig)
+    return fname
+
+
 def report_migrate(cluster, out_lines, plt, out_dir):
     rows = []
     for e in cluster:
@@ -225,19 +316,28 @@ def report_migrate(cluster, out_lines, plt, out_dir):
     for v, m in steady:
         groups[(v, m["model"], m["backend"], int(m["max_seq"]), m["load"])].append(m)
     table = []
-    points = defaultdict(list)  # (variant, model, load) -> [(bytes, stall_excess_ms)]
+    # (variant, model, load) -> list of dicts with bytes + phase medians (ms)
+    points = defaultdict(list)
     for (v, model, backend, max_seq, load), ms in sorted(groups.items()):
         nbytes = int(med([fnum(m["bytes"]) for m in ms]))
         xfer = med([fnum(m["xfer_us"]) for m in ms])
         stall = med([fnum(m["stall_excess_us"]) for m in ms])
+        wait_b = med([fnum(m["wait_boundary_us"]) for m in ms])
+        commit = med([fnum(m["commit_ack_us"]) for m in ms])
         table.append([v, model, backend, max_seq, load, human_bytes(nbytes),
-                      f"{med([fnum(m['wait_boundary_us']) for m in ms]) / 1e3:.2f}",
+                      f"{wait_b / 1e3:.2f}",
                       f"{xfer / 1e3:.3f}",
-                      f"{med([fnum(m['commit_ack_us']) for m in ms]) / 1e3:.3f}",
+                      f"{commit / 1e3:.3f}",
                       f"{med([fnum(m['total_us']) for m in ms]) / 1e3:.2f}",
                       f"{stall / 1e3:.2f}",
                       f"{(nbytes / (xfer * 1e3)) if xfer > 0 else 0:.2f}", len(ms)])
-        points[(v, model, load)].append((nbytes, stall / 1e3, backend))
+        points[(v, model, load)].append({
+            "bytes": nbytes,
+            "stall_excess_ms": stall / 1e3,
+            "xfer_ms": xfer / 1e3,
+            "wait_boundary_ms": wait_b / 1e3,
+            "commit_ack_ms": commit / 1e3,
+        })
     out_lines.append(md_table(
         ["variant", "model", "backend", "max_seq", "load", "slot bytes", "wait_boundary ms",
          "xfer ms", "commit_ack ms", "total ms", "stall_excess ms", "xfer GB/s", "n"], table))
@@ -282,19 +382,33 @@ def report_migrate(cluster, out_lines, plt, out_dir):
                                    "during ms", "slowdown"], rows_i))
 
     if plt and points:
-        fig, ax = plt.subplots(figsize=(6.5, 4.2))
-        for (v, model, load), pts in sorted(points.items()):
-            pts = sorted(pts)
-            label = f"{v}:{model}:{load}"
-            ax.plot([p[0] / 2**20 for p in pts], [p[1] for p in pts], marker="o", label=label)
-        ax.set(xlabel="slot bytes (MiB)", ylabel="stall excess (ms)", xscale="log",
-               title="Migration stall vs state size")
-        ax.legend(fontsize=6)
-        fig.tight_layout()
-        path = os.path.join(out_dir, "migration_stall.png")
-        fig.savefig(path, dpi=120)
-        plt.close(fig)
-        out_lines.append("![migration stall](migration_stall.png)\n")
+        out_lines.append("### Plots\n")
+        plot_links = []
+        for load in ("busy", "idle"):
+            for peer_only, tag in ((False, "all"), (True, "peer")):
+                series = _filter_migrate_series(points, load, peer_only)
+                if not series:
+                    continue
+                scope = "nccl / nccl_nop2p / nixl_cudaipc" if peer_only else "all backends"
+                fname = _plot_metric_lines(
+                    plt, out_dir, series, "stall_excess_ms", "stall excess (ms)",
+                    f"Migration stall vs state size ({load}, {scope})",
+                    f"migration_stall_{load}_{tag}.png")
+                if fname:
+                    plot_links.append(f"![migration stall ({load}, {tag})]({fname})")
+                fname = _plot_metric_lines(
+                    plt, out_dir, series, "xfer_ms", "xfer (ms)",
+                    f"Migration xfer vs state size ({load}, {scope})",
+                    f"xfer_us_{load}_{tag}.png")
+                if fname:
+                    plot_links.append(f"![xfer ({load}, {tag})]({fname})")
+                fname = _plot_stage_stacks(
+                    plt, out_dir, series,
+                    f"Migrate stages vs state size ({load}, {scope})",
+                    f"migrate_stages_{load}_{tag}.png")
+                if fname:
+                    plot_links.append(f"![migrate stages ({load}, {tag})]({fname})")
+        out_lines.extend(link + "\n" for link in plot_links)
 
 
 def report_rebalance(cluster, out_lines):

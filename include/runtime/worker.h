@@ -4,6 +4,8 @@
 #include "comm/comm_factory.h"
 #include "core/device.h"
 #include "core/status.h"
+#include "core/tensor.h"
+#include "ops/exec_context.h"
 #include "proto/worker.pb.h"
 #include "runtime/cache/cache_pool.h"
 #include "runtime/cluster_config.h"
@@ -17,6 +19,12 @@
 #include <span>
 #include <thread>
 #include <unordered_map>
+#include <vector>
+
+#ifdef MAMBASERVE_WITH_CUDA
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+#endif
 
 struct GenerateParams {
   int max_new_tokens = 32;
@@ -68,8 +76,38 @@ private:
     XferRole role = XferRole::Send;
   };
 
+  // Per-slot GPU execution resources (indexed by CacheHandle::id()).
+  // CPU workers leave stream/cublas/event null and run inference synchronously.
+  struct DecodeCtx {
+#ifdef MAMBASERVE_WITH_CUDA
+    cudaStream_t stream = nullptr;
+    cublasHandle_t cublas = nullptr;
+    cudaEvent_t done = nullptr;
+#endif
+    bool running = false;
+    uint64_t req_id = 0;
+    bool is_prefill = false;
+    int64_t prompt_len = 0; // for set_seq_len after async prefill
+    Tensor logits;
+  };
+
   std::unordered_map<uint64_t, CacheHandle> cache_handles_;
   std::unordered_map<uint64_t, PendingXfer> pending_transfers_;
+  std::vector<DecodeCtx> decode_ctx_;
+
+  ExecContext exec_ctx_for_slot_(int slot_id) const;
+  Status init_decode_ctx_pool_();
+  void destroy_decode_ctx_pool_();
+  Status wait_infer_idle_(int slot_id);
+  bool has_running_infer_() const;
+  void poll_infer_completions_();
+
+  // Launch prefill/decode onto the slot stream (GPU) or run sync (CPU).
+  // On success with async GPU: leaves running=true and returns nullopt (event later).
+  // On sync completion or error: returns the event to emit now.
+  std::optional<mambaserve::PrefillEvent> launch_prefill_(uint64_t req_id,
+                                                          std::span<const int32_t> tokens);
+  std::optional<mambaserve::DecodeEvent> launch_decode_(uint64_t req_id, int32_t token);
 
   StatusOr<int32_t> sample_(Tensor& logits);
 
@@ -78,12 +116,6 @@ private:
 
   // releases cache handle
   Status release_(uint64_t req_id);
-
-  // prefill, cache the states and return new token
-  mambaserve::PrefillEvent prefill_(uint64_t req_id, std::span<const int32_t> tokens);
-
-  // one forward pass, update cache, and return new token
-  mambaserve::DecodeEvent decode_(uint64_t req_id, const int32_t token);
 
   // Posts a transfer. On success stores the handle in pending_transfers_ and
   // returns nullopt (MigrateEvent is emitted later by poll_transfer_states_).

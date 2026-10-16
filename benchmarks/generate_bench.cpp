@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "core/device.h"
 #include "core/status.h"
 #include "core/tensor.h"
@@ -228,7 +229,7 @@ void BM_Prefill(benchmark::State& state) {
     const auto t0 = Clock::now();
     StatusOr<Tensor> pref = [&]() -> StatusOr<Tensor> {
       AllocatorScope scope(g_alloc.get());
-      return g_runner->prefill(prompt, layers.value());
+      return g_runner->prefill(ExecContext{}, prompt, layers.value());
     }();
     sync_device();
     if (!pref.ok()) {
@@ -302,7 +303,7 @@ void BM_Generate(benchmark::State& state) {
 
     StatusOr<Tensor> pref = [&]() -> StatusOr<Tensor> {
       AllocatorScope scope(g_alloc.get());
-      return g_runner->prefill(prompt, layers.value());
+      return g_runner->prefill(ExecContext{}, prompt, layers.value());
     }();
     sync_device();
     if (!pref.ok()) {
@@ -329,7 +330,7 @@ void BM_Generate(benchmark::State& state) {
       const auto t0 = Clock::now();
       StatusOr<Tensor> dec = [&]() -> StatusOr<Tensor> {
         AllocatorScope scope(g_alloc.get());
-        return g_runner->decode(cur, layers.value(), prompt_len + i - 1);
+        return g_runner->decode(ExecContext{}, cur, layers.value(), prompt_len + i - 1);
       }();
       sync_device();
       if (!dec.ok()) {

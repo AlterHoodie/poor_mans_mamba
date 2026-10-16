@@ -21,6 +21,7 @@
 #include <vector>
 
 #ifdef MAMBASERVE_WITH_CUDA
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #endif
 
@@ -105,7 +106,160 @@ StatusOr<int32_t> Worker::sample_(Tensor& logits) {
   return Status::InvalidArgument("logits device not supported for sampling");
 }
 
-mambaserve::PrefillEvent Worker::prefill_(uint64_t req_id, std::span<const int32_t> tokens) {
+ExecContext Worker::exec_ctx_for_slot_(int slot_id) const {
+  ExecContext ctx;
+  if (slot_id < 0 || static_cast<size_t>(slot_id) >= decode_ctx_.size())
+    return ctx;
+#ifdef MAMBASERVE_WITH_CUDA
+  const DecodeCtx& d = decode_ctx_[static_cast<size_t>(slot_id)];
+  ctx.stream = d.stream;
+  ctx.cublas = d.cublas;
+#endif
+  return ctx;
+}
+
+Status Worker::init_decode_ctx_pool_() {
+  decode_ctx_.clear();
+  decode_ctx_.resize(static_cast<size_t>(cfg_.num_slots));
+  if (cfg_.device != Device::GPU)
+    return Status::Ok();
+#ifdef MAMBASERVE_WITH_CUDA
+  for (int i = 0; i < cfg_.num_slots; ++i) {
+    DecodeCtx& d = decode_ctx_[static_cast<size_t>(i)];
+    if (cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking) != cudaSuccess)
+      return Status::RuntimeError("cudaStreamCreate failed for decode ctx");
+    if (cublasCreate(&d.cublas) != CUBLAS_STATUS_SUCCESS)
+      return Status::RuntimeError("cublasCreate failed for decode ctx");
+    if (cublasSetStream(d.cublas, d.stream) != CUBLAS_STATUS_SUCCESS)
+      return Status::RuntimeError("cublasSetStream failed for decode ctx");
+    if (cudaEventCreateWithFlags(&d.done, cudaEventDisableTiming) != cudaSuccess)
+      return Status::RuntimeError("cudaEventCreate failed for decode ctx");
+  }
+  return Status::Ok();
+#else
+  return Status::InvalidArgument("GPU worker requires CUDA build");
+#endif
+}
+
+void Worker::destroy_decode_ctx_pool_() {
+#ifdef MAMBASERVE_WITH_CUDA
+  for (DecodeCtx& d : decode_ctx_) {
+    if (d.running && d.done)
+      cudaEventSynchronize(d.done);
+    d.logits = Tensor{};
+    if (d.done) {
+      cudaEventDestroy(d.done);
+      d.done = nullptr;
+    }
+    if (d.cublas) {
+      cublasDestroy(d.cublas);
+      d.cublas = nullptr;
+    }
+    if (d.stream) {
+      cudaStreamDestroy(d.stream);
+      d.stream = nullptr;
+    }
+    d.running = false;
+  }
+#endif
+  decode_ctx_.clear();
+}
+
+Status Worker::wait_infer_idle_(int slot_id) {
+  if (slot_id < 0 || static_cast<size_t>(slot_id) >= decode_ctx_.size())
+    return Status::Ok();
+  DecodeCtx& d = decode_ctx_[static_cast<size_t>(slot_id)];
+  if (!d.running)
+    return Status::Ok();
+#ifdef MAMBASERVE_WITH_CUDA
+  if (d.done && cudaEventSynchronize(d.done) != cudaSuccess)
+    return Status::RuntimeError("cudaEventSynchronize failed waiting for infer");
+#endif
+  // Drain completion so logits/sample side effects match a normal poll.
+  // Force-complete path: sample is not needed for migrate; just clear running.
+  d.running = false;
+  d.logits = Tensor{};
+  return Status::Ok();
+}
+
+bool Worker::has_running_infer_() const {
+  for (const DecodeCtx& d : decode_ctx_) {
+    if (d.running)
+      return true;
+  }
+  return false;
+}
+
+void Worker::poll_infer_completions_() {
+#ifdef MAMBASERVE_WITH_CUDA
+  for (size_t i = 0; i < decode_ctx_.size(); ++i) {
+    DecodeCtx& d = decode_ctx_[i];
+    if (!d.running)
+      continue;
+    const cudaError_t q = cudaEventQuery(d.done);
+    if (q == cudaErrorNotReady)
+      continue;
+    if (q != cudaSuccess) {
+      mambaserve::Event ev;
+      if (d.is_prefill) {
+        *ev.mutable_prefill() =
+            make_prefill_event(d.req_id, -1, Status::RuntimeError("infer event query failed"));
+        telemetry::trace(telemetry::TraceKind::PrefillEnd, d.req_id, static_cast<int>(index_), 0);
+      } else {
+        *ev.mutable_decode() =
+            make_decode_event(d.req_id, -1, Status::RuntimeError("infer event query failed"));
+        telemetry::trace(telemetry::TraceKind::DecodeEnd, d.req_id, static_cast<int>(index_), 0, 0);
+      }
+      emit_event_(std::move(ev));
+      d.running = false;
+      d.logits = Tensor{};
+      continue;
+    }
+
+    auto hit = cache_handles_.find(d.req_id);
+    Status book = Status::Ok();
+    if (hit == cache_handles_.end()) {
+      book = Status::NotFound("infer complete missing cache handle");
+    } else if (d.is_prefill) {
+      book = pool_->set_seq_len(hit->second, d.prompt_len);
+    } else {
+      StatusOr<int64_t> past = pool_->seq_len(hit->second);
+      if (!past.ok())
+        book = past.status();
+      else
+        book = pool_->set_seq_len(hit->second, past.value() + 1);
+    }
+
+    StatusOr<int32_t> tok = book.ok() ? sample_(d.logits) : StatusOr<int32_t>(book);
+    mambaserve::Event ev;
+    if (d.is_prefill) {
+      void* slot_ptr = nullptr;
+      if (tok.ok() && hit != cache_handles_.end()) {
+        if (auto sp = pool_->slot_ptr(hit->second); sp.ok())
+          slot_ptr = sp.value();
+      }
+      *ev.mutable_prefill() =
+          make_prefill_event(d.req_id, tok.ok() ? tok.value() : -1,
+                             tok.ok() ? Status::Ok() : Status(tok.status()), slot_ptr);
+      telemetry::trace(telemetry::TraceKind::PrefillEnd, d.req_id, static_cast<int>(index_),
+                       tok.ok() ? 1 : 0);
+    } else {
+      *ev.mutable_decode() = make_decode_event(d.req_id, tok.ok() ? tok.value() : -1,
+                                               tok.ok() ? Status::Ok() : Status(tok.status()));
+      telemetry::trace(telemetry::TraceKind::DecodeEnd, d.req_id, static_cast<int>(index_), 0,
+                       tok.ok() ? 1 : 0);
+    }
+    emit_event_(std::move(ev));
+    d.running = false;
+    d.logits = Tensor{};
+  }
+#else
+  (void)0;
+#endif
+}
+
+std::optional<mambaserve::PrefillEvent> Worker::launch_prefill_(uint64_t req_id,
+                                                                std::span<const int32_t> tokens) {
   if (!pool_)
     return make_prefill_event(req_id, -1, Status::RuntimeError("cache pool not yet initialized"));
   if (!alloc_)
@@ -119,32 +273,53 @@ mambaserve::PrefillEvent Worker::prefill_(uint64_t req_id, std::span<const int32
         req_id, -1,
         Status::NotFound("Could not find Cache Handle for req_id" + std::to_string(req_id)));
 
+  const int slot_id = it->second.id();
+  if (slot_id < 0 || static_cast<size_t>(slot_id) >= decode_ctx_.size())
+    return make_prefill_event(req_id, -1, Status::RuntimeError("invalid cache slot id"));
+  DecodeCtx& dctx = decode_ctx_[static_cast<size_t>(slot_id)];
+  if (dctx.running)
+    return make_prefill_event(req_id, -1, Status::RuntimeError("slot already has in-flight infer"));
+
   StatusOr<std::span<LayerCacheView>> views = pool_->layer_views(it->second);
   if (!views.ok())
     return make_prefill_event(req_id, -1, views.status());
 
-  StatusOr<Tensor> prefill = [&]() -> StatusOr<Tensor> {
+  const ExecContext ctx = exec_ctx_for_slot_(slot_id);
+  StatusOr<Tensor> logits = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc_.get());
-    return runner_->prefill(tokens, views.value());
+    return runner_->prefill(ctx, tokens, views.value());
   }();
-  if (!prefill.ok())
-    return make_prefill_event(req_id, -1, prefill.status());
+  if (!logits.ok())
+    return make_prefill_event(req_id, -1, logits.status());
 
-  if (Status s = pool_->set_seq_len(it->second, static_cast<int64_t>(tokens.size())); !s.ok())
-    return make_prefill_event(req_id, -1, s);
+  // CPU (or no stream): finish synchronously.
+  if (cfg_.device != Device::GPU || ctx.stream == nullptr) {
+    if (Status s = pool_->set_seq_len(it->second, static_cast<int64_t>(tokens.size())); !s.ok())
+      return make_prefill_event(req_id, -1, s);
+    StatusOr<int32_t> sampled = sample_(logits.value());
+    if (!sampled.ok())
+      return make_prefill_event(req_id, -1, sampled.status());
+    StatusOr<void*> slot_ptr = pool_->slot_ptr(it->second);
+    if (!slot_ptr.ok())
+      return make_prefill_event(req_id, -1, slot_ptr.status());
+    return make_prefill_event(req_id, sampled.value(), Status::Ok(), slot_ptr.value());
+  }
 
-  StatusOr<int32_t> sampled = sample_(prefill.value());
-  if (!sampled.ok())
-    return make_prefill_event(req_id, -1, sampled.status());
-  StatusOr<void*> slot_ptr = pool_->slot_ptr(it->second);
-  if (!slot_ptr.ok())
-    return make_prefill_event(req_id, -1, slot_ptr.status());
-
-  // slot_ptr is for cluster level bookeeping
-  return make_prefill_event(req_id, sampled.value(), Status::Ok(), slot_ptr.value());
+#ifdef MAMBASERVE_WITH_CUDA
+  if (cudaEventRecord(dctx.done, dctx.stream) != cudaSuccess)
+    return make_prefill_event(req_id, -1, Status::RuntimeError("cudaEventRecord failed"));
+  dctx.running = true;
+  dctx.req_id = req_id;
+  dctx.is_prefill = true;
+  dctx.prompt_len = static_cast<int64_t>(tokens.size());
+  dctx.logits = std::move(logits.value());
+  return std::nullopt;
+#else
+  return make_prefill_event(req_id, -1, Status::InvalidArgument("GPU requires CUDA"));
+#endif
 }
 
-mambaserve::DecodeEvent Worker::decode_(uint64_t req_id, const int32_t token) {
+std::optional<mambaserve::DecodeEvent> Worker::launch_decode_(uint64_t req_id, int32_t token) {
   if (!pool_)
     return make_decode_event(req_id, -1, Status::RuntimeError("cache pool not yet initialized"));
   if (!alloc_)
@@ -156,6 +331,13 @@ mambaserve::DecodeEvent Worker::decode_(uint64_t req_id, const int32_t token) {
         req_id, -1,
         Status::NotFound("Could not find Cache Handle for req_id" + std::to_string(req_id)));
 
+  const int slot_id = it->second.id();
+  if (slot_id < 0 || static_cast<size_t>(slot_id) >= decode_ctx_.size())
+    return make_decode_event(req_id, -1, Status::RuntimeError("invalid cache slot id"));
+  DecodeCtx& dctx = decode_ctx_[static_cast<size_t>(slot_id)];
+  if (dctx.running)
+    return make_decode_event(req_id, -1, Status::RuntimeError("slot already has in-flight infer"));
+
   StatusOr<std::span<LayerCacheView>> views = pool_->layer_views(it->second);
   if (!views.ok())
     return make_decode_event(req_id, -1, views.status());
@@ -164,21 +346,34 @@ mambaserve::DecodeEvent Worker::decode_(uint64_t req_id, const int32_t token) {
   if (!past.ok())
     return make_decode_event(req_id, -1, past.status());
 
+  const ExecContext ctx = exec_ctx_for_slot_(slot_id);
   StatusOr<Tensor> logits = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc_.get());
-    return runner_->decode(token, views.value(), past.value());
+    return runner_->decode(ctx, token, views.value(), past.value());
   }();
   if (!logits.ok())
     return make_decode_event(req_id, -1, logits.status());
 
-  if (Status s = pool_->set_seq_len(it->second, past.value() + 1); !s.ok())
-    return make_decode_event(req_id, -1, s);
+  if (cfg_.device != Device::GPU || ctx.stream == nullptr) {
+    if (Status s = pool_->set_seq_len(it->second, past.value() + 1); !s.ok())
+      return make_decode_event(req_id, -1, s);
+    StatusOr<int32_t> sampled = sample_(logits.value());
+    if (!sampled.ok())
+      return make_decode_event(req_id, -1, sampled.status());
+    return make_decode_event(req_id, sampled.value(), Status::Ok());
+  }
 
-  StatusOr<int32_t> sampled = sample_(logits.value());
-  if (!sampled.ok())
-    return make_decode_event(req_id, -1, sampled.status());
-
-  return make_decode_event(req_id, sampled.value(), Status::Ok());
+#ifdef MAMBASERVE_WITH_CUDA
+  if (cudaEventRecord(dctx.done, dctx.stream) != cudaSuccess)
+    return make_decode_event(req_id, -1, Status::RuntimeError("cudaEventRecord failed"));
+  dctx.running = true;
+  dctx.req_id = req_id;
+  dctx.is_prefill = false;
+  dctx.logits = std::move(logits.value());
+  return std::nullopt;
+#else
+  return make_decode_event(req_id, -1, Status::InvalidArgument("GPU requires CUDA"));
+#endif
 }
 
 Status Worker::register_(uint64_t req_id) {
@@ -206,6 +401,9 @@ Status Worker::release_(uint64_t req_id) {
   auto it = cache_handles_.find(req_id);
   if (it == cache_handles_.end())
     return Status::NotFound("Could not find Cache Handle for req_id" + std::to_string(req_id));
+
+  if (Status s = wait_infer_idle_(it->second.id()); !s.ok())
+    return s;
 
   Status s = pool_->release(it->second);
   cache_handles_.erase(it);
@@ -284,6 +482,10 @@ std::optional<mambaserve::MigrateEvent> Worker::migrate_send_(const mambaserve::
     return make_migrate_event(cmd.req_id(), cmd.role(),
                               Status::NotFound("Send migrate missing cache handle for req_id " +
                                                std::to_string(cmd.req_id())));
+
+  // Slot must be idle so NCCL/memcpy does not race in-flight decode kernels.
+  if (Status s = wait_infer_idle_(hit->second.id()); !s.ok())
+    return make_migrate_event(cmd.req_id(), cmd.role(), s);
 
   StatusOr<int64_t> sl = pool_->seq_len(hit->second);
   if (!sl.ok())
@@ -373,6 +575,8 @@ Status Worker::init_() {
   ASSIGN_OR_RETURN(runner_, entry.create_runner(*alloc_));
   ASSIGN_OR_RETURN(
       pool_, create_cache_pool(*entry.cfg, alloc_.get(), cfg_.num_slots, create_cache_layout));
+  if (Status s = init_decode_ctx_pool_(); !s.ok())
+    return s;
   // No shared transport state: backends coordinate through the parent's control plane,
   // so this works identically for a worker thread and a worker process.
   ASSIGN_OR_RETURN(comm_agent_, create_comm_agent(cfg_, device_id_, nullptr));
@@ -387,6 +591,7 @@ Worker::~Worker() {
     ipc_->close();
   if (thread_.joinable())
     thread_.join();
+  destroy_decode_ctx_pool_();
 }
 
 void Worker::poll_transfer_states_() {
@@ -473,14 +678,15 @@ void Worker::handle_command_(const mambaserve::Command& cmd) {
       return;
     }
     auto pref =
-        prefill_(c.req_id(),
-                 std::span<const int32_t>(c.tokens().data(), static_cast<size_t>(c.tokens_size())));
-    // track prefill end
-    telemetry::trace(telemetry::TraceKind::PrefillEnd, c.req_id(), w,
-                     status_ok(pref.status()) ? 1 : 0);
-
-    *ev.mutable_prefill() = std::move(pref);
-    emit_event_(std::move(ev));
+        launch_prefill_(c.req_id(), std::span<const int32_t>(c.tokens().data(),
+                                                             static_cast<size_t>(c.tokens_size())));
+    // nullopt = async in flight; PrefillEnd traced in poll_infer_completions_.
+    if (pref) {
+      telemetry::trace(telemetry::TraceKind::PrefillEnd, c.req_id(), w,
+                       status_ok(pref->status()) ? 1 : 0);
+      *ev.mutable_prefill() = std::move(*pref);
+      emit_event_(std::move(ev));
+    }
     return;
   }
 
@@ -491,14 +697,13 @@ void Worker::handle_command_(const mambaserve::Command& cmd) {
     // track each decode start
     telemetry::trace(telemetry::TraceKind::DecodeStart, c.req_id(), w);
 
-    auto dec = decode_(c.req_id(), c.token());
-
-    // track each decode end
-    telemetry::trace(telemetry::TraceKind::DecodeEnd, c.req_id(), w, 0,
-                     status_ok(dec.status()) ? 1 : 0);
-
-    *ev.mutable_decode() = std::move(dec);
-    emit_event_(std::move(ev));
+    auto dec = launch_decode_(c.req_id(), c.token());
+    if (dec) {
+      telemetry::trace(telemetry::TraceKind::DecodeEnd, c.req_id(), w, 0,
+                       status_ok(dec->status()) ? 1 : 0);
+      *ev.mutable_decode() = std::move(*dec);
+      emit_event_(std::move(ev));
+    }
     return;
   }
   case mambaserve::Command::kRelease: {
@@ -594,15 +799,16 @@ void Worker::loop_() {
     emit_transport_(std::move(*announce));
 
   for (;;) {
+    poll_infer_completions_();
     poll_transfer_states_();
     if (!ipc_)
       return;
-    // Graceful stop: drain in-flight transfers, then exit.
-    if (stop_ && pending_transfers_.empty())
+    // Graceful stop: drain in-flight transfers and infer, then exit.
+    if (stop_ && pending_transfers_.empty() && !has_running_infer_())
       return;
 
-    // While transfers are outstanding, don't block the poll loop on IPC.
-    const bool draining = !pending_transfers_.empty();
+    // While transfers or infer are outstanding, don't block the poll loop on IPC.
+    const bool draining = !pending_transfers_.empty() || has_running_infer_();
     StatusOr<mambaserve::Envelope> env_or = draining ? ipc_->try_recv() : ipc_->recv();
     if (!env_or.ok()) {
       // Idle (Empty) or a hard error while transfers may still complete out-of-band:

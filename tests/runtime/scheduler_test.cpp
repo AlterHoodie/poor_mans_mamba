@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "core/device.h"
 #include "ops/backend.h"
 #include "ops/cpu/map.h"
@@ -117,8 +118,8 @@ public:
 
   FakeRunner(int vocab, int32_t next_token) : FakeRunner(vocab, std::vector<int32_t>{next_token}) {}
 
-  StatusOr<Tensor> prefill(std::span<const int32_t> tokens,
-                           std::span<LayerCacheView> /*layers*/) override {
+  StatusOr<Tensor> prefill(const ExecContext&, std::span<const int32_t> tokens,
+                           std::span<LayerCacheView>) override {
     if (tokens.empty())
       return Status::InvalidArgument("empty prompt");
     Tensor logits;
@@ -127,8 +128,8 @@ public:
     return std::move(logits);
   }
 
-  StatusOr<Tensor> decode(int32_t /*token*/, std::span<LayerCacheView> /*layers*/,
-                          int64_t /*past_len*/) override {
+  StatusOr<Tensor> decode(const ExecContext& , int32_t ,
+                          std::span<LayerCacheView> , int64_t ) override {
     if (overflow_after_decodes_ >= 0 && decode_calls_ >= overflow_after_decodes_) {
       return Status::KvCacheOverflow("KV cache overflow");
     }
@@ -189,7 +190,7 @@ StatusOr<std::vector<int32_t>> greedy_generate(Runner& runner, CachePool& pool,
   AllocatorScope scope(&alloc);
 
   std::vector<int32_t> out;
-  StatusOr<Tensor> logits = runner.prefill(prompt, layers.value());
+  StatusOr<Tensor> logits = runner.prefill(ExecContext{}, prompt, layers.value());
   if (!logits.ok()) {
     (void)pool.release(handle);
     return logits.status();
@@ -209,7 +210,7 @@ StatusOr<std::vector<int32_t>> greedy_generate(Runner& runner, CachePool& pool,
 
     // out already holds the just-sampled token; KV write index is prompt + prior gens.
     const int64_t past_len = static_cast<int64_t>(prompt.size() + out.size() - 1);
-    logits = runner.decode(tok.value(), layers.value(), past_len);
+    logits = runner.decode(ExecContext{}, tok.value(), layers.value(), past_len);
     if (!logits.ok()) {
       if (logits.status().code() == Code::kKvCacheOverflow) {
         (void)pool.release(handle);

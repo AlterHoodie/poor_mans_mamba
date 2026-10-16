@@ -16,22 +16,24 @@ private:
   ModelConfig cfg_;
   FalconH1Weights weights_;
 
-  Status block_forward_(int layer_idx, LayerCacheView& cache, Tensor& hidden, int64_t past_len);
+  Status block_forward_(const ExecContext& ctx, int layer_idx, LayerCacheView& cache,
+                        Tensor& hidden, int64_t past_len);
 
-  StatusOr<Tensor> embed_(std::span<const int32_t> tokens);
-  Status norm_f_(Tensor& hidden);
-  StatusOr<Tensor> lm_head_(const Tensor& hidden);
-  StatusOr<Tensor> last_token_hidden_(const Tensor& hidden) const;
+  StatusOr<Tensor> embed_(const ExecContext& ctx, std::span<const int32_t> tokens);
+  Status norm_f_(const ExecContext& ctx, Tensor& hidden);
+  StatusOr<Tensor> lm_head_(const ExecContext& ctx, const Tensor& hidden);
+  StatusOr<Tensor> last_token_hidden_(const ExecContext& ctx, const Tensor& hidden) const;
 
-  StatusOr<Tensor> forward_hidden_(std::span<LayerCacheView> layers, Tensor& hidden, int64_t past_len);
+  StatusOr<Tensor> forward_hidden_(const ExecContext& ctx, std::span<LayerCacheView> layers,
+                                   Tensor& hidden, int64_t past_len);
 
 public:
   FalconH1Runner(ModelConfig cfg, FalconH1Weights weights, const OpsBackend& ops);
 
   ~FalconH1Runner() override;
 
-  StatusOr<Tensor> prefill(std::span<const int32_t> tokens,
+  StatusOr<Tensor> prefill(const ExecContext& ctx, std::span<const int32_t> tokens,
                            std::span<LayerCacheView> layers) override;
-  StatusOr<Tensor> decode(const int32_t token, std::span<LayerCacheView> layers,
-                          int64_t past_len) override;
+  StatusOr<Tensor> decode(const ExecContext& ctx, const int32_t token,
+                          std::span<LayerCacheView> layers, int64_t past_len) override;
 };

@@ -17,8 +17,8 @@ FalconH1Runner::~FalconH1Runner() = default;
 FalconH1Runner::FalconH1Runner(ModelConfig cfg, FalconH1Weights weights, const OpsBackend& ops)
     : ops_(&ops), cfg_(std::move(cfg)), weights_(std::move(weights)) {}
 
-Status FalconH1Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tensor& hidden,
-                                      int64_t past_len) {
+Status FalconH1Runner::block_forward_(const ExecContext& ctx, int layer_idx, LayerCacheView& cache,
+                                      Tensor& hidden, int64_t past_len) {
   if (cache.kind != LayerCacheKind::Hybrid)
     return Status::InvalidArgument("cache kind must be hybrid");
   if (layer_idx < 0 || layer_idx >= static_cast<int>(weights_.layers.size()))
@@ -35,7 +35,8 @@ Status FalconH1Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tens
   StatusOr<Tensor> normed = allocate_f32_tensor(hidden.shape);
   if (!normed.ok())
     return Status(normed.status());
-  if (Status s = ops_->rms_norm(hidden, layer.input_layernorm, cfg_.rms_norm_eps, normed.value());
+  if (Status s =
+          ops_->rms_norm(ctx, hidden, layer.input_layernorm, cfg_.rms_norm_eps, normed.value());
       !s.ok())
     return s;
 
@@ -54,12 +55,12 @@ Status FalconH1Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tens
                         .A_log = layer.A_log,
                         .D = layer.D,
                         .mixer_norm = nullptr};
-  if (Status s = ops_->mamba2_mixer_f32(normed.value(), mw, cfg_.ssm, scales, cfg_.rms_norm_eps,
-                                        cache, mamba_out.value());
+  if (Status s = ops_->mamba2_mixer_f32(ctx, normed.value(), mw, cfg_.ssm, scales,
+                                        cfg_.rms_norm_eps, cache, mamba_out.value());
       !s.ok()) {
     return s;
   }
-  if (Status s = ops_->scale(mamba_out.value(), ssm_out); !s.ok())
+  if (Status s = ops_->scale(ctx, mamba_out.value(), ssm_out); !s.ok())
     return s;
 
   // attn_input = normed * attn_in (skip the copy when the scale is 1).
@@ -74,15 +75,16 @@ Status FalconH1Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tens
       std::memcpy(attn_scaled.buffer.ptr, normed.value().buffer.ptr, normed.value().buffer.bytes);
     } else {
 #ifdef MAMBASERVE_WITH_CUDA
-      cudaError_t err = cudaMemcpy(attn_scaled.buffer.ptr, normed.value().buffer.ptr,
-                                   normed.value().buffer.bytes, cudaMemcpyDeviceToDevice);
+      cudaError_t err = cudaMemcpyAsync(attn_scaled.buffer.ptr, normed.value().buffer.ptr,
+                                        normed.value().buffer.bytes, cudaMemcpyDeviceToDevice,
+                                        static_cast<cudaStream_t>(ctx.stream));
       if (err != cudaSuccess)
         return Status::RuntimeError(std::string("attn_in copy failed: ") + cudaGetErrorString(err));
 #else
       return Status::InvalidArgument("GPU FalconH1 requires CUDA");
 #endif
     }
-    if (Status s = ops_->scale(attn_scaled, attn_in); !s.ok())
+    if (Status s = ops_->scale(ctx, attn_scaled, attn_in); !s.ok())
       return s;
     attn_input = &attn_scaled;
   }
@@ -90,24 +92,24 @@ Status FalconH1Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tens
                  .k_proj = layer.k_proj,
                  .v_proj = layer.v_proj,
                  .o_proj = layer.o_proj};
-  if (Status s = ops_->attention_f32(*attn_input, aw, *cfg_.attn, scales, cfg_.max_seq_length,
+  if (Status s = ops_->attention_f32(ctx, *attn_input, aw, *cfg_.attn, scales, cfg_.max_seq_length,
                                      cfg_.hidden_size, cache, past_len, attn_out.value());
       !s.ok()) {
     return s;
   }
-  if (Status s = ops_->scale(attn_out.value(), attn_out_scale); !s.ok())
+  if (Status s = ops_->scale(ctx, attn_out.value(), attn_out_scale); !s.ok())
     return s;
 
-  if (Status s = ops_->add(hidden, mamba_out.value(), hidden); !s.ok())
+  if (Status s = ops_->add(ctx, hidden, mamba_out.value(), hidden); !s.ok())
     return s;
-  if (Status s = ops_->add(hidden, attn_out.value(), hidden); !s.ok())
+  if (Status s = ops_->add(ctx, hidden, attn_out.value(), hidden); !s.ok())
     return s;
 
   StatusOr<Tensor> ff_normed = allocate_f32_tensor(hidden.shape);
   if (!ff_normed.ok())
     return Status(ff_normed.status());
-  if (Status s =
-          ops_->rms_norm(hidden, layer.pre_ff_layer_norm, cfg_.rms_norm_eps, ff_normed.value());
+  if (Status s = ops_->rms_norm(ctx, hidden, layer.pre_ff_layer_norm, cfg_.rms_norm_eps,
+                                ff_normed.value());
       !s.ok())
     return s;
 
@@ -117,14 +119,14 @@ Status FalconH1Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tens
   MlpWeights mw_mlp{.up_proj = layer.ff_up_proj,
                     .gate_proj = layer.ff_gate_proj,
                     .down_proj = layer.ff_down_proj};
-  if (Status s = ops_->mlp_f32(ff_normed.value(), mw_mlp, *cfg_.mlp, scales, ff_out.value());
+  if (Status s = ops_->mlp_f32(ctx, ff_normed.value(), mw_mlp, *cfg_.mlp, scales, ff_out.value());
       !s.ok())
     return s;
 
-  return ops_->add(hidden, ff_out.value(), hidden);
+  return ops_->add(ctx, hidden, ff_out.value(), hidden);
 }
 
-StatusOr<Tensor> FalconH1Runner::embed_(std::span<const int32_t> tokens) {
+StatusOr<Tensor> FalconH1Runner::embed_(const ExecContext& ctx, std::span<const int32_t> tokens) {
   if (tokens.empty())
     return Status::InvalidArgument("embed requires at least one token");
   if (weights_.embeddings.size() != 2)
@@ -140,19 +142,21 @@ StatusOr<Tensor> FalconH1Runner::embed_(std::span<const int32_t> tokens) {
   if (!out.ok())
     return Status(out.status());
 
-  if (Status s = ops_->embedding_lookup(weights_.embeddings, tokens.data(),
-                                        static_cast<int64_t>(tokens.size()), emb_scale, out.value());
+  if (Status s =
+          ops_->embedding_lookup(ctx, weights_.embeddings, tokens.data(),
+                                 static_cast<int64_t>(tokens.size()), emb_scale, out.value());
       !s.ok()) {
     return s;
   }
   return std::move(out.value());
 }
 
-Status FalconH1Runner::norm_f_(Tensor& hidden) {
-  return ops_->rms_norm(hidden, weights_.norm_f, cfg_.rms_norm_eps, hidden);
+Status FalconH1Runner::norm_f_(const ExecContext& ctx, Tensor& hidden) {
+  return ops_->rms_norm(ctx, hidden, weights_.norm_f, cfg_.rms_norm_eps, hidden);
 }
 
-StatusOr<Tensor> FalconH1Runner::last_token_hidden_(const Tensor& hidden) const {
+StatusOr<Tensor> FalconH1Runner::last_token_hidden_(const ExecContext& ctx,
+                                                    const Tensor& hidden) const {
   if (hidden.empty())
     return Status::InvalidArgument("hidden is empty");
 
@@ -168,13 +172,13 @@ StatusOr<Tensor> FalconH1Runner::last_token_hidden_(const Tensor& hidden) const 
   StatusOr<Tensor> last = allocate_f32_tensor(std::move(out_shape));
   if (!last.ok())
     return Status(last.status());
-  if (Status s = ops_->take_last_row(hidden, last.value()); !s.ok())
+  if (Status s = ops_->take_last_row(ctx, hidden, last.value()); !s.ok())
     return s;
   return std::move(last.value());
 }
 
-StatusOr<Tensor> FalconH1Runner::lm_head_(const Tensor& hidden) {
-  StatusOr<Tensor> last = last_token_hidden_(hidden);
+StatusOr<Tensor> FalconH1Runner::lm_head_(const ExecContext& ctx, const Tensor& hidden) {
+  StatusOr<Tensor> last = last_token_hidden_(ctx, hidden);
   if (!last.ok())
     return Status(last.status());
 
@@ -186,57 +190,59 @@ StatusOr<Tensor> FalconH1Runner::lm_head_(const Tensor& hidden) {
   StatusOr<Tensor> logits = allocate_f32_tensor(std::move(out_shape.value()));
   if (!logits.ok())
     return Status(logits.status());
-  if (Status s = ops_->linear(last.value(), weight, logits.value()); !s.ok())
+  if (Status s = ops_->linear(ctx, last.value(), weight, logits.value()); !s.ok())
     return s;
 
   const float lm_scale = cfg_.scales ? cfg_.scales->lm_head : 1.f;
-  if (Status s = ops_->scale(logits.value(), lm_scale); !s.ok())
+  if (Status s = ops_->scale(ctx, logits.value(), lm_scale); !s.ok())
     return s;
   return std::move(logits.value());
 }
 
-StatusOr<Tensor> FalconH1Runner::forward_hidden_(std::span<LayerCacheView> layers, Tensor& hidden,
+StatusOr<Tensor> FalconH1Runner::forward_hidden_(const ExecContext& ctx,
+                                                 std::span<LayerCacheView> layers, Tensor& hidden,
                                                  int64_t past_len) {
 
   for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-    if (Status s = block_forward_(i, layers[i], hidden, past_len); !s.ok())
+    if (Status s = block_forward_(ctx, i, layers[i], hidden, past_len); !s.ok())
       return s;
   }
 
-  if (Status s = norm_f_(hidden); !s.ok())
+  if (Status s = norm_f_(ctx, hidden); !s.ok())
     return s;
   return std::move(hidden);
 }
 
-StatusOr<Tensor> FalconH1Runner::prefill(std::span<const int32_t> tokens, std::span<LayerCacheView> layers) {
+StatusOr<Tensor> FalconH1Runner::prefill(const ExecContext& ctx, std::span<const int32_t> tokens,
+                                         std::span<LayerCacheView> layers) {
 
   Tensor hidden;
-  ASSIGN_OR_RETURN(hidden, embed_(tokens));
+  ASSIGN_OR_RETURN(hidden, embed_(ctx, tokens));
 
   Tensor normalized;
-  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, 0));
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(ctx, layers, hidden, 0));
 
   Tensor logits;
-  ASSIGN_OR_RETURN(logits, lm_head_(normalized));
+  ASSIGN_OR_RETURN(logits, lm_head_(ctx, normalized));
   return std::move(logits);
 }
 
-StatusOr<Tensor> FalconH1Runner::decode(const int32_t token, std::span<LayerCacheView> layers,
-                                        int64_t past_len) {
+StatusOr<Tensor> FalconH1Runner::decode(const ExecContext& ctx, const int32_t token,
+                                        std::span<LayerCacheView> layers, int64_t past_len) {
   if (past_len < 0)
     return Status::InvalidArgument("past_len must be non-negative");
 
   Tensor hidden;
-  ASSIGN_OR_RETURN(hidden, embed_(std::span<const int32_t>(&token, 1)));
+  ASSIGN_OR_RETURN(hidden, embed_(ctx, std::span<const int32_t>(&token, 1)));
 
   // convert shape from [1,H] to [H]
   if (hidden.size() == 2 && hidden.shape[0] == 1)
     hidden.shape = {hidden.shape[1]};
 
   Tensor normalized;
-  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, past_len));
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(ctx, layers, hidden, past_len));
 
   Tensor logits;
-  ASSIGN_OR_RETURN(logits, lm_head_(normalized));
+  ASSIGN_OR_RETURN(logits, lm_head_(ctx, normalized));
   return std::move(logits);
 }

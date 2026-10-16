@@ -13,8 +13,8 @@ Mamba2Runner::~Mamba2Runner() = default;
 Mamba2Runner::Mamba2Runner(ModelConfig cfg, Mamba2Weights weights, const OpsBackend& ops)
     : ops_(&ops), cfg_(std::move(cfg)), weights_(std::move(weights)) {}
 
-Status Mamba2Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tensor& hidden,
-                                    bool is_prefill) {
+Status Mamba2Runner::block_forward_(const ExecContext& ctx, int layer_idx, LayerCacheView& cache,
+                                    Tensor& hidden, bool is_prefill) {
   (void)is_prefill;
   if (cache.kind != LayerCacheKind::Mamba2)
     return Status::InvalidArgument("cache kind must be mamba2");
@@ -26,7 +26,7 @@ Status Mamba2Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tensor
   StatusOr<Tensor> normed = allocate_f32_tensor(hidden.shape);
   if (!normed.ok())
     return Status(normed.status());
-  if (Status s = ops_->rms_norm(hidden, layer.layer_norm, cfg_.rms_norm_eps, normed.value());
+  if (Status s = ops_->rms_norm(ctx, hidden, layer.layer_norm, cfg_.rms_norm_eps, normed.value());
       !s.ok())
     return s;
 
@@ -42,16 +42,16 @@ Status Mamba2Runner::block_forward_(int layer_idx, LayerCacheView& cache, Tensor
                         .A_log = layer.A_log,
                         .D = layer.D,
                         .mixer_norm = &layer.mixer_norm};
-  if (Status s = ops_->mamba2_mixer_f32(normed.value(), mw, cfg_.ssm, /*scales=*/nullptr,
+  if (Status s = ops_->mamba2_mixer_f32(ctx, normed.value(), mw, cfg_.ssm, /*scales=*/nullptr,
                                         cfg_.rms_norm_eps, cache, mixer_out.value());
       !s.ok()) {
     return s;
   }
 
-  return ops_->add(hidden, mixer_out.value(), hidden);
+  return ops_->add(ctx, hidden, mixer_out.value(), hidden);
 }
 
-StatusOr<Tensor> Mamba2Runner::embed_(std::span<const int32_t> tokens) {
+StatusOr<Tensor> Mamba2Runner::embed_(const ExecContext& ctx, std::span<const int32_t> tokens) {
   if (tokens.empty()) {
     return Status::InvalidArgument("embed requires at least one token");
   }
@@ -68,20 +68,21 @@ StatusOr<Tensor> Mamba2Runner::embed_(std::span<const int32_t> tokens) {
   if (!out.ok())
     return Status(out.status());
 
-  if (Status s = ops_->embedding_lookup(weights_.embeddings, tokens.data(),
-                                        static_cast<int64_t>(tokens.size()), /*scale=*/1.f,
-                                        out.value());
+  if (Status s =
+          ops_->embedding_lookup(ctx, weights_.embeddings, tokens.data(),
+                                 static_cast<int64_t>(tokens.size()), /*scale=*/1.f, out.value());
       !s.ok()) {
     return s;
   }
   return std::move(out.value());
 }
 
-Status Mamba2Runner::norm_f_(Tensor& hidden) {
-  return ops_->rms_norm(hidden, weights_.norm_f, cfg_.rms_norm_eps, hidden);
+Status Mamba2Runner::norm_f_(const ExecContext& ctx, Tensor& hidden) {
+  return ops_->rms_norm(ctx, hidden, weights_.norm_f, cfg_.rms_norm_eps, hidden);
 }
 
-StatusOr<Tensor> Mamba2Runner::last_token_hidden_(const Tensor& hidden) const {
+StatusOr<Tensor> Mamba2Runner::last_token_hidden_(const ExecContext& ctx,
+                                                  const Tensor& hidden) const {
   if (hidden.empty())
     return Status::InvalidArgument("hidden is empty");
 
@@ -97,13 +98,13 @@ StatusOr<Tensor> Mamba2Runner::last_token_hidden_(const Tensor& hidden) const {
   StatusOr<Tensor> last = allocate_f32_tensor(std::move(out_shape));
   if (!last.ok())
     return Status(last.status());
-  if (Status s = ops_->take_last_row(hidden, last.value()); !s.ok())
+  if (Status s = ops_->take_last_row(ctx, hidden, last.value()); !s.ok())
     return s;
   return std::move(last.value());
 }
 
-StatusOr<Tensor> Mamba2Runner::lm_head_(const Tensor& hidden) {
-  StatusOr<Tensor> last = last_token_hidden_(hidden);
+StatusOr<Tensor> Mamba2Runner::lm_head_(const ExecContext& ctx, const Tensor& hidden) {
+  StatusOr<Tensor> last = last_token_hidden_(ctx, hidden);
   if (!last.ok())
     return Status(last.status());
 
@@ -115,44 +116,46 @@ StatusOr<Tensor> Mamba2Runner::lm_head_(const Tensor& hidden) {
   StatusOr<Tensor> logits = allocate_f32_tensor(std::move(out_shape.value()));
   if (!logits.ok())
     return Status(logits.status());
-  if (Status s = ops_->linear(last.value(), weight, logits.value()); !s.ok())
+  if (Status s = ops_->linear(ctx, last.value(), weight, logits.value()); !s.ok())
     return s;
   return std::move(logits.value());
 }
 
-StatusOr<Tensor> Mamba2Runner::forward_hidden_(std::span<LayerCacheView> layers, Tensor& hidden,
+StatusOr<Tensor> Mamba2Runner::forward_hidden_(const ExecContext& ctx,
+                                               std::span<LayerCacheView> layers, Tensor& hidden,
                                                bool is_prefill) {
 
   for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-    if (Status s = block_forward_(i, layers[i], hidden, is_prefill); !s.ok()) {
+    if (Status s = block_forward_(ctx, i, layers[i], hidden, is_prefill); !s.ok()) {
       return s;
     }
   }
 
-  if (Status s = norm_f_(hidden); !s.ok())
+  if (Status s = norm_f_(ctx, hidden); !s.ok())
     return s;
   return std::move(hidden);
 }
 
-StatusOr<Tensor> Mamba2Runner::prefill(std::span<const int32_t> tokens, std::span<LayerCacheView> layers) {
+StatusOr<Tensor> Mamba2Runner::prefill(const ExecContext& ctx, std::span<const int32_t> tokens,
+                                       std::span<LayerCacheView> layers) {
 
   Tensor hidden;
-  ASSIGN_OR_RETURN(hidden, embed_(tokens));
+  ASSIGN_OR_RETURN(hidden, embed_(ctx, tokens));
 
   Tensor normalized;
-  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, true));
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(ctx, layers, hidden, true));
 
   Tensor logits;
-  ASSIGN_OR_RETURN(logits, lm_head_(normalized));
+  ASSIGN_OR_RETURN(logits, lm_head_(ctx, normalized));
   return std::move(logits);
 }
 
-StatusOr<Tensor> Mamba2Runner::decode(const int32_t token, std::span<LayerCacheView> layers,
-                                      int64_t past_len) {
+StatusOr<Tensor> Mamba2Runner::decode(const ExecContext& ctx, const int32_t token,
+                                      std::span<LayerCacheView> layers, int64_t past_len) {
   (void)past_len;
 
   Tensor hidden;
-  ASSIGN_OR_RETURN(hidden, embed_(std::span<const int32_t>(&token, 1)));
+  ASSIGN_OR_RETURN(hidden, embed_(ctx, std::span<const int32_t>(&token, 1)));
 
   // convert shape from [1,H] to [H]
   if (hidden.size() == 2 && hidden.shape[0] == 1) {
@@ -160,9 +163,9 @@ StatusOr<Tensor> Mamba2Runner::decode(const int32_t token, std::span<LayerCacheV
   }
 
   Tensor normalized;
-  ASSIGN_OR_RETURN(normalized, forward_hidden_(layers, hidden, false));
+  ASSIGN_OR_RETURN(normalized, forward_hidden_(ctx, layers, hidden, false));
 
   Tensor logits;
-  ASSIGN_OR_RETURN(logits, lm_head_(normalized));
+  ASSIGN_OR_RETURN(logits, lm_head_(ctx, normalized));
   return std::move(logits);
 }

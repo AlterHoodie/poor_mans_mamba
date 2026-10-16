@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "core/device.h"
 #include "ops/backend.h"
 #include "ops/cpu/map.h"
@@ -261,7 +262,7 @@ TEST(FalconH1Attn, PrefillWritesKvAndDecodeAppends) {
   StatusOr<Tensor> out = allocate_f32_tensor({T, D});
   ASSERT_TRUE(out.ok());
   ASSERT_TRUE(cpu_ops()
-                  .attention_f32(hidden.value(), aw, *cfg.attn, cfg.scales ? &*cfg.scales : nullptr,
+                  .attention_f32(ExecContext{}, hidden.value(), aw, *cfg.attn, cfg.scales ? &*cfg.scales : nullptr,
                                  cfg.max_seq_length, cfg.hidden_size, view.value(),
                                  /*past_len=*/0, out.value())
                   .ok());
@@ -285,7 +286,7 @@ TEST(FalconH1Attn, PrefillWritesKvAndDecodeAppends) {
   StatusOr<Tensor> out1 = allocate_f32_tensor({D});
   ASSERT_TRUE(out1.ok());
   ASSERT_TRUE(cpu_ops()
-                  .attention_f32(one.value(), aw, *cfg.attn, cfg.scales ? &*cfg.scales : nullptr,
+                  .attention_f32(ExecContext{}, one.value(), aw, *cfg.attn, cfg.scales ? &*cfg.scales : nullptr,
                                  cfg.max_seq_length, cfg.hidden_size, view.value(), /*past_len=*/T,
                                  out1.value())
                   .ok());
@@ -316,7 +317,7 @@ TEST(FalconH1Runner, PrefillReturnsVocabLogits) {
   const int32_t tokens[] = {1, 2, 3};
   StatusOr<Tensor> logits = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    return runner.prefill(tokens, layers.value());
+    return runner.prefill(ExecContext{}, tokens, layers.value());
   }();
   ASSERT_TRUE(logits.ok()) << logits.status().message();
   ASSERT_EQ(logits.value().shape.size(), 1u);
@@ -343,12 +344,12 @@ TEST(FalconH1Runner, PrefillThenDecode) {
   const int32_t prompt[] = {1, 2};
   StatusOr<Tensor> d0 = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    StatusOr<Tensor> pref = runner.prefill(prompt, layers.value());
+    StatusOr<Tensor> pref = runner.prefill(ExecContext{}, prompt, layers.value());
     if (!pref.ok())
       return pref.status();
     if (Status s = pool->set_seq_len(handle, 2); !s.ok())
       return s;
-    return runner.decode(/*token=*/3, layers.value(), /*past_len=*/2);
+    return runner.decode(ExecContext{}, /*token=*/3, layers.value(), /*past_len=*/2);
   }();
   ASSERT_TRUE(d0.ok()) << d0.status().message();
   ASSERT_EQ(d0.value().shape.size(), 1u);
@@ -356,7 +357,7 @@ TEST(FalconH1Runner, PrefillThenDecode) {
 
   StatusOr<Tensor> d1 = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    return runner.decode(/*token=*/4, layers.value(), /*past_len=*/3);
+    return runner.decode(ExecContext{}, /*token=*/4, layers.value(), /*past_len=*/3);
   }();
   ASSERT_TRUE(d1.ok()) << d1.status().message();
 
@@ -378,7 +379,7 @@ TEST(FalconH1Runner, PrefillEmptyTokensFails) {
 
   StatusOr<Tensor> result = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    return runner_or.value()->prefill({}, layers.value());
+    return runner_or.value()->prefill(ExecContext{}, {}, layers.value());
   }();
   EXPECT_FALSE(result.ok());
   ASSERT_TRUE(pool->release(handle).ok());
@@ -412,7 +413,7 @@ TEST(FalconH1Runner, RegistryLoadsRealCheckpointPrefillDecode) {
   const int32_t tokens[] = {1, 2};
   StatusOr<Tensor> pref = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    return runner_or.value()->prefill(tokens, layers.value());
+    return runner_or.value()->prefill(ExecContext{}, tokens, layers.value());
   }();
   ASSERT_TRUE(pref.ok()) << pref.status().message();
   ASSERT_EQ(pref.value().shape.size(), 1u);
@@ -421,7 +422,7 @@ TEST(FalconH1Runner, RegistryLoadsRealCheckpointPrefillDecode) {
   ASSERT_TRUE(pool->set_seq_len(handle, 2).ok());
   StatusOr<Tensor> dec = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    return runner_or.value()->decode(/*token=*/3, layers.value(), /*past_len=*/2);
+    return runner_or.value()->decode(ExecContext{}, /*token=*/3, layers.value(), /*past_len=*/2);
   }();
   ASSERT_TRUE(dec.ok()) << dec.status().message();
   EXPECT_EQ(dec.value().shape[0], entry.cfg->vocab_size);

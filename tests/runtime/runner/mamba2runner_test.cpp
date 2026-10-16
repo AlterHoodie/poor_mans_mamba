@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "core/device.h"
 #include "ops/backend.h"
 #include "ops/cpu/map.h"
@@ -138,7 +139,7 @@ TEST(Mamba2Runner, PrefillReturnsVocabLogits) {
   const int32_t tokens[] = {1, 2, 3};
   StatusOr<Tensor> logits = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    return runner.prefill(tokens, layers.value());
+    return runner.prefill(ExecContext{}, tokens, layers.value());
   }();
   ASSERT_TRUE(logits.ok()) << logits.status().message();
   ASSERT_EQ(logits.value().shape.size(), 1u);
@@ -165,10 +166,10 @@ TEST(Mamba2Runner, DecodeReusesHandleAndReturnsLogits) {
   const int32_t prompt[] = {1, 2};
   StatusOr<Tensor> dec = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    StatusOr<Tensor> pref = runner.prefill(prompt, layers.value());
+    StatusOr<Tensor> pref = runner.prefill(ExecContext{}, prompt, layers.value());
     if (!pref.ok())
       return pref.status();
-    return runner.decode(/*token=*/3, layers.value(), /*past_len=*/2);
+    return runner.decode(ExecContext{}, /*token=*/3, layers.value(), /*past_len=*/2);
   }();
   ASSERT_TRUE(dec.ok()) << dec.status().message();
   ASSERT_EQ(dec.value().shape.size(), 1u);
@@ -192,7 +193,7 @@ TEST(Mamba2Runner, PrefillEmptyTokensFails) {
 
   StatusOr<Tensor> result = [&]() -> StatusOr<Tensor> {
     AllocatorScope scope(alloc.get());
-    return runner_or.value()->prefill({}, layers.value());
+    return runner_or.value()->prefill(ExecContext{}, {}, layers.value());
   }();
   EXPECT_FALSE(result.ok());
   ASSERT_TRUE(pool->release(handle).ok());

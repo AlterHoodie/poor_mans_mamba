@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "io/config.h"
 #include "ops/backend.h"
 #include "ops/gpu/gpu_test_utils.h"
@@ -38,7 +39,7 @@ TEST_F(GpuTest, MlpMatchesCpu) {
     Tensor down = make_cpu_f32({D, F}, down_h);
     cpu_out = make_cpu_f32({T, D}, fill_vec(static_cast<size_t>(T * D), 0.f));
     MlpWeights w{.up_proj = up, .gate_proj = gate, .down_proj = down};
-    ASSERT_TRUE(cpu_ops().mlp_f32(hidden, w, mlp, &scales, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().mlp_f32(ExecContext{}, hidden, w, mlp, &scales, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -50,7 +51,7 @@ TEST_F(GpuTest, MlpMatchesCpu) {
     Tensor down = make_gpu_f32({D, F}, down_h);
     Tensor out = make_gpu_f32({T, D}, fill_vec(static_cast<size_t>(T * D), 0.f));
     MlpWeights w{.up_proj = up, .gate_proj = gate, .down_proj = down};
-    ASSERT_TRUE(cuda_ops().mlp_f32(hidden, w, mlp, &scales, out).ok());
+    ASSERT_TRUE(cuda_ops().mlp_f32(ExecContext{}, hidden, w, mlp, &scales, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }

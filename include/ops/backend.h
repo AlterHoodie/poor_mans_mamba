@@ -4,6 +4,7 @@
 #include "core/status.h"
 #include "core/tensor.h"
 #include "io/config.h"
+#include "ops/exec_context.h"
 #include "runtime/cache/cache_layout.h"
 
 #include <cstdint>
@@ -45,37 +46,42 @@ public:
   Device device() const { return device_; }
 
   // blocks
-  virtual Status attention_f32(const Tensor& normed_hidden, const AttnWeights& w,
-                               const AttnConfig& attn, const ScaleConfig* scales,
-                               int max_seq_length, int hidden_size, LayerCacheView& cache,
-                               int64_t past_len, Tensor& out) const = 0;
+  virtual Status attention_f32(const ExecContext& ctx, const Tensor& normed_hidden,
+                               const AttnWeights& w, const AttnConfig& attn,
+                               const ScaleConfig* scales, int max_seq_length, int hidden_size,
+                               LayerCacheView& cache, int64_t past_len, Tensor& out) const = 0;
 
-  virtual Status mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2MixerWeights& w,
-                                  const SsmConfig& ssm, const ScaleConfig* scales,
-                                  float rms_norm_eps, LayerCacheView& cache, Tensor& out) const = 0;
+  virtual Status mamba2_mixer_f32(const ExecContext& ctx, const Tensor& normed_hidden,
+                                  const Mamba2MixerWeights& w, const SsmConfig& ssm,
+                                  const ScaleConfig* scales, float rms_norm_eps,
+                                  LayerCacheView& cache, Tensor& out) const = 0;
 
-  virtual Status mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, const MlpConfig& mlp,
-                         const ScaleConfig* scales, Tensor& out) const = 0;
+  virtual Status mlp_f32(const ExecContext& ctx, const Tensor& normed_hidden, const MlpWeights& w,
+                         const MlpConfig& mlp, const ScaleConfig* scales, Tensor& out) const = 0;
 
   // glue
-  virtual Status rms_norm(const Tensor& x, const Tensor& weight, float eps, Tensor& out) const = 0;
-  virtual Status add(const Tensor& a, const Tensor& b, Tensor& out) const = 0;
-  virtual Status scale(Tensor& x, float s) const = 0;
+  virtual Status rms_norm(const ExecContext& ctx, const Tensor& x, const Tensor& weight, float eps,
+                          Tensor& out) const = 0;
+  virtual Status add(const ExecContext& ctx, const Tensor& a, const Tensor& b,
+                     Tensor& out) const = 0;
+  virtual Status scale(const ExecContext& ctx, Tensor& x, float s) const = 0;
 
   // y = x @ W^T  with W stored as [N, K]
-  virtual Status linear(const Tensor& x, const Tensor& W, Tensor& out) const = 0;
+  virtual Status linear(const ExecContext& ctx, const Tensor& x, const Tensor& W,
+                        Tensor& out) const = 0;
 
   // out [T, H] = scale * table[tokens[t]]
-  virtual Status embedding_lookup(const Tensor& table, const int32_t* tokens, int64_t n_tokens,
-                                  float scale, Tensor& out) const = 0;
+  virtual Status embedding_lookup(const ExecContext& ctx, const Tensor& table,
+                                  const int32_t* tokens, int64_t n_tokens, float scale,
+                                  Tensor& out) const = 0;
 
   // rank-1: copy hidden into out; rank-2 [T,H]: copy last row into out {H}
-  virtual Status take_last_row(const Tensor& hidden, Tensor& out) const = 0;
+  virtual Status take_last_row(const ExecContext& ctx, const Tensor& hidden, Tensor& out) const = 0;
 };
 
 const OpsBackend& cpu_ops();
 #ifdef MAMBASERVE_WITH_CUDA
-// Per-device backend (cuBLAS handle is device-bound). Default 0 for single-GPU tests.
+// Per-device backend (fallback cuBLAS when ExecContext.cublas is null). Default 0 for tests.
 const OpsBackend& cuda_ops(int device_id = 0);
 #endif
 const OpsBackend& ops_for(Device d, int device_id = 0);

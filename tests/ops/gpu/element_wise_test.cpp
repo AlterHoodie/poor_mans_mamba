@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "ops/backend.h"
 #include "ops/gpu/gpu_test_utils.h"
 
@@ -17,7 +18,7 @@ TEST_F(GpuTest, AddMatchesCpu) {
     Tensor a = make_cpu_f32({3}, a_h);
     Tensor b = make_cpu_f32({3}, b_h);
     cpu_out = make_cpu_f32({3}, {0.f, 0.f, 0.f});
-    ASSERT_TRUE(cpu_ops().add(a, b, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().add(ExecContext{}, a, b, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -26,7 +27,7 @@ TEST_F(GpuTest, AddMatchesCpu) {
     Tensor a = make_gpu_f32({3}, a_h);
     Tensor b = make_gpu_f32({3}, b_h);
     Tensor out = make_gpu_f32({3}, {0.f, 0.f, 0.f});
-    ASSERT_TRUE(cuda_ops().add(a, b, out).ok());
+    ASSERT_TRUE(cuda_ops().add(ExecContext{}, a, b, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }
@@ -42,14 +43,14 @@ TEST_F(GpuTest, ScaleMatchesCpu) {
   {
     AllocatorScope scope(cpu_alloc_.get());
     cpu_x = make_cpu_f32({3}, x_h);
-    ASSERT_TRUE(cpu_ops().scale(cpu_x, s).ok());
+    ASSERT_TRUE(cpu_ops().scale(ExecContext{}, cpu_x, s).ok());
   }
 
   std::vector<float> gpu_h;
   {
     AllocatorScope scope(gpu_alloc_.get());
     Tensor x = make_gpu_f32({3}, x_h);
-    ASSERT_TRUE(cuda_ops().scale(x, s).ok());
+    ASSERT_TRUE(cuda_ops().scale(ExecContext{}, x, s).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(x);
   }
@@ -62,5 +63,5 @@ TEST_F(GpuTest, AddShapeMismatchFails) {
   Tensor a = make_gpu_f32({2}, {1.f, 2.f});
   Tensor b = make_gpu_f32({3}, {1.f, 2.f, 3.f});
   Tensor out = make_gpu_f32({2}, {0.f, 0.f});
-  EXPECT_FALSE(cuda_ops().add(a, b, out).ok());
+  EXPECT_FALSE(cuda_ops().add(ExecContext{}, a, b, out).ok());
 }

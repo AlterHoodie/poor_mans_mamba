@@ -4,6 +4,7 @@
 #include "ops/cpu/linear.h"
 #include "ops/cpu/map.h"
 #include "ops/cpu/rms_norm.h"
+#include "ops/exec_context.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -44,10 +45,11 @@ void CPUBackend::apply_rope_inplace_(float* q, float* k, int64_t T, int Hq, int 
   rope_one(k, Hkv);
 }
 
-Status CPUBackend::attention_f32(const Tensor& normed_hidden, const AttnWeights& w,
-                                 const AttnConfig& attn, const ScaleConfig* scales,
-                                 int max_seq_length, int hidden_size, LayerCacheView& cache,
-                                 int64_t past_len, Tensor& out) const {
+Status CPUBackend::attention_f32(const ExecContext& ctx, const Tensor& normed_hidden,
+                                 const AttnWeights& w, const AttnConfig& attn,
+                                 const ScaleConfig* scales, int max_seq_length, int hidden_size,
+                                 LayerCacheView& cache, int64_t past_len, Tensor& out) const {
+  (void)ctx;
   if (Status s = require_f32(normed_hidden, "normed_hidden", Device::CPU); !s.ok())
     return s;
   if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
@@ -194,9 +196,9 @@ Status CPUBackend::attention_f32(const Tensor& normed_hidden, const AttnWeights&
 
   if (normed_hidden.size() == 1) {
     attn_out.value().shape = {q_dim};
-    return linear(attn_out.value(), w.o_proj, out);
+    return linear(ctx, attn_out.value(), w.o_proj, out);
   }
-  return linear(attn_out.value(), w.o_proj, out);
+  return linear(ctx, attn_out.value(), w.o_proj, out);
 }
 
 Status CPUBackend::mamba2_ssm_scan_f32_(const float* x, const float* B, const float* C,
@@ -301,9 +303,11 @@ Status CPUBackend::rms_norm_gated_f32_(Tensor& y, const Tensor& gate, const Tens
   return rms_norm_inplace(y, weight, eps);
 }
 
-Status CPUBackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2MixerWeights& w,
-                                    const SsmConfig& ssm, const ScaleConfig* scales,
-                                    float rms_norm_eps, LayerCacheView& cache, Tensor& out) const {
+Status CPUBackend::mamba2_mixer_f32(const ExecContext& ctx, const Tensor& normed_hidden,
+                                    const Mamba2MixerWeights& w, const SsmConfig& ssm,
+                                    const ScaleConfig* scales, float rms_norm_eps,
+                                    LayerCacheView& cache, Tensor& out) const {
+  (void)ctx;
   if (Status s = require_f32(normed_hidden, "normed_hidden", Device::CPU); !s.ok())
     return s;
   if (Status s = require_f32(out, "out", Device::CPU); !s.ok())
@@ -482,13 +486,14 @@ Status CPUBackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mix
 
   if (normed_hidden.size() == 1) {
     y.value().shape = {I};
-    return linear(y.value(), w.out_proj, out);
+    return linear(ctx, y.value(), w.out_proj, out);
   }
-  return linear(y.value(), w.out_proj, out);
+  return linear(ctx, y.value(), w.out_proj, out);
 }
 
-Status CPUBackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, const MlpConfig& mlp,
-                           const ScaleConfig* scales, Tensor& out) const {
+Status CPUBackend::mlp_f32(const ExecContext& ctx, const Tensor& normed_hidden, const MlpWeights& w,
+                           const MlpConfig& mlp, const ScaleConfig* scales, Tensor& out) const {
+  (void)ctx;
   (void)mlp;
   if (Status s = require_f32(normed_hidden, "normed_hidden", Device::CPU); !s.ok())
     return s;
@@ -517,7 +522,7 @@ Status CPUBackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, con
   if (Status s = mul(up.value(), gate_act.value(), up.value()); !s.ok())
     return s;
 
-  if (Status s = linear(up.value(), w.down_proj, out); !s.ok())
+  if (Status s = linear(ctx, up.value(), w.down_proj, out); !s.ok())
     return s;
 
   auto o = as_vec_f32(out);
@@ -525,27 +530,36 @@ Status CPUBackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, con
   return Status::Ok();
 }
 
-Status CPUBackend::rms_norm(const Tensor& x, const Tensor& weight, float eps, Tensor& out) const {
+Status CPUBackend::rms_norm(const ExecContext& ctx, const Tensor& x, const Tensor& weight,
+                            float eps, Tensor& out) const {
+  (void)ctx;
   return ::rms_norm(x, weight, eps, out);
 }
 
-Status CPUBackend::add(const Tensor& a, const Tensor& b, Tensor& out) const {
+Status CPUBackend::add(const ExecContext& ctx, const Tensor& a, const Tensor& b,
+                       Tensor& out) const {
+  (void)ctx;
   return ::add(a, b, out);
 }
 
-Status CPUBackend::scale(Tensor& x, float s) const {
+Status CPUBackend::scale(const ExecContext& ctx, Tensor& x, float s) const {
+  (void)ctx;
   if (Status st = require_f32(x, "x", Device::CPU); !st.ok())
     return st;
   as_vec_f32(x) *= s;
   return Status::Ok();
 }
 
-Status CPUBackend::linear(const Tensor& x, const Tensor& W, Tensor& out) const {
+Status CPUBackend::linear(const ExecContext& ctx, const Tensor& x, const Tensor& W,
+                          Tensor& out) const {
+  (void)ctx;
   return ::linear(x, W, out);
 }
 
-Status CPUBackend::embedding_lookup(const Tensor& table, const int32_t* tokens, int64_t n_tokens,
-                                    float scale, Tensor& out) const {
+Status CPUBackend::embedding_lookup(const ExecContext& ctx, const Tensor& table,
+                                    const int32_t* tokens, int64_t n_tokens, float scale,
+                                    Tensor& out) const {
+  (void)ctx;
   if (tokens == nullptr || n_tokens <= 0)
     return Status::InvalidArgument("embedding_lookup requires at least one token");
   if (Status s = require_f32(table, "table", Device::CPU); !s.ok())
@@ -567,13 +581,13 @@ Status CPUBackend::embedding_lookup(const Tensor& table, const int32_t* tokens, 
     const int32_t id = tokens[i];
     if (id < 0 || static_cast<int64_t>(id) >= vocab)
       return Status::InvalidArgument("token id out of range");
-    dest.row(static_cast<Eigen::Index>(i)) =
-        emb.row(static_cast<Eigen::Index>(id)) * scale;
+    dest.row(static_cast<Eigen::Index>(i)) = emb.row(static_cast<Eigen::Index>(id)) * scale;
   }
   return Status::Ok();
 }
 
-Status CPUBackend::take_last_row(const Tensor& hidden, Tensor& out) const {
+Status CPUBackend::take_last_row(const ExecContext& ctx, const Tensor& hidden, Tensor& out) const {
+  (void)ctx;
   if (Status s = require_f32(hidden, "hidden", Device::CPU); !s.ok())
     return s;
   if (Status s = require_f32(out, "out", Device::CPU); !s.ok())

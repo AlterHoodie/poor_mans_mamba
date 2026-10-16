@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "ops/backend.h"
 #include "ops/gpu/gpu_test_utils.h"
 
@@ -24,7 +25,7 @@ TEST_F(GpuTest, EmbeddingLookupMatchesCpu) {
     AllocatorScope scope(cpu_alloc_.get());
     Tensor table = make_cpu_f32({4, 3}, table_h);
     cpu_out = make_cpu_f32({3, 3}, std::vector<float>(9, 0.f));
-    ASSERT_TRUE(cpu_ops().embedding_lookup(table, tokens, 3, scale, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().embedding_lookup(ExecContext{}, table, tokens, 3, scale, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -32,7 +33,7 @@ TEST_F(GpuTest, EmbeddingLookupMatchesCpu) {
     AllocatorScope scope(gpu_alloc_.get());
     Tensor table = make_gpu_f32({4, 3}, table_h);
     Tensor out = make_gpu_f32({3, 3}, std::vector<float>(9, 0.f));
-    ASSERT_TRUE(cuda_ops().embedding_lookup(table, tokens, 3, scale, out).ok());
+    ASSERT_TRUE(cuda_ops().embedding_lookup(ExecContext{}, table, tokens, 3, scale, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }
@@ -48,7 +49,7 @@ TEST_F(GpuTest, TakeLastRowMatchesCpu) {
     AllocatorScope scope(cpu_alloc_.get());
     Tensor hidden = make_cpu_f32({3, 2}, hidden_h);
     cpu_out = make_cpu_f32({2}, {0.f, 0.f});
-    ASSERT_TRUE(cpu_ops().take_last_row(hidden, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().take_last_row(ExecContext{}, hidden, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -56,7 +57,7 @@ TEST_F(GpuTest, TakeLastRowMatchesCpu) {
     AllocatorScope scope(gpu_alloc_.get());
     Tensor hidden = make_gpu_f32({3, 2}, hidden_h);
     Tensor out = make_gpu_f32({2}, {0.f, 0.f});
-    ASSERT_TRUE(cuda_ops().take_last_row(hidden, out).ok());
+    ASSERT_TRUE(cuda_ops().take_last_row(ExecContext{}, hidden, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }
@@ -72,7 +73,7 @@ TEST_F(GpuTest, TakeLastRowRank1MatchesCpu) {
     AllocatorScope scope(cpu_alloc_.get());
     Tensor hidden = make_cpu_f32({3}, hidden_h);
     cpu_out = make_cpu_f32({3}, {0.f, 0.f, 0.f});
-    ASSERT_TRUE(cpu_ops().take_last_row(hidden, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().take_last_row(ExecContext{}, hidden, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -80,7 +81,7 @@ TEST_F(GpuTest, TakeLastRowRank1MatchesCpu) {
     AllocatorScope scope(gpu_alloc_.get());
     Tensor hidden = make_gpu_f32({3}, hidden_h);
     Tensor out = make_gpu_f32({3}, {0.f, 0.f, 0.f});
-    ASSERT_TRUE(cuda_ops().take_last_row(hidden, out).ok());
+    ASSERT_TRUE(cuda_ops().take_last_row(ExecContext{}, hidden, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }

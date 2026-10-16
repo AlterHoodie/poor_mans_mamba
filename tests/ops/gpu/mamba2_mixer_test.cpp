@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "io/config.h"
 #include "ops/backend.h"
 #include "ops/gpu/gpu_test_utils.h"
@@ -124,7 +125,7 @@ TEST_F(GpuTest, Mamba2MixerMatchesCpu) {
                           .D = D_t,
                           .mixer_norm = nullptr};
     ASSERT_TRUE(cpu_ops()
-                    .mamba2_mixer_f32(hidden, mw, cfg.ssm, cfg.scales ? &*cfg.scales : nullptr,
+                    .mamba2_mixer_f32(ExecContext{}, hidden, mw, cfg.ssm, cfg.scales ? &*cfg.scales : nullptr,
                                       cfg.rms_norm_eps, view.value(), cpu_out)
                     .ok());
 
@@ -170,7 +171,7 @@ TEST_F(GpuTest, Mamba2MixerMatchesCpu) {
                           .D = D_t,
                           .mixer_norm = nullptr};
     ASSERT_TRUE(cuda_ops()
-                    .mamba2_mixer_f32(hidden, mw, cfg.ssm, cfg.scales ? &*cfg.scales : nullptr,
+                    .mamba2_mixer_f32(ExecContext{}, hidden, mw, cfg.ssm, cfg.scales ? &*cfg.scales : nullptr,
                                       cfg.rms_norm_eps, view.value(), out)
                     .ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);

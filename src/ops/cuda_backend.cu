@@ -92,7 +92,19 @@ Status CUDABackend::ensure_cublas_() const {
   return Status::Ok();
 }
 
-Status CUDABackend::rms_norm(const Tensor& x, const Tensor& weight, float eps, Tensor& out) const {
+cublasHandle_t CUDABackend::cublas_of_(const ExecContext& ctx) const {
+  if (ctx.cublas)
+    return static_cast<cublasHandle_t>(ctx.cublas);
+  return handle_;
+}
+
+namespace {
+inline cudaStream_t stream_of(const ExecContext& ctx) {
+  return static_cast<cudaStream_t>(ctx.stream);
+}
+} // namespace
+
+Status CUDABackend::rms_norm(const ExecContext& ctx, const Tensor& x, const Tensor& weight, float eps, Tensor& out) const {
   if (Status s = bind_device_(); !s.ok())
     return s;
     if (Status s = require_f32(x, "x", Device::GPU); !s.ok())
@@ -113,14 +125,14 @@ Status CUDABackend::rms_norm(const Tensor& x, const Tensor& weight, float eps, T
     const int rows = static_cast<int>(numel / N);
     const int n = static_cast<int>(N);
 
-    ::rms_norm<<<rows, block_size_>>>(static_cast<const float*>(x.buffer.ptr),
+    ::rms_norm<<<rows, block_size_, 0, stream_of(ctx)>>>(static_cast<const float*>(x.buffer.ptr),
                                       static_cast<float*>(out.buffer.ptr),
                                       static_cast<const float*>(weight.buffer.ptr), n, eps);
 
     return Status::Ok();
 }
 
-Status CUDABackend::add(const Tensor& a, const Tensor& b, Tensor& out) const {
+Status CUDABackend::add(const ExecContext& ctx, const Tensor& a, const Tensor& b, Tensor& out) const {
   if (Status s = bind_device_(); !s.ok())
     return s;
     if (Status s = require_f32(a, "a", Device::GPU); !s.ok())
@@ -141,13 +153,13 @@ Status CUDABackend::add(const Tensor& a, const Tensor& b, Tensor& out) const {
     const int n = static_cast<int>(numel);
     const int grid = (n + block_size_ - 1) / block_size_;
 
-    ::add<<<grid, block_size_>>>(static_cast<const float*>(a.buffer.ptr),
+    ::add<<<grid, block_size_, 0, stream_of(ctx)>>>(static_cast<const float*>(a.buffer.ptr),
                                  static_cast<const float*>(b.buffer.ptr),
                                  static_cast<float*>(out.buffer.ptr), n);
     return Status::Ok();
 }
 
-Status CUDABackend::scale(Tensor& x, float s) const {
+Status CUDABackend::scale(const ExecContext& ctx, Tensor& x, float s) const {
   if (Status s_bind = bind_device_(); !s_bind.ok())
     return s_bind;
     if (Status st = require_f32(x, "x", Device::GPU); !st.ok())
@@ -158,17 +170,20 @@ Status CUDABackend::scale(Tensor& x, float s) const {
     const int n = static_cast<int>(numel);
     const int grid = (n + block_size_ - 1) / block_size_;
 
-    ::scale<<<grid, block_size_>>>(static_cast<float*>(x.buffer.ptr), s, n);
+    ::scale<<<grid, block_size_, 0, stream_of(ctx)>>>(static_cast<float*>(x.buffer.ptr), s, n);
     return Status::Ok();
 }
 
-Status CUDABackend::linear(const Tensor& x, const Tensor& W, Tensor& out) const {
-  if (Status s = ensure_cublas_(); !s.ok())
+Status CUDABackend::linear(const ExecContext& ctx, const Tensor& x, const Tensor& W, Tensor& out) const {
+  if (!ctx.cublas) {
+    if (Status s = ensure_cublas_(); !s.ok())
+      return s;
+  } else if (Status s = bind_device_(); !s.ok())
     return s;
-  return gpu_linear(handle_, x, W, out);
+  return gpu_linear(cublas_of_(ctx), x, W, out);
 }
 
-Status CUDABackend::embedding_lookup(const Tensor& table, const int32_t* tokens, int64_t n_tokens,
+Status CUDABackend::embedding_lookup(const ExecContext& ctx, const Tensor& table, const int32_t* tokens, int64_t n_tokens,
                                      float scale, Tensor& out) const {
   if (tokens == nullptr || n_tokens <= 0)
     return Status::InvalidArgument("embedding_lookup requires at least one token");
@@ -199,7 +214,8 @@ Status CUDABackend::embedding_lookup(const Tensor& table, const int32_t* tokens,
   if (err != cudaSuccess)
     return Status::OOM("cudaMalloc tokens for embedding_lookup failed");
 
-  err = cudaMemcpy(d_tokens, tokens, tok_bytes, cudaMemcpyHostToDevice);
+  const cudaStream_t stream = stream_of(ctx);
+  err = cudaMemcpyAsync(d_tokens, tokens, tok_bytes, cudaMemcpyHostToDevice, stream);
   if (err != cudaSuccess) {
     cudaFree(d_tokens);
     return Status::RuntimeError(std::string("cudaMemcpy H2D tokens failed: ") +
@@ -208,7 +224,9 @@ Status CUDABackend::embedding_lookup(const Tensor& table, const int32_t* tokens,
 
   err = embedding_lookup_f32(static_cast<const float*>(table.buffer.ptr), d_tokens,
                              static_cast<float*>(out.buffer.ptr), T, static_cast<int>(hidden),
-                             static_cast<int>(vocab), scale, block_size_);
+                             static_cast<int>(vocab), scale, stream, block_size_);
+  // tokens buffer must outlive the kernel; sync this stream before free.
+  cudaStreamSynchronize(stream);
   cudaFree(d_tokens);
   if (err != cudaSuccess)
     return Status::RuntimeError(std::string("embedding_lookup_f32 failed: ") +
@@ -216,7 +234,7 @@ Status CUDABackend::embedding_lookup(const Tensor& table, const int32_t* tokens,
   return Status::Ok();
 }
 
-Status CUDABackend::take_last_row(const Tensor& hidden, Tensor& out) const {
+Status CUDABackend::take_last_row(const ExecContext& ctx, const Tensor& hidden, Tensor& out) const {
   if (Status s = bind_device_(); !s.ok())
     return s;
   if (Status s = require_f32(hidden, "hidden", Device::GPU); !s.ok())
@@ -230,7 +248,7 @@ Status CUDABackend::take_last_row(const Tensor& hidden, Tensor& out) const {
     if (!same_shape(out.shape, hidden.shape))
       return Status::InvalidArgument("out shape must match rank-1 hidden");
     cudaError_t err =
-        cudaMemcpy(out.buffer.ptr, hidden.buffer.ptr, hidden.buffer.bytes, cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(out.buffer.ptr, hidden.buffer.ptr, hidden.buffer.bytes, cudaMemcpyDeviceToDevice, stream_of(ctx));
     if (err != cudaSuccess)
       return Status::RuntimeError(std::string("cudaMemcpy D2D failed: ") +
                                      cudaGetErrorString(err));
@@ -248,18 +266,21 @@ Status CUDABackend::take_last_row(const Tensor& hidden, Tensor& out) const {
 
   const float* src = static_cast<const float*>(hidden.buffer.ptr) +
                      static_cast<size_t>(rows - 1) * static_cast<size_t>(cols);
-  cudaError_t err = cudaMemcpy(out.buffer.ptr, src, static_cast<size_t>(cols) * sizeof(float),
-                               cudaMemcpyDeviceToDevice);
+  cudaError_t err = cudaMemcpyAsync(out.buffer.ptr, src, static_cast<size_t>(cols) * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream_of(ctx));
   if (err != cudaSuccess)
     return Status::RuntimeError(std::string("cudaMemcpy D2D last row failed: ") +
                                    cudaGetErrorString(err));
   return Status::Ok();
 }
 
-Status CUDABackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, const MlpConfig& mlp,
+Status CUDABackend::mlp_f32(const ExecContext& ctx, const Tensor& normed_hidden, const MlpWeights& w, const MlpConfig& mlp,
                             const ScaleConfig* scales, Tensor& out) const {
   (void)mlp;
-  if (Status s = ensure_cublas_(); !s.ok())
+  if (!ctx.cublas) {
+    if (Status s = ensure_cublas_(); !s.ok())
+      return s;
+  } else if (Status s = bind_device_(); !s.ok())
     return s;
   if (Status s = require_f32(normed_hidden, "normed_hidden", Device::GPU); !s.ok())
     return s;
@@ -285,9 +306,9 @@ Status CUDABackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, co
     return Status(gate_or.status());
   Tensor gate = std::move(gate_or.value());
 
-  if (Status s = gpu_linear(handle_, normed_hidden, w.up_proj, up); !s.ok())
+  if (Status s = gpu_linear(cublas_of_(ctx), normed_hidden, w.up_proj, up); !s.ok())
     return s;
-  if (Status s = gpu_linear(handle_, normed_hidden, w.gate_proj, gate); !s.ok())
+  if (Status s = gpu_linear(cublas_of_(ctx), normed_hidden, w.gate_proj, gate); !s.ok())
     return s;
 
   int64_t mid_numel = 0;
@@ -296,28 +317,28 @@ Status CUDABackend::mlp_f32(const Tensor& normed_hidden, const MlpWeights& w, co
   const int grid = (n + block_size_ - 1) / block_size_;
 
   if (gate_mult != 1.f) {
-    if (Status s = scale(gate, gate_mult); !s.ok())
+    if (Status s = scale(ctx, gate, gate_mult); !s.ok())
       return s;
   }
 
-  ::silu<<<grid, block_size_>>>(static_cast<float*>(gate.buffer.ptr), n);
+  ::silu<<<grid, block_size_, 0, stream_of(ctx)>>>(static_cast<float*>(gate.buffer.ptr), n);
 
-  ::mul<<<grid, block_size_>>>(static_cast<const float*>(up.buffer.ptr),
+  ::mul<<<grid, block_size_, 0, stream_of(ctx)>>>(static_cast<const float*>(up.buffer.ptr),
                                static_cast<const float*>(gate.buffer.ptr),
                                static_cast<float*>(up.buffer.ptr), n);
 
-  if (Status s = gpu_linear(handle_, up, w.down_proj, out); !s.ok())
+  if (Status s = gpu_linear(cublas_of_(ctx), up, w.down_proj, out); !s.ok())
     return s;
 
   if (down_mult != 1.f) {
-    if (Status s = scale(out, down_mult); !s.ok())
+    if (Status s = scale(ctx, out, down_mult); !s.ok())
       return s;
   }
 
   return Status::Ok();
 }
 
-Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2MixerWeights& w,
+Status CUDABackend::mamba2_mixer_f32(const ExecContext& ctx, const Tensor& normed_hidden, const Mamba2MixerWeights& w,
                                      const SsmConfig& ssm, const ScaleConfig* scales,
                                      float rms_norm_eps, LayerCacheView& cache,
                                      Tensor& out) const {
@@ -391,7 +412,10 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
       return s;
   }
 
-  if (Status s = ensure_cublas_(); !s.ok())
+  if (!ctx.cublas) {
+    if (Status s = ensure_cublas_(); !s.ok())
+      return s;
+  } else if (Status s = bind_device_(); !s.ok())
     return s;
 
   StatusOr<Tensor> scaled_or = alloc_gpu_f32(normed_hidden.shape);
@@ -399,14 +423,14 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
     return Status(scaled_or.status());
   Tensor scaled_hidden = std::move(scaled_or.value());
   if (in_scale != 1.f) {
-    if (cudaMemcpy(scaled_hidden.buffer.ptr, normed_hidden.buffer.ptr, normed_hidden.buffer.bytes,
-                   cudaMemcpyDeviceToDevice) != cudaSuccess)
+    if (cudaMemcpyAsync(scaled_hidden.buffer.ptr, normed_hidden.buffer.ptr, normed_hidden.buffer.bytes,
+                   cudaMemcpyDeviceToDevice, stream_of(ctx)) != cudaSuccess)
       return Status::RuntimeError("cudaMemcpy scaled_hidden failed");
-    if (Status s = scale(scaled_hidden, in_scale); !s.ok())
+    if (Status s = scale(ctx, scaled_hidden, in_scale); !s.ok())
       return s;
   } else {
-    if (cudaMemcpy(scaled_hidden.buffer.ptr, normed_hidden.buffer.ptr, normed_hidden.buffer.bytes,
-                   cudaMemcpyDeviceToDevice) != cudaSuccess)
+    if (cudaMemcpyAsync(scaled_hidden.buffer.ptr, normed_hidden.buffer.ptr, normed_hidden.buffer.bytes,
+                   cudaMemcpyDeviceToDevice, stream_of(ctx)) != cudaSuccess)
       return Status::RuntimeError("cudaMemcpy scaled_hidden failed");
   }
 
@@ -417,7 +441,7 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
   if (!projected_or.ok())
     return Status(projected_or.status());
   Tensor projected = std::move(projected_or.value());
-  if (Status s = gpu_linear(handle_, scaled_hidden, w.in_proj, projected); !s.ok())
+  if (Status s = gpu_linear(cublas_of_(ctx), scaled_hidden, w.in_proj, projected); !s.ok())
     return s;
   if (projected.size() == 1)
     projected.shape = {1, projected.shape[0]};
@@ -437,7 +461,7 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
 
   {
     const int n = static_cast<int>(T) * proj_size;
-    ::mixer_split_proj<<<launch_grid(n, block_size_), block_size_>>>(
+    ::mixer_split_proj<<<launch_grid(n, block_size_), block_size_, 0, stream_of(ctx)>>>(
         static_cast<const float*>(projected.buffer.ptr), static_cast<float*>(gate.buffer.ptr),
         static_cast<float*>(xBC.buffer.ptr), static_cast<float*>(dt.buffer.ptr),
         static_cast<int>(T), I, GN, H, mz, mx, mB, mC, mdt);
@@ -453,7 +477,7 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
 
   const float* conv_b =
       ssm.use_conv_bias ? static_cast<const float*>(w.conv1d_bias.buffer.ptr) : nullptr;
-  ::causal_conv1d<<<launch_grid(conv_dim, block_size_), block_size_>>>(
+  ::causal_conv1d<<<launch_grid(conv_dim, block_size_), block_size_, 0, stream_of(ctx)>>>(
       static_cast<const float*>(xBC.buffer.ptr), T, conv_dim, K,
       static_cast<const float*>(w.conv1d.buffer.ptr), conv_b, static_cast<float*>(cache.conv.ptr),
       static_cast<float*>(xBC_out.buffer.ptr), true);
@@ -469,7 +493,7 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
 
   {
     const int n = static_cast<int>(T) * conv_dim;
-    ::mixer_split_xbc<<<launch_grid(n, block_size_), block_size_>>>(
+    ::mixer_split_xbc<<<launch_grid(n, block_size_), block_size_, 0, stream_of(ctx)>>>(
         static_cast<const float*>(xBC_out.buffer.ptr), static_cast<float*>(x.buffer.ptr),
         static_cast<float*>(B.buffer.ptr), static_cast<float*>(C.buffer.ptr), static_cast<int>(T),
         I, GN);
@@ -480,7 +504,7 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
     return Status(y_or.status());
   Tensor y = std::move(y_or.value());
 
-  ::mamba2_ssm_scan<<<launch_grid(H * Dh, block_size_), block_size_>>>(
+  ::mamba2_ssm_scan<<<launch_grid(H * Dh, block_size_), block_size_, 0, stream_of(ctx)>>>(
       static_cast<const float*>(x.buffer.ptr), static_cast<const float*>(B.buffer.ptr),
       static_cast<const float*>(C.buffer.ptr), static_cast<const float*>(dt.buffer.ptr),
       static_cast<const float*>(w.A_log.buffer.ptr), static_cast<const float*>(w.D.buffer.ptr),
@@ -492,12 +516,12 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
     ASSIGN_OR_RETURN(n64, y.numel());
     const int n = static_cast<int>(n64);
     const int grid = launch_grid(n, block_size_);
-    ::silu<<<grid, block_size_>>>(static_cast<float*>(gate.buffer.ptr), n);
-    ::mul<<<grid, block_size_>>>(static_cast<const float*>(y.buffer.ptr),
+    ::silu<<<grid, block_size_, 0, stream_of(ctx)>>>(static_cast<float*>(gate.buffer.ptr), n);
+    ::mul<<<grid, block_size_, 0, stream_of(ctx)>>>(static_cast<const float*>(y.buffer.ptr),
                                  static_cast<const float*>(gate.buffer.ptr),
                                  static_cast<float*>(y.buffer.ptr), n);
     if (ssm.gated_rms_norm) {
-      if (Status s = rms_norm(y, *w.mixer_norm, rms_norm_eps, y); !s.ok())
+      if (Status s = rms_norm(ctx, y, *w.mixer_norm, rms_norm_eps, y); !s.ok())
         return s;
     }
   }
@@ -507,10 +531,10 @@ Status CUDABackend::mamba2_mixer_f32(const Tensor& normed_hidden, const Mamba2Mi
 
   if (normed_hidden.size() == 1)
     y.shape = {I};
-  return gpu_linear(handle_, y, w.out_proj, out);
+  return gpu_linear(cublas_of_(ctx), y, w.out_proj, out);
 }
 
-Status CUDABackend::attention_f32(const Tensor& normed_hidden, const AttnWeights& w,
+Status CUDABackend::attention_f32(const ExecContext& ctx, const Tensor& normed_hidden, const AttnWeights& w,
                                   const AttnConfig& attn, const ScaleConfig* scales,
                                   int max_seq_length, int hidden_size, LayerCacheView& cache,
                                   int64_t past_len, Tensor& out) const {
@@ -575,7 +599,10 @@ Status CUDABackend::attention_f32(const Tensor& normed_hidden, const AttnWeights
   if (Status s = require_f32(w.o_proj, "o_proj", Device::GPU); !s.ok())
     return s;
 
-  if (Status s = ensure_cublas_(); !s.ok())
+  if (!ctx.cublas) {
+    if (Status s = ensure_cublas_(); !s.ok())
+      return s;
+  } else if (Status s = bind_device_(); !s.ok())
     return s;
 
   StatusOr<std::vector<int64_t>> q_shape_or = linear_output_shape(normed_hidden, w.q_proj);
@@ -601,11 +628,11 @@ Status CUDABackend::attention_f32(const Tensor& normed_hidden, const AttnWeights
   Tensor K = std::move(K_or.value());
   Tensor V = std::move(V_or.value());
 
-  if (Status s = gpu_linear(handle_, normed_hidden, w.q_proj, Q); !s.ok())
+  if (Status s = gpu_linear(cublas_of_(ctx), normed_hidden, w.q_proj, Q); !s.ok())
     return s;
-  if (Status s = gpu_linear(handle_, normed_hidden, w.k_proj, K); !s.ok())
+  if (Status s = gpu_linear(cublas_of_(ctx), normed_hidden, w.k_proj, K); !s.ok())
     return s;
-  if (Status s = gpu_linear(handle_, normed_hidden, w.v_proj, V); !s.ok())
+  if (Status s = gpu_linear(cublas_of_(ctx), normed_hidden, w.v_proj, V); !s.ok())
     return s;
 
   if (Q.size() == 1)
@@ -616,24 +643,24 @@ Status CUDABackend::attention_f32(const Tensor& normed_hidden, const AttnWeights
     V.shape = {1, V.shape[0]};
 
   if (key_mult != 1.f) {
-    if (Status s = scale(K, key_mult); !s.ok())
+    if (Status s = scale(ctx, K, key_mult); !s.ok())
       return s;
   }
 
   {
     const int q_rows = static_cast<int>(T) * Hq;
     const int k_rows = static_cast<int>(T) * Hkv;
-    ::apply_rope<<<launch_grid(q_rows, block_size_), block_size_>>>(
+    ::apply_rope<<<launch_grid(q_rows, block_size_), block_size_, 0, stream_of(ctx)>>>(
         static_cast<float*>(Q.buffer.ptr), static_cast<int>(T), Hq, Dh, static_cast<int>(past_len),
         attn.rope_theta);
-    ::apply_rope<<<launch_grid(k_rows, block_size_), block_size_>>>(
+    ::apply_rope<<<launch_grid(k_rows, block_size_), block_size_, 0, stream_of(ctx)>>>(
         static_cast<float*>(K.buffer.ptr), static_cast<int>(T), Hkv, Dh, static_cast<int>(past_len),
         attn.rope_theta);
   }
 
   {
     const int n = static_cast<int>(T * kv_dim);
-    ::kv_append<<<launch_grid(n, block_size_), block_size_>>>(
+    ::kv_append<<<launch_grid(n, block_size_), block_size_, 0, stream_of(ctx)>>>(
         static_cast<const float*>(K.buffer.ptr), static_cast<const float*>(V.buffer.ptr),
         static_cast<float*>(cache.k.ptr), static_cast<float*>(cache.v.ptr), static_cast<int>(T),
         static_cast<int>(kv_dim), static_cast<int>(past_len));
@@ -646,14 +673,14 @@ Status CUDABackend::attention_f32(const Tensor& normed_hidden, const AttnWeights
 
   const float attn_scale = 1.f / std::sqrt(static_cast<float>(Dh));
   const size_t shmem = static_cast<size_t>(past_len + T) * sizeof(float);
-  ::causal_attention_fused<<<static_cast<int>(T) * Hq, block_size_, shmem>>>(
+  ::causal_attention_fused<<<static_cast<int>(T) * Hq, block_size_, shmem, stream_of(ctx)>>>(
       static_cast<const float*>(Q.buffer.ptr), static_cast<const float*>(cache.k.ptr),
       static_cast<const float*>(cache.v.ptr), static_cast<float*>(attn_out.buffer.ptr),
       static_cast<int>(T), Hq, Hkv, Dh, static_cast<int>(past_len), attn_scale);
 
   if (normed_hidden.size() == 1)
     attn_out.shape = {q_dim};
-  return gpu_linear(handle_, attn_out, w.o_proj, out);
+  return gpu_linear(cublas_of_(ctx), attn_out, w.o_proj, out);
 }
 
 const OpsBackend& cuda_ops(int device_id) {

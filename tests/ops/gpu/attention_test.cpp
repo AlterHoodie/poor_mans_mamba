@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "io/config.h"
 #include "ops/backend.h"
 #include "ops/gpu/gpu_test_utils.h"
@@ -105,7 +106,7 @@ TEST_F(GpuTest, AttentionPrefillMatchesCpu) {
 
     AttnWeights aw{.q_proj = q_proj, .k_proj = k_proj, .v_proj = v_proj, .o_proj = o_proj};
     ASSERT_TRUE(cpu_ops()
-                    .attention_f32(hidden, aw, *cfg.attn, cfg.scales ? &*cfg.scales : nullptr,
+                    .attention_f32(ExecContext{}, hidden, aw, *cfg.attn, cfg.scales ? &*cfg.scales : nullptr,
                                    cfg.max_seq_length, cfg.hidden_size, view.value(),
                                    /*past_len=*/0, cpu_out)
                     .ok());
@@ -140,7 +141,7 @@ TEST_F(GpuTest, AttentionPrefillMatchesCpu) {
 
     AttnWeights aw{.q_proj = q_proj, .k_proj = k_proj, .v_proj = v_proj, .o_proj = o_proj};
     ASSERT_TRUE(cuda_ops()
-                    .attention_f32(hidden, aw, *cfg.attn, cfg.scales ? &*cfg.scales : nullptr,
+                    .attention_f32(ExecContext{}, hidden, aw, *cfg.attn, cfg.scales ? &*cfg.scales : nullptr,
                                    cfg.max_seq_length, cfg.hidden_size, view.value(),
                                    /*past_len=*/0, out)
                     .ok());

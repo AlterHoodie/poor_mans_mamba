@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "ops/backend.h"
 #include "ops/gpu/gpu_test_utils.h"
 
@@ -18,7 +19,7 @@ TEST_F(GpuTest, RmsNormRank1MatchesCpu) {
     Tensor x = make_cpu_f32({2}, x_h);
     Tensor w = make_cpu_f32({2}, w_h);
     cpu_out = make_cpu_f32({2}, {0.f, 0.f});
-    ASSERT_TRUE(cpu_ops().rms_norm(x, w, eps, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().rms_norm(ExecContext{}, x, w, eps, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -27,7 +28,7 @@ TEST_F(GpuTest, RmsNormRank1MatchesCpu) {
     Tensor x = make_gpu_f32({2}, x_h);
     Tensor w = make_gpu_f32({2}, w_h);
     Tensor out = make_gpu_f32({2}, {0.f, 0.f});
-    ASSERT_TRUE(cuda_ops().rms_norm(x, w, eps, out).ok());
+    ASSERT_TRUE(cuda_ops().rms_norm(ExecContext{}, x, w, eps, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }
@@ -46,7 +47,7 @@ TEST_F(GpuTest, RmsNormBatchedMatchesCpu) {
     Tensor x = make_cpu_f32({2, 2}, x_h);
     Tensor w = make_cpu_f32({2}, w_h);
     cpu_out = make_cpu_f32({2, 2}, {0.f, 0.f, 0.f, 0.f});
-    ASSERT_TRUE(cpu_ops().rms_norm(x, w, eps, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().rms_norm(ExecContext{}, x, w, eps, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -55,7 +56,7 @@ TEST_F(GpuTest, RmsNormBatchedMatchesCpu) {
     Tensor x = make_gpu_f32({2, 2}, x_h);
     Tensor w = make_gpu_f32({2}, w_h);
     Tensor out = make_gpu_f32({2, 2}, {0.f, 0.f, 0.f, 0.f});
-    ASSERT_TRUE(cuda_ops().rms_norm(x, w, eps, out).ok());
+    ASSERT_TRUE(cuda_ops().rms_norm(ExecContext{}, x, w, eps, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }
@@ -73,7 +74,7 @@ TEST_F(GpuTest, RmsNormWeightScaleMatchesCpu) {
     Tensor x = make_cpu_f32({3}, x_h);
     Tensor w = make_cpu_f32({3}, w_h);
     cpu_out = make_cpu_f32({3}, {0.f, 0.f, 0.f});
-    ASSERT_TRUE(cpu_ops().rms_norm(x, w, 0.f, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().rms_norm(ExecContext{}, x, w, 0.f, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -82,7 +83,7 @@ TEST_F(GpuTest, RmsNormWeightScaleMatchesCpu) {
     Tensor x = make_gpu_f32({3}, x_h);
     Tensor w = make_gpu_f32({3}, w_h);
     Tensor out = make_gpu_f32({3}, {0.f, 0.f, 0.f});
-    ASSERT_TRUE(cuda_ops().rms_norm(x, w, 0.f, out).ok());
+    ASSERT_TRUE(cuda_ops().rms_norm(ExecContext{}, x, w, 0.f, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }

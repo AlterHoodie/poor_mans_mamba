@@ -18,9 +18,10 @@ __global__ void embedding_lookup_kernel(const float* __restrict__ table,
 } // namespace
 
 cudaError_t embedding_lookup_f32(const float* table, const int32_t* tokens, float* out, int T,
-                                 int H, int /*vocab*/, float scale, int block_size) {
+                                 int H, int /*vocab*/, float scale, cudaStream_t stream,
+                                 int block_size) {
   if (T <= 0 || H <= 0)
     return cudaErrorInvalidValue;
-  embedding_lookup_kernel<<<T, block_size>>>(table, tokens, out, T, H, scale);
+  embedding_lookup_kernel<<<T, block_size, 0, stream>>>(table, tokens, out, T, H, scale);
   return cudaGetLastError();
 }

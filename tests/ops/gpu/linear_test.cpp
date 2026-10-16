@@ -1,3 +1,4 @@
+#include "ops/exec_context.h"
 #include "ops/backend.h"
 #include "ops/gpu/gpu_test_utils.h"
 
@@ -18,7 +19,7 @@ TEST_F(GpuTest, LinearVecMatchesCpu) {
     Tensor x = make_cpu_f32({2}, x_h);
     Tensor W = make_cpu_f32({2, 2}, W_h);
     cpu_out = make_cpu_f32({2}, {0.f, 0.f});
-    ASSERT_TRUE(cpu_ops().linear(x, W, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().linear(ExecContext{}, x, W, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -27,7 +28,7 @@ TEST_F(GpuTest, LinearVecMatchesCpu) {
     Tensor x = make_gpu_f32({2}, x_h);
     Tensor W = make_gpu_f32({2, 2}, W_h);
     Tensor out = make_gpu_f32({2}, {0.f, 0.f});
-    ASSERT_TRUE(cuda_ops().linear(x, W, out).ok());
+    ASSERT_TRUE(cuda_ops().linear(ExecContext{}, x, W, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }
@@ -45,7 +46,7 @@ TEST_F(GpuTest, LinearBatchedMatchesCpu) {
     Tensor x = make_cpu_f32({2, 2}, x_h);
     Tensor W = make_cpu_f32({2, 2}, W_h);
     cpu_out = make_cpu_f32({2, 2}, {0.f, 0.f, 0.f, 0.f});
-    ASSERT_TRUE(cpu_ops().linear(x, W, cpu_out).ok());
+    ASSERT_TRUE(cpu_ops().linear(ExecContext{}, x, W, cpu_out).ok());
   }
 
   std::vector<float> gpu_h;
@@ -54,7 +55,7 @@ TEST_F(GpuTest, LinearBatchedMatchesCpu) {
     Tensor x = make_gpu_f32({2, 2}, x_h);
     Tensor W = make_gpu_f32({2, 2}, W_h);
     Tensor out = make_gpu_f32({2, 2}, {0.f, 0.f, 0.f, 0.f});
-    ASSERT_TRUE(cuda_ops().linear(x, W, out).ok());
+    ASSERT_TRUE(cuda_ops().linear(ExecContext{}, x, W, out).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     gpu_h = download_f32(out);
   }
@@ -67,5 +68,5 @@ TEST_F(GpuTest, LinearInnerDimMismatchFails) {
   Tensor x = make_gpu_f32({3}, {1.f, 2.f, 3.f});
   Tensor W = make_gpu_f32({2, 2}, {1.f, 2.f, 3.f, 4.f});
   Tensor out = make_gpu_f32({2}, {0.f, 0.f});
-  EXPECT_FALSE(cuda_ops().linear(x, W, out).ok());
+  EXPECT_FALSE(cuda_ops().linear(ExecContext{}, x, W, out).ok());
 }

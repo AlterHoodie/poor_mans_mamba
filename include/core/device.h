@@ -4,6 +4,8 @@
 
 #include <cstring>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 enum class Device { NA, GPU, CPU };
 
@@ -56,14 +58,19 @@ public:
   Status memset_zero(DeviceMemory& mem, size_t offset, size_t bytes) final;
 };
 
-class CUDAAllocator : public DeviceAllocator{
-  public:
-    explicit CUDAAllocator(int device_id) : DeviceAllocator(Device::GPU, device_id){};
+class CUDAAllocator : public DeviceAllocator {
+public:
+  explicit CUDAAllocator(int device_id) : DeviceAllocator(Device::GPU, device_id) {}
+  ~CUDAAllocator() override;
 
-    StatusOr<DeviceMemory> allocate(size_t bytes) final;
+  StatusOr<DeviceMemory> allocate(size_t bytes) final;
 
-    Status free(DeviceMemory& mem) final;
-    Status memset_zero(DeviceMemory& mem, size_t offset, size_t bytes) final;
+  Status free(DeviceMemory& mem) final;
+  Status memset_zero(DeviceMemory& mem, size_t offset, size_t bytes) final;
+
+private:
+  // Exact byte-size buckets; allocate/free recycle without cudaMalloc/cudaFree.
+  std::unordered_map<size_t, std::vector<void*>> free_lists_;
 };
 
 struct AllocatorScope {

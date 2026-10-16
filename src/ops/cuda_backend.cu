@@ -208,26 +208,28 @@ Status CUDABackend::embedding_lookup(const ExecContext& ctx, const Tensor& table
       return Status::InvalidArgument("token id out of range");
   }
 
-  int32_t* d_tokens = nullptr;
-  const size_t tok_bytes = static_cast<size_t>(T) * sizeof(int32_t);
-  cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&d_tokens), tok_bytes);
-  if (err != cudaSuccess)
-    return Status::OOM("cudaMalloc tokens for embedding_lookup failed");
+  DeviceAllocator* alloc = current_allocator();
+  if (!alloc)
+    return Status::InvalidArgument("no current allocator");
 
+  const size_t tok_bytes = static_cast<size_t>(T) * sizeof(int32_t);
+  StatusOr<DeviceMemory> tok_mem = alloc->allocate(tok_bytes);
+  if (!tok_mem.ok())
+    return Status(tok_mem.status());
+
+  auto* d_tokens = static_cast<int32_t*>(tok_mem.value().ptr);
   const cudaStream_t stream = stream_of(ctx);
-  err = cudaMemcpyAsync(d_tokens, tokens, tok_bytes, cudaMemcpyHostToDevice, stream);
+  cudaError_t err = cudaMemcpyAsync(d_tokens, tokens, tok_bytes, cudaMemcpyHostToDevice, stream);
   if (err != cudaSuccess) {
-    cudaFree(d_tokens);
     return Status::RuntimeError(std::string("cudaMemcpy H2D tokens failed: ") +
                                    cudaGetErrorString(err));
   }
 
+  // Token buffer is recycled via the allocator freelist when tok_mem leaves scope.
+  // Same-stream ops after this are ordered; the worker completion event covers the launch.
   err = embedding_lookup_f32(static_cast<const float*>(table.buffer.ptr), d_tokens,
                              static_cast<float*>(out.buffer.ptr), T, static_cast<int>(hidden),
                              static_cast<int>(vocab), scale, stream, block_size_);
-  // tokens buffer must outlive the kernel; sync this stream before free.
-  cudaStreamSynchronize(stream);
-  cudaFree(d_tokens);
   if (err != cudaSuccess)
     return Status::RuntimeError(std::string("embedding_lookup_f32 failed: ") +
                                    cudaGetErrorString(err));

@@ -28,9 +28,11 @@
 #   PERF_FREQ            sample frequency Hz               (99)
 #   PERF_MAX_SEQ         max-seq for the perf stage        (512)
 #   PERF_STAT            1 to also run perf stat (2nd pass) (0)
+#   NSYS_BG_SESSIONS     bg sessions for the nsys stage    (2)
+#   NSYS_MAX_SEQ         max-seq for the nsys stage        (2048)
 #   NCU                  ncu binary                       (ncu on PATH)
 #   NCU_MAX_SEQ          max-seq for the ncu stage         (2048)
-#   NCU_LAUNCH_COUNT     matching launches to profile/pass (8)
+#   NCU_LAUNCH_COUNT     matching launches to profile/pass (2)
 #   NCU_SECTIONS         comma-separated ncu sections
 #                        (LaunchStats,Occupancy,SpeedOfLight)
 #   NCU_TRANSPORT_REGEX  kernel regex for transport pass   (ncclDevKernel)
@@ -79,8 +81,10 @@ PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf}"
 PERF_FREQ="${PERF_FREQ:-99}"
 PERF_MAX_SEQ="${PERF_MAX_SEQ:-512}"
 PERF_STAT="${PERF_STAT:-0}"
+NSYS_BG_SESSIONS="${NSYS_BG_SESSIONS:-2}"
+NSYS_MAX_SEQ="${NSYS_MAX_SEQ:-2048}"
 NCU_MAX_SEQ="${NCU_MAX_SEQ:-2048}"
-NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-8}"
+NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-2}"
 NCU_SECTIONS="${NCU_SECTIONS:-LaunchStats,Occupancy,SpeedOfLight}"
 NCU_TRANSPORT_REGEX="${NCU_TRANSPORT_REGEX:-ncclDevKernel}"
 NCU_DECODE_REGEX="${NCU_DECODE_REGEX:-mamba2_ssm_scan}"
@@ -288,11 +292,12 @@ if have_stage nsys; then
     for v in "${VARIANT_LIST[@]}"; do
       IFS='|' read -r backend envs <<< "$(variant_spec "$v")"
       wm="$(worker_mode_for "$backend")"
-      log "nsys: $v (worker-mode $wm)"
+      log "nsys: $v (worker-mode $wm, bg=$NSYS_BG_SESSIONS, max-seq=$NSYS_MAX_SEQ)"
       mkdir -p "$OUT/nsys"
       run_with_env "$envs" nsys profile -t cuda,nvtx,osrt -o "$OUT/nsys/$v" --force-overwrite true \
         "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" --model-dirs "${MODELS%%,*}" \
-        --backends "$backend" --worker-mode "$wm" --max-seq 2048 --loads busy --bg-sessions 2 --repeats 1 \
+        --backends "$backend" --worker-mode "$wm" --max-seq "$NSYS_MAX_SEQ" --loads busy \
+        --bg-sessions "$NSYS_BG_SESSIONS" --repeats 1 \
         --warmup-runs 1 --out-dir "$OUT/nsys/run_$v" > "$OUT/nsys_$v.log" 2>&1 || log "  (failed: $v)"
     done
   else

@@ -30,6 +30,10 @@
 #   PERF_STAT            1 to also run perf stat (2nd pass) (0)
 #   NSYS_BG_SESSIONS     bg sessions for the nsys stage    (2)
 #   NSYS_MAX_SEQ         max-seq for the nsys stage        (2048)
+#   NSYS_GPU_METRICS     1 to collect SM/GPU metric rows   (1)
+#   NSYS_GPU_METRICS_DEVICES  device list for metrics      (all)
+#   NSYS_GPU_METRICS_SET metric set (empty=nsys default; ga100 on A100)
+#   NSYS_GPU_METRICS_FREQUENCY  sampling Hz                (10000)
 #   NCU                  ncu binary                       (ncu on PATH)
 #   NCU_MAX_SEQ          max-seq for the ncu stage         (2048)
 #   NCU_LAUNCH_COUNT     matching launches to profile/pass (2)
@@ -83,6 +87,10 @@ PERF_MAX_SEQ="${PERF_MAX_SEQ:-512}"
 PERF_STAT="${PERF_STAT:-0}"
 NSYS_BG_SESSIONS="${NSYS_BG_SESSIONS:-2}"
 NSYS_MAX_SEQ="${NSYS_MAX_SEQ:-2048}"
+NSYS_GPU_METRICS="${NSYS_GPU_METRICS:-1}"
+NSYS_GPU_METRICS_DEVICES="${NSYS_GPU_METRICS_DEVICES:-all}"
+NSYS_GPU_METRICS_SET="${NSYS_GPU_METRICS_SET:-}"
+NSYS_GPU_METRICS_FREQUENCY="${NSYS_GPU_METRICS_FREQUENCY:-10000}"
 NCU_MAX_SEQ="${NCU_MAX_SEQ:-2048}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-2}"
 NCU_SECTIONS="${NCU_SECTIONS:-LaunchStats,Occupancy,SpeedOfLight}"
@@ -287,14 +295,29 @@ fi
 if have_stage nsys; then
   # Needs a build with -DMAMBASERVE_WITH_NVTX=ON and nsys on PATH. Shows whether the
   # migrate overlaps decode on the same GPU and whether NCCL (SM kernels) vs
-  # UCX/NIXL (copy engines) interfere differently.
+  # UCX/NIXL (copy engines) interfere differently. With NSYS_GPU_METRICS=1 (default)
+  # also records SM Active / similar GPU metric rows for the NCCL-vs-NIXL contention
+  # question (not classical occupancy — that is the ncu stage).
   if command -v nsys >/dev/null; then
+    nsys_metric_args=()
+    if [[ "$NSYS_GPU_METRICS" == "1" && "$DEVICE" == "GPU" ]]; then
+      nsys_metric_args+=(--gpu-metrics-devices "$NSYS_GPU_METRICS_DEVICES")
+      nsys_metric_args+=(--gpu-metrics-frequency "$NSYS_GPU_METRICS_FREQUENCY")
+      if [[ -n "$NSYS_GPU_METRICS_SET" ]]; then
+        nsys_metric_args+=(--gpu-metrics-set "$NSYS_GPU_METRICS_SET")
+      fi
+      log "nsys: GPU metrics on (devices=$NSYS_GPU_METRICS_DEVICES freq=${NSYS_GPU_METRICS_FREQUENCY}Hz set=${NSYS_GPU_METRICS_SET:-auto})"
+    elif [[ "$NSYS_GPU_METRICS" == "1" ]]; then
+      log "nsys: GPU metrics requested but DEVICE=$DEVICE; skipping metrics"
+    fi
     for v in "${VARIANT_LIST[@]}"; do
       IFS='|' read -r backend envs <<< "$(variant_spec "$v")"
       wm="$(worker_mode_for "$backend")"
       log "nsys: $v (worker-mode $wm, bg=$NSYS_BG_SESSIONS, max-seq=$NSYS_MAX_SEQ)"
       mkdir -p "$OUT/nsys"
-      run_with_env "$envs" nsys profile -t cuda,nvtx,osrt -o "$OUT/nsys/$v" --force-overwrite true \
+      run_with_env "$envs" nsys profile -t cuda,nvtx,osrt \
+        "${nsys_metric_args[@]}" \
+        -o "$OUT/nsys/$v" --force-overwrite true \
         "$BIN_DIR/cluster_bench" --scenario migrate --device "$DEVICE" --model-dirs "${MODELS%%,*}" \
         --backends "$backend" --worker-mode "$wm" --max-seq "$NSYS_MAX_SEQ" --loads busy \
         --bg-sessions "$NSYS_BG_SESSIONS" --repeats 1 \

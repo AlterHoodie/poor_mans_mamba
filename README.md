@@ -1,37 +1,12 @@
 # MambaServe
 
-A small C++/CUDA **benchmark testbed** for studying hybrid Mamba serving: model execution, cache placement, state migration, and multi-GPU systems.
+A small C++/CUDA benchmark testbed for studying hybrid Mamba serving: model execution, cache placement, state migration, and multi-GPU systems.
 
-## What This Project Is
+## What This Project Is for
 
-```text
-MambaServe = minimal runtime + reproducible benchmarks + explicit policies
-```
+An exploration of how distributed systems, multi-GPU layouts, cache layouts for different models, CUDA kernels, and different transport or policy choices affect metrics like TTFT, tok/s, and transfer speed.
 
-The runtime is intentionally small. The deliverable is **data and tradeoffs**.
-
-## Central Question
-
-The project starts with a correct CPU implementation of the Mamba path, then adds hybrid layers and progressively more capable cache and transport backends. The goal is to make each systems transition measurable rather than to reproduce a production serving stack.
-
-Pure Mamba has fixed-size recurrent state: convolution state plus SSM state. Hybrid models add attention KV cache, whose size grows with context. This gives the project a useful progression from fixed-size state movement to realistic hybrid cache movement.
-
-> **How do hybrid model state, cache placement, and transport choices affect serving throughput and latency as the system moves from one CPU to multiple GPUs?**
-
-
-
-## Scope
-
-- Hybrid Mamba + attention inference, starting with a CPU reference path
-- Explicit recurrent state and attention KV cache as first-class cache data
-- CPU and GPU execution backends
-- Multi-GPU full-model replicas with static placement
-- State/cache movement experiments using NCCL, then NIXL
-- A small benchmark harness with reproducible workloads and published metrics
-
-
-
-## Architecture
+## High Level Architecture
 
 ```text
                     +------------------+
@@ -60,222 +35,285 @@ Pure Mamba has fixed-size recurrent state: convolution state plus SSM state. Hyb
                              |
                     +--------v---------+
                     |  State Transport |
-                    |      NCCL        |
+                    | NCCL/NIXL/MemCpy |
                     +------------------+
 ```
 
-Design notes for the cluster scheduler / workers / transports: [docs/cluster_runtime.md](docs/cluster_runtime.md). Implemented CommAgent backends and migration FSM: [docs/comm_and_migration.md](docs/comm_and_migration.md).
-
 ## Metrics
 
-The generate harness (`benchmarks/generate_bench.cpp`, target `benches`) reports:
+### Generate harness (`benches`)
 
-- Time to first token (TTFT)
-- Prefill throughput (tokens/sec)
-- Decode throughput (tokens/sec)
-- End-to-end throughput (tokens/sec)
-- Inter-token latency (ITL) mean / p50 / p95
+From `benchmarks/generate_bench.cpp`:
+
+1. Time to first token (TTFT)
+2. Prefill throughput (tokens/sec)
+3. Decode throughput (tokens/sec)
+4. End-to-end throughput (tokens/sec)
+5. Inter-token latency (ITL) mean / p50 / p95
 
 Sweeps prompt length `{32, 128, 512, 1024, 2048}` × generation length `{1, 16, 64, 128}` on CPU or GPU (`--device CPU|GPU`). Drive `Runner` directly so EOS cannot truncate a timed run.
 
-```text
-cmake -S . -B build-cuda -DMAMBASERVE_WITH_CUDA=ON -DBUILD_BENCHMARKS=ON
-cmake --build build-cuda --target benches
-./build-cuda/benchmarks/benches --device CPU --benchmark_counters_tabular=true
+Model outputs may not always be meaningful. System prompt templates are not implemented yet.
+
+### Migration harness (`cluster_bench`)
+
+Forced migrate of one decode session from GPU A to GPU B while both GPUs may also run background decode sessions. Reported per migrate:
+
+1. `wait_boundary` (ms): wait until the in-flight decode finishes so the slot is safe to copy
+2. `xfer` (ms): host-observed transfer time
+3. `commit_ack` (ms): recv completion through commit and source release
+4. `stall_excess` (ms): hitch beyond a normal decode step
+5. `xfer` GB/s: slot bytes over `xfer` time
+
+Slot size is set by `--max-seq`. Background load is set by `--bg-sessions`.
+
+## How to Run
+
+### 1. Download models
+
+```bash
+mkdir -p models
+huggingface-cli download tiiuae/Falcon-H1-0.5B-Base --local-dir models/falcon-h1-0.5b-base
+huggingface-cli download AntonV/mamba2-130m-hf --local-dir models/mamba2-130m-hf
 ```
 
+### 2. Build
 
+For CUDA + NCCL + NIXL (pulls UCX, Abseil, NIXL, NCCL into `deps/`, then builds the project):
 
-## Multi-GPU benchmarking and telemetry
-
-Two plain-`main()` drivers (CSV output) sit next to the google-benchmark `benches` target:
-
-- `transport_bench`: model-free CommAgent microbenchmark (MemcpyPeer / NCCL / NIXL plus a raw `cudaMemcpyPeerAsync` baseline). Size sweep, uni/bidirectional, one-time setup cost reported separately.
-- `cluster_bench`: drives `ClusterScheduler`. Scenarios `scale` (workers x sessions), `migrate` (forced migrations, idle vs busy peer GPU, state size via `--max-seq`), `rebalance` (skewed load, policy off/on).
-
-```text
-cmake -S . -B build-cuda -DMAMBASERVE_WITH_CUDA=ON -DMAMBASERVE_WITH_NCCL=ON \
-      -DMAMBASERVE_WITH_NIXL=ON -DBUILD_BENCHMARKS=ON [-DMAMBASERVE_WITH_NVTX=ON]
-cmake --build build-cuda --target transport_bench cluster_bench
-scripts/run_matrix.sh            # full matrix on a 2-GPU VM -> report.md
+```bash
+./scripts/build.sh
+source deps/env.sh
 ```
 
-`scripts/run_matrix.sh` runs per transport variant (`memcpy`, `nccl`, `nccl_nop2p`, `nixl_cudaipc`, `nixl_hoststaged`), records the NCCL/UCX path actually chosen (`paths` stage), compares `MAMBASERVE_LOG=off` vs `debug` (`logcheck` stage), and calls `scripts/analyze.py` for the report. Cluster stages use each backend's native worker mode (`thread` for memcpy, `process` for nccl/nixl). Use `STAGES=...`, `DEVICE=CPU REPEATS=1` for subsets or a no-GPU smoke test.
+Useful knobs:
 
-**Telemetry.** `MAMBASERVE_LOG=debug|info|warn|error|off` (default `warn`) controls logging. The trace recorder (`include/telemetry/recorder.h`) stamps submit, prefill, every decode, and each migrate phase per thread with no shared lock; `cluster_bench` enables it and derives TTFT, ITL, migrate wait/transfer/ack/stall, and background-session interference from it. Counters (bytes migrated, rebalance decisions, slot rejects, ...) land in `summary.csv`. NVTX ranges for Nsight Systems are compiled in with `-DMAMBASERVE_WITH_NVTX=ON`.
-
-**Reading the numbers.**
-
-- Workers are threads of one process by default (`ClusterConfig::worker_mode = WorkerMode::Thread`). `WorkerMode::Process` (`cluster_bench --worker-mode process`) runs each worker as a child process that re-execs the same binary over a Unix socket; it needs GPU with NCCL or NIXL, because MemcpyPeer passes raw pointers between workers and is thread-mode only. The host creates workers with `create_cluster_workers(cfg)` (`worker_factory.h`) and passes them to `ClusterScheduler::start(cfg, workers)`; the scheduler never spawns anything itself. Any binary that hosts process workers must call `maybe_run_worker_process(argc, argv)` first in `main()`. In process mode, `cluster_bench` syncs recorder epochs and pulls worker TraceBatches over IPC at the end of each run so TTFT/ITL/migrate phases match thread mode. NIXL runs over UCX between local GPUs (`cuda_ipc` or host staged), not network RDMA, so results are intra-node only.
-- A migrate always moves the whole slot (`slot_bytes`, set by `--max-seq`), not just the used KV prefix. State size is therefore swept with `--max-seq`.
-- The worker polls transfers on a 1 ms tick, so host-side `xfer_us` is only reliable above about 1 ms. Use `transport_bench` for fine-grained transfer latency.
-- NCCL and NIXL senders ack at post time; the receive side marks real completion.
-- Needs at least `workers + 3` hardware threads (workers, event thread, driver, migrate driver) for clean numbers.
-
-
-
-## Findings: NCCL vs NIXL migration (intra-node)
-
-Two generations of NIXL results are kept here. The first is the original sender-WRITE design with a per-transfer announce (**before**). The second is the receiver-driven design that piggybacks NIXL metadata and control on the cluster transport plane (**after**, see [After: piggybacked NIXL](#after-piggybacked-nixl-on-the-cluster-transport-plane)).
-
-### Before: sender-WRITE NIXL with per-transfer announce
-
-Setup: VM with 2x A100-SXM4-80GB (NV12 between the GPUs), falcon-h1-0.5b-base, process-per-worker for NCCL and NIXL. Early runs had zeros for NCCL/NIXL xfer because process-mode traces were not collected yet; the table below uses the later runs. In the latest of those runs `mamba2-130m-hf` failed to load, so all numbers are falcon-h1 only.
-
-
-| Scenario                                | NCCL (P2P)      | NIXL (cuda_ipc), before                              |
-| --------------------------------------- | --------------- | ---------------------------------------------------- |
-| Idle xfer, 100 MiB / 172 MiB            | 1.2 ms / 1.1 ms | 3.2 ms / 3.2 ms                                      |
-| Busy xfer, 2 background sessions        | ~18-24 ms       | ~20-25 ms                                            |
-| Busy xfer, 32 background sessions       | 24-29 ms        | ~322 ms                                              |
-| Rebalance `pinned_on` makespan          | baseline        | within 1-5% of NCCL                                  |
-| `balanced_off` makespan (no migrations) | 13.76 s         | 14.6-14.8 s (59.7 s vs 50.7 s in the 32-session run) |
-
-
-**Takeaways (before)**
-
-- **Idle xfer is not a bandwidth number.** Time is flat across 100 and 172 MiB for both backends, so it measures fixed latency plus the 1 ms poll floor. Only `nccl_nop2p` scales with size (about 14 GB/s). `transport_bench` has not been run for these results (no `paths/` or `transport/` output), and `ucx_version` is not recorded, so `cuda_ipc` use is unconfirmed.
-- **NIXL's extra ~2 ms idle is the handshake.** NCCL posts `ncclSend`/`ncclRecv` independently. NIXL does a sender WRITE, so the destination address travels recv worker -> parent (`ingress_loop_`, 1 ms idle sleep) -> src worker. The src worker must then post and poll `getXferStatus` (it flushes the WRITE and sends the notif), and the recv side polls `getNotifs`. Each hop is quantized to ~1 ms.
-- **The ~322 ms busy xfer is about one decode round.** With 32 background sessions the ITL is ~305 ms. The announce shares the worker's FIFO IPC channel with queued `Decode` commands, and `Worker::loop_` is single-threaded, so the announce waits behind them. NCCL has no such dependency. `wait_boundary` and `commit_ack` (~300 ms) are the same for every backend, so they do not separate the two.
-- **NIXL workers decode slower even with no migration.** ITL outside migration windows is 20.3 ms vs 19.0 ms for NCCL, and `pinned_off`/`balanced_off` are 5-7% slower (up to 18% under the 32-session load). Likely cause: `nixlAgentConfig cfg(true)` in `NixlCommAgent::init_backend_` turns on the agent's progress thread (NIXL's default is off, `kDefaultUseProgThread = false`, and the UCX backend then runs a shared progress thread with `pthrDelay = 0`). That thread, plus `tcp` in `UCX_TLS`, probably competes with launch-bound decode. That the thread is on is confirmed from the NIXL source; that it causes the slowdown is not yet measured. Test with `cfg(false)`.
-- **First NIXL migration is slow.** About 20-30 ms vs 3.2 ms steady state, from lazy `loadRemoteMD` and UCX wireup. NCCL does its setup at bootstrap.
-- `nixl_hoststaged` **(~0.24 GB/s) is a configuration artifact,** likely UCX falling back to TCP loopback. It is not comparable to `nccl_nop2p` (~14 GB/s over SHM).
-
-**Versus Ray's experimental NIXL transport** (`ray/experimental/rdt/nixl_tensor_transport.py`):
-
-
-|                     | MambaServe NIXL (before)                        | Ray                                                                                                     |
-| ------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Direction           | Sender WRITE + notif                            | Receiver READ (one-sided)                                                                               |
-| Address exchange    | Per-transfer announce via parent and src worker | Descriptors and agent metadata ride in object metadata over Ray's control plane                         |
-| Sender in data path | Yes (must post and poll)                        | No                                                                                                      |
-| Registration        | Whole slab once                                 | Per object (ref-counted), or an optional preregistered pool; receiver registers fresh buffers per fetch |
-| Remote agent load   | Lazy on first post                              | LRU cache, invalidated by a metadata version bump                                                       |
-| Completion polling  | 1 ms tick in the worker loop                    | `check_xfer_state` with `sleep(0.001)`                                                                  |
-
-
-Ray avoids the sender-gating problem because the receiver drives the transfer. The preregistered slab here is cheaper per transfer than Ray's per-object registration.
-
-### After: piggybacked NIXL on the cluster transport plane
-
-What changed (`src/comm/nixl_comm_agent.cpp`, `src/comm/nixl_transport_control.cpp`, `src/runtime/worker.cpp`):
-
-- The receiver drives the transfer: `NixlCommAgent::create_xfer_req_` posts a `NIXL_READ` from the source slot, and the source pointer rides in the migrate command (`cmd.src_ptr()`). The sender is no longer in the data path and there is no per-transfer announce hop through the parent.
-- Agent metadata is published once at startup over the cluster transport control plane (`publish_md` after Ready, then `peers_finalized`), instead of being exchanged per transfer.
-- `loadRemoteMD` is still lazy on the first post, so the first migration still pays a wire-up cost.
-
-Setup: same VM (2x A100-SXM4-80GB, NV12), falcon-h1-0.5b-base, process-per-worker, `UCX_TLS=self,tcp,sm,cuda_copy,cuda_ipc`, git `8ab0518`. Primary migrate numbers: n=10 per cell, 16 background sessions for busy. Rebalance numbers come from an earlier short run (n=3, 8 background sessions). The fuller matrix was cut short during rebalance, so only migrate (all variants) and `rebalance/memcpy` completed there.
-
-Migrate, 99.7 MiB slot (`--max-seq 2048`):
-
-
-| Metric                                     | NIXL cuda_ipc, before    | NIXL cuda_ipc, after    | NCCL P2P, after           |
-| ------------------------------------------ | ------------------------ | ----------------------- | ------------------------- |
-| Idle xfer, steady                          | 3.2 ms                   | 1.15 ms                 | 1.14 ms                   |
-| Idle xfer, first migration                 | ~67 ms                   | ~34 ms                  | ~6 ms                     |
-| Busy xfer                                  | ~322 ms (32 bg sessions) | ~16 ms (16 bg sessions) | ~23.5 ms (16 bg sessions) |
-| Busy `wait_boundary` / `commit_ack`        | ~322 ms / ~297 ms        | ~141 ms / ~121 ms       | ~132 ms / ~118 ms         |
-| Busy `stall_excess`                        | ~904 ms                  | ~248 ms                 | ~241 ms                   |
-| Background ITL during vs outside migration | 0.99x                    | 0.99x                   | 1.00x                     |
-| `nixl_hoststaged` idle / busy xfer         | ~395 ms / ~862 ms        | ~220 ms / ~340 ms       | n/a                       |
-
-
-Busy "before" is 32 background sessions (decode round about 305 ms) and busy "after" is 16 (decode round about 125 ms), so the busy rows are not a matched load comparison. The idle rows are matched.
-
-Migrate across state size (busy, `stall_excess`; after):
-
-
-| max_seq | slot     | NIXL cuda_ipc xfer / stall | NCCL xfer / stall | memcpy stall |
-| ------- | -------- | -------------------------- | ----------------- | ------------ |
-| 512     | 45.7 MiB | 15.7 ms / 237 ms           | 21.6 ms / 248 ms  | 312 ms       |
-| 1024    | 63.7 MiB | 15.8 ms / 240 ms           | 22.6 ms / 241 ms  | 310 ms       |
-| 2048    | 99.7 MiB | 16.1 ms / 248 ms           | 23.5 ms / 241 ms  | 308 ms       |
-
-
-Rebalance (`pinned_on` threshold 2, 16 sessions; short run):
-
-
-| Backend       | Makespan | vs `pinned_off` | Migrations | `stall_excess` median |
-| ------------- | -------- | --------------- | ---------- | --------------------- |
-| NIXL cuda_ipc | 23.08 s  | 1.53x           | 12         | 156 ms                |
-| NCCL P2P      | 22.78 s  | 1.50x           | 10         | 195 ms                |
-| memcpy        | 27.81 s  | 1.22x           | 12         | 202 ms                |
-
-
-**Takeaways (after)**
-
-- **The busy-xfer gap is gone.** Before, busy NIXL xfer (~322 ms) was about one decode round because the announce queued behind `Decode` commands. Now busy xfer is ~16 ms, far below a decode round (~125 ms), and slightly faster than NCCL (~23 ms). Idle xfer matches NCCL (~1.15 ms vs ~1.14 ms), with the ~2 ms handshake gone.
-- **Busy stall is now the same for NIXL and NCCL, and it is not the wire.** `stall_excess` is ~240-250 ms for both and flat across 46-100 MiB. About 140 ms is `wait_boundary` and ~120 ms is `commit_ack`, so xfer is ~16 ms of a ~395 ms total (about 4%). Speeding up the copy further will not move stall.
-- **Doubling the background load doubled stall, not xfer.** Going from 8 sessions (stall ~120 ms, ITL ~60 ms) to 16 (stall ~240 ms, ITL ~120 ms) scales stall with ITL for both NIXL and NCCL. Xfer stayed ~16 ms for NIXL and ~21-25 ms for NCCL, and background ITL during migration stayed at ~1.0x. This does not show NCCL being hurt more by load yet; that needs more concurrent decode or bigger models (see next steps).
-- **NIXL workers still decode a bit slower than NCCL.** ITL outside migration windows is 124-128 ms vs 118-119 ms (about 5-6%) at 16 sessions, and `balanced_off` is 21.4 s vs 20.3 s in the short run. The agent progress thread (`nixlAgentConfig cfg(true)`) is still the suspect and still unmeasured.
-- **First migration still has a wire-up cost.** Idle first xfer is ~34-40 ms for NIXL (steady ~1.2 ms), from the lazy `loadRemoteMD`. NCCL does its setup at bootstrap (first xfer ~4-6 ms).
-- **Rebalance is on par with NCCL.** NIXL `pinned_on` reaches 1.53x vs 1.50x for NCCL with a lower median per-migration stall (156 ms vs 195 ms, with 12 vs 10 migrations). Only one short run per backend, so treat the difference as noise-level.
-- `nixl_hoststaged` **is still a configuration artifact.** Xfer is better than before (idle ~395 ms to ~220 ms) but still scales with slot size (127 to 220 ms idle, 215 to 340 ms busy over 46-100 MiB) and is the only variant that slows background ITL (1.09-1.13x).
-- **nsys companion** (3 sessions, 1 timed run): steady cuda_ipc xfer ~1.1 ms vs ~20 ms NCCL, host-staged ~445 ms. Numbers include profiler overhead. What the timeline shows is in [Nsight Systems: how the bytes move](#nsight-systems-how-the-bytes-move).
-
-
-
-### Nsight Systems: how the bytes move
-
-`nsys` gives the timeline (which stream, which engine, when). `ncu` is the per-kernel tool for SM throughput and occupancy; `scripts/run_matrix.sh` has an opt-in `ncu` stage for that. Neither replaces `migrations.csv`, which is the stall accounting.
-
-Capture with `STAGES=nsys scripts/run_matrix.sh` on a build with `-DMAMBASERVE_WITH_NVTX=ON`. Reports need Nsight Systems 2026.5.1 or newer to open. App ranges (`prefill`, `decode`, `migrate_post`) only appear with NVTX on. NCCL ships its own NVTX ranges, so `ncclSend`/`ncclRecv` show up by name. NIXL does not: its NVTX trace plugin (`libtrace_backend_nvtx.so`) was not found, so there is no NIXL row to look for.
-
-Each worker has two CUDA streams in the timeline. The default stream carries decode (`mamba2_ssm_scan`, attention, GEMV, RoPE). A second stream (for example stream 14) carries only transport: the `NcclCommAgent` stream for NCCL, the peer copy for NIXL.
-
-What a ~100 MiB (104,583,168 B) slot move looks like:
-
-
-| Backend          | What to click                                      | Engine                                                     | GPU time       |
-| ---------------- | -------------------------------------------------- | ---------------------------------------------------------- | -------------- |
-| NCCL P2P         | `ncclDevKernel_SendRecv` on the GPU kernel row     | SM kernel (grid 16, block 640, ~31% theoretical occupancy) | ~16 ms         |
-| NIXL cuda_ipc    | Memory, `PtoP memcpy`, channel type `Async Memcpy` | Copy engine / DMA, ~200 GiB/s                              | ~0.5 ms        |
-| NIXL host-staged | Long host-to-device / device-to-host chain         | Host bounce (UCX without `cuda_ipc`)                       | hundreds of ms |
-
-
-Reading tips:
-
-- **NCCL posts two messages per migrate**: an 8 B `seq_len` header, then the slot. Click the one with the 104,583,168 B message size. The host `ncclSend`/`ncclRecv` ranges and the "kernel launcher" tooltip are microseconds (enqueue only); the transfer is the `ncclDevKernel_SendRecv` bar on the GPU row. Send acks at post time, so the recv side is the one that visibly waits.
-- **NIXL has no transport kernel.** The `PtoP memcpy` bar is the transfer, and every steady-state bar looks the same (same size, same duration). The first migration is slower from lazy `loadRemoteMD` and UCX wire-up.
-- **GPU time vs host** `xfer_us`**.** The ~0.5 ms `PtoP memcpy` is the wire; the ~1.1 ms steady `xfer_us` in `migrations.csv` adds the worker's 1 ms poll tick before it notices completion. Use nsys for the copy and the CSV for the end-to-end host view.
-- **Why stall still matches across backends.** Stall is roughly `wait_boundary` (the in-flight decode must finish so the slot stops changing; the CPU being idle during the kernel does not make the slot safe to copy) plus `xfer` plus `commit_ack`. `commit_ack` runs from recv completion to commit, and includes the src `Release` round trip, which queues behind `Decode` commands on the single-threaded worker loop. Both are protocol and decode-length costs shared by NCCL and NIXL, so a 0.5 ms copy vs a 16 ms kernel barely moves the total.
-- **Overlap has not been shown yet.** In the 2-background-session capture the transfer mostly sits in a gap between decode bursts, so decode and transfer do not overlap. The copy-engine vs SM contention question (NCCL `SendRecv` taking SMs from decode, NIXL not) needs a busy capture with 16-32 background sessions; see next step 6. The migrating session itself never overlaps its own decode by design.
-- **Bad paths.** `nccl_nop2p` is NCCL over shared host memory (~14 GB/s class). `nixl_hoststaged` drops `cuda_ipc` from `UCX_TLS` and falls back to a much slower host path (~0.24 GB/s), so it is a configuration artifact, not a fair NIXL number.
-- **Allocator churn.** The default `nsys stats` shows ~293k `cudaMalloc`/`cudaFree` pairs from per-op temporaries on the decode path. A scratch allocator would trim host API time and some ITL, but it does not address `wait_boundary` or `commit_ack`, so it is not the migrate-stall lever.
-
-**Planned next steps**
-
-1. ~~Receiver-driven READ~~ (done): the src pointer rides in the migrate command, the receiver posts `NIXL_READ`, and agent metadata is published over the cluster transport control plane. Busy xfer dropped from ~322 ms to ~16 ms.
-2. Run transport progress (`getXferStatus`, `getNotifs`, control messages) off the decode loop, or prioritize it over `Decode`. Lower priority now that the announce no longer queues behind `Decode`; busy stall is dominated by `wait_boundary` and `commit_ack`, which are the same for NCCL and NIXL.
-3. A/B the agent progress thread (`cfg(false)`) on `balanced_off`; NIXL decode is still ~5-6% slower than NCCL.
-4. Eagerly `loadRemoteMD` after `peers_finalized` and do one warm-up transfer, to remove the ~34-40 ms first-migration cost. NCCL pays its equivalent at `ncclCommInitRank` during bootstrap, which is why its first migrate is already warm.
-5. Run the `paths` and `transport` stages, record the UCX version, and fix the `nixl_hoststaged` `UCX_TLS`. Compare against `nccl_nop2p` (NCCL over shared host memory) as the sane no-P2P reference; host-staged is far below it only because `cuda_ipc` is missing.
-6. Stress the NCCL-vs-NIXL contention question: re-run `migrate` for `nccl` and `nixl_cudaipc` with 32-48 background sessions (and larger `--max-seq` or a bigger model). 8 to 16 sessions only scaled stall with ITL and did not separate the two backends. Capture nsys at that load too (the `nsys` stage currently hard-codes `--bg-sessions 2`): the question is whether decode bars stretch while NCCL `SendRecv` holds SMs, versus NIXL `PtoP memcpy` on the copy engine.
-7. Re-run `rebalance` to completion for all variants (the fuller matrix was cut short mid-rebalance), with more than one repeat.
-
-
-
-## Status
-
-CPU Mamba2 and Falcon-H1 runners, hybrid cache, scheduler, tokenizer, CUDA backends, and the generate latency/throughput harness are in place. Multi-GPU static placement (full-model replicas with admission-time routing) and live state migration over MemcpyPeer, NCCL, and NIXL/UCX are implemented and benchmarked on a 2x A100-SXM VM (see Findings above). NIXL migration now matches NCCL intra-node on cuda_ipc after moving to receiver-driven READ with metadata exchanged over the cluster transport plane (busy xfer ~16 ms vs ~23 ms for NCCL; the old ~322 ms busy xfer is gone). Remaining work: the ~5-6% NIXL decode slowdown, the first-migration wire-up cost, higher-contention comparisons, complete rebalance runs, and clean transport microbenchmarks.
-
-```text
-Pure Mamba CPU           ✅
-      |
-Hybrid CPU               ✅
-      |
-Hybrid GPU               ✅
-      |
-Multi-GPU static         ✅
-      |
-NCCL migration           ✅
-      |
-NIXL migration           ← current (receiver-driven READ, on par with NCCL intra-node; tuning decode overhead and warmup)
+```bash
+CMAKE_CUDA_ARCHITECTURES=80 ./scripts/build.sh   # A100. auto from nvidia-smi if unset
+SKIP_APT=1 ./scripts/build.sh                    # skip apt/pip bootstrap
+SKIP_SMOKE=1 ./scripts/build.sh                  # skip NIXL smoke at the end
+TARGETS="benches transport_bench cluster_bench" ./scripts/build.sh
 ```
 
+CPU only (no GPU deps, generate benches):
+
+```bash
+cmake -S . -B build -DBUILD_BENCHMARKS=ON
+cmake --build build --target benches
+```
+
+`scripts/build.sh` always enables CUDA, NCCL, and NIXL. Variants whose backend was not built are skipped by `scripts/run_matrix.sh`.
+
+### 3. Run generate benches
+
+```bash
+./build/benchmarks/benches --device CPU --benchmark_counters_tabular=true
+./build-cuda/benchmarks/benches --device GPU --benchmark_counters_tabular=true
+```
+
+### 4. Run migration matrix (2 GPUs)
+
+```bash
+STAGES=migrate,analyze \
+VARIANTS=memcpy,nccl,nccl_nop2p,nixl_cudaipc,nixl_hoststaged \
+MODELS=models/falcon-h1-0.5b-base \
+scripts/run_matrix.sh
+```
+
+Or call `cluster_bench` directly:
+
+```bash
+./build-cuda/benchmarks/cluster_bench \
+  --scenario migrate \
+  --model-dirs models/falcon-h1-0.5b-base \
+  --device GPU \
+  --backends nccl,nixl \
+  --worker-mode process \
+  --max-seq 2048 \
+  --loads idle,busy \
+  --bg-sessions 16 \
+  --out-dir results/migrate_smoke
+```
+
+`memcpy` uses thread workers. `nccl` and `nixl` use process workers.
+
+## Results
+
+Migration results measure the time to move one decode session from GPU A to GPU B while both GPUs also run `bg` background decode sessions. Numbers below use falcon-h1-0.5b-base on **2× A100-SXM4-80GB** (NV12), with a **~171.6 MiB** cache slot per session (`max_seq=4096`).
+
+Busy stage waterfall (ms), pinned medians from `results_12` / `results_13`:
 
 
-## Objective
+| bg  | backend         | wait_boundary | xfer    | commit_ack | stall_excess | xfer GB/s |
+| --- | --------------- | ------------- | ------- | ---------- | ------------ | --------- |
+| 4   | nccl            | 17.96         | 4.305   | 2.747      | 10.13        | 41.83     |
+| 4   | nixl_cudaipc    | 19.46         | 4.594   | 5.406      | 11.45        | 39.2      |
+| 4   | nccl_nop2p      | 17.93         | 14.358  | 1.839      | 19.63        | 12.54     |
+| 4   | nixl_hoststaged | 15.76         | 724.98  | 1.95       | 724.8        | 0.25      |
+| 16  | nccl            | 42.17         | 8.948   | 20.702     | 46.22        | 20.12     |
+| 16  | nixl_cudaipc    | 42.33         | 5.506   | 24.272     | 52.08        | 32.71     |
+| 16  | nccl_nop2p      | 42.14         | 15.014  | 18.269     | 51.03        | 11.99     |
+| 16  | nixl_hoststaged | 42.34         | 686.259 | 30.563     | 757.9        | 0.26      |
+| 32  | nccl            | 79.341        | 4.688   | 60.122     | 123.298      | 38.42     |
+| 32  | nccl_nop2p      | 79.847        | 14.598  | 55.982     | 128.402      | 12.34     |
+| 48  | nccl            | 127.28        | 14.217  | 112.768    | 229.71       | 12.67     |
+| 48  | nixl_cudaipc    | 122.88        | 5.352   | 105.501    | 203.18       | 33.65     |
+| 48  | nccl_nop2p      | 135.77        | 18.204  | 102.839    | 232.87       | 9.89      |
+| 48  | nixl_hoststaged | 134.02        | 745.883 | 114.403    | 969.37       | 0.24      |
+| 64  | nccl            | 154.68        | 18.658  | 136.059    | 289.33       | 9.65      |
+| 64  | nixl_cudaipc    | 155.1         | 5.32    | 139.389    | 282.87       | 33.85     |
+| 64  | nccl_nop2p      | 162.36        | 15.423  | 135.81     | 291.47       | 11.68     |
+| 64  | nixl_hoststaged | 162.1         | 671.333 | 149.048    | 969.25       | 0.27      |
 
-> **Build a small, instrumented hybrid Mamba serving testbed and measure how execution backends, cache placement, and state transport affect serving performance from one CPU to multiple GPUs.**
+
+Busy `nixl_cudaipc` at bg 32 was not collected.
+
+Idle xfer (ms), same slot:
+
+
+| bg  | nccl  | nixl_cudaipc | nccl_nop2p | nixl_hoststaged |
+| --- | ----- | ------------ | ---------- | --------------- |
+| 4   | 1.087 | 1.235        | 12.756     | 703.325         |
+| 16  | 1.095 | 1.199        | 9.571      | 596.43          |
+| 32  | 1.089 | —            | 9.544      | —               |
+| 48  | 1.195 | 1.135        | 12.735     | 692.405         |
+| 64  | 1.151 | 1.143        | 9.541      | 624.528         |
+
+
+## Findings
+
+### 1. Who asks for the data: NIXL sender-WRITE vs receiver-READ
+
+The early design had the sender push the slot. The destination told the parent it wanted a slot, the parent forwarded that to the source worker, and only then did the source post the copy and notify the destination. Every migrate paid for that round trip, and because the announce rode the same single threaded worker loop as `Decode` commands, it queued behind decode work under load. Busy xfer blew up to **~322 ms** at **32** bg sessions in that design.
+
+```text
+Before: sender-WRITE, destination announces first
+
++----------------+        +------------------------+        +----------------+
+|   Dst worker   |        |     Parent (relay)     |        |   Src worker   |
++----------------+        +------------------------+        +----------------+
+         |                             |                             |
+         | ready to receive                                          | waiting to hear
+         |                             |                             |   where to send to
+         |  "here is my
+         |   address, send here"
+         +----------------------------->                             |
+         |                             | already knows who
+         |                             |   this goes to
+         |                             +----------------------------->
+         |                             |                             | now knows the address
+         |                             |                             | starts copying the
+         |                             |                             |   slot over
+         |                             |                             | keeps checking until
+         |                             |                             |   the copy finishes
+         | keeps checking for a                                      | copy is done, sends a
+         |   "done" signal, sent                                     |   "done" signal straight
+         |   straight from src                                       |   to the dst worker
+         <-----------------------------------------------------------+
+         | done                                                      | done
+```
+
+The fix moved two things. First, the `ClusterScheduler` already tracks where every session's slot lives: each worker reports its `slot_ptr` back on `PrefillEvent`/`MigrateEvent`, and the scheduler stores it on the `Session` (`sess.slot_ptr`). So when a migrate starts, `begin_migrate_` sends the destination a `MigrateCmd` that already carries `src_ptr = sess.slot_ptr`. The destination never has to ask the source where the data is, the scheduler's own session metadata answers that half of the handshake before the migrate even begins. Second, each NIXL agent's address info (used to post RDMA style transfers) is published once at worker startup over the control plane (`publish_md`, then `peers_finalized`), not re-sent per transfer.
+
+```text
+After: receiver-READ, address already known
+
+                      +-------------------------------------+
+                      |          ClusterScheduler            |
+                      | Session[7].worker_idx = GPU0         | <- filled in by PrefillEvent,
+                      | Session[7].slot_ptr   = 0x7f00...    |    before any migrate starts
+                      +-------------------------------------+
+                                         |
+                 +-----------------------+-----------------------+
+                 |                                               |
+    MigrateCmd(XFER_RECV,
+      src_ptr=0x7f00...)                             MigrateCmd(XFER_SEND)
+                 |                                               |
+                 v                                               v
+       +------------------+                            +------------------+
+       |    Dst worker    |                            |    Src worker    |
+       |       GPU1       |                            |       GPU0       |
+       +------------------+                            +------------------+
+            |                                                        |
+    NIXL_READ(local=mine,                             never asked where the data is. 
+      remote=0x7f00... on GPU0)                      just waits to be told to Release
+            |                                                        |
+            v                                                        v
+      +-----------+       direct copy : Pull from src          +-----------+
+      | GPU0 VRAM |------------------------------------------->| GPU1 VRAM | 
+      +-----------+                                            +-----------+
+```
+
+With the source address already in hand, the destination posts `NIXL_READ` immediately and the source is never in the data path at all, it just waits to be told it can release the slot. Busy xfer dropped from the **~322 ms** announce path into the same **few-to-tens-of-ms** band as NCCL.
+
+### 2. NCCL's default path shares the SM cores with decode
+
+NCCL's usual GPU to GPU P2P path uses a CUDA kernel (`ncclDevKernel_SendRecv`) that runs on the SMs to coordinate communication, rather than relying entirely on a DMA engine. These are the same SMs that execute decode kernels such as `mamba2_ssm_scan`, attention, GEMV, and RoPE, so communication can compete with inference for GPU execution resources. NCCL can also use alternative mechanisms, including CUDA copy engines on supported topologies, but the P2P path measured here uses an SM resident communication kernel.
+
+```text
+GPU SM grid (A100, ~108 SMs)
+
+      idle decode                         busy decode (many bg sessions)
+  +----+----+----+----+----+----+     +----+----+----+----+----+----+
+  |    | NC |    |    |    |    |     | de | de | de | de | de | NC |
+  +----+----+----+----+----+----+     +----+----+----+----+----+----+
+  |    |    |    |    |    |    |     | de | de | de | de | de | de |
+  +----+----+----+----+----+----+     +----+----+----+----+----+----+
+   plenty of free SMs for NCCL's        SMs mostly full of decode (de);
+   SendRecv kernel (NC)                 NCCL's SendRecv kernel (NC)
+                                        has to wait its turn
+```
+
+That is why idle NCCL xfer is flat at **~1.1 ms** (mostly a fixed launch cost plus the worker's **1 ms** poll tick), but busy stall climbs steadily with background load, from **~10 ms** at bg **4** to **~289 ms** at bg **64**. The transfer kernel is not slower on the wire, it is waiting for SM occupancy the same way any other launched kernel would. `wait_boundary` (waiting for the in-flight decode step to end before the slot is safe to copy) and `commit_ack` (completion handshake) dominate the hitch far more than the few milliseconds the actual copy takes.
+
+### 3. NIXL's cuda_ipc path uses the copy engine, not the SMs
+
+`nixl_cudaipc` moves bytes with a `PtoP memcpy` on the GPU's copy engine (the DMA/copy engine), a separate piece of silicon from the SMs that CUDA kernels run on. It does not compete with decode for compute cores.
+
+```text
+GPU die (simplified)
+
+  +-----------------------------+
+  |   SM SM SM SM SM SM SM SM   |  <- decode kernels live here
+  |   SM SM SM SM SM SM SM SM   |     (mamba2_ssm_scan, attention, ...)
+  +-----------------------------+
+  |      Copy / DMA engine      |  <- NIXL cuda_ipc PtoP memcpy lives here
+  +-----------------------------+     independent queue, own hardware
+```
+
+nsys shows this directly: NCCL's `ncclDevKernel_SendRecv` holds the SMs for **~16 ms** per **~100 MiB** slot in a light-bg capture, while NIXL's `PtoP memcpy` finishes in **~0.5 ms** on the copy engine. Even so, under heavy bg load the two backends' *stall* numbers track closely (e.g. **~290 ms** NCCL vs **~283 ms** `nixl_cudaipc` at bg **64**), because stall is dominated by `wait_boundary` and `commit_ack`, protocol costs shared by both backends, not by which engine does the copy. The copy engine wins on the wire, but the wire was never the bottleneck here.
+
+### 4. NIXL cuda_ipc (NVLink) vs host-staged (D2H/H2D over TCP)
+
+`nixl_cudaipc` sets `UCX_TLS=self,tcp,sm,cuda_copy,cuda_ipc`, so UCX maps the peer GPU's memory directly and the copy engine moves bytes GPU VRAM to GPU VRAM over NVLink in one hop.
+
+`nixl_hoststaged` drops `cuda_ipc` from that list (`UCX_TLS=self,tcp,sm,cuda_copy`), so UCX has no direct GPU to GPU path left and falls back to bouncing through host memory over its TCP transport, even though both GPUs are in the same box:
+
+```text
+nixl_cudaipc: one hop, over NVLink
+
+  +---------------+                                        +---------------+
+  |   GPU0 VRAM   |-------------- NVLink P2P ------------->|   GPU1 VRAM   |
+  +---------------+                                        +---------------+
+
+
+nixl_hoststaged: four hops, bounced through host memory
+
+  +-----------+     +-----------+     +-----------+     +-----------+
+  | GPU0 VRAM |---> | Host RAM  |---> | Host RAM  |---> | GPU1 VRAM |
+  +-----------+     +-----------+     +-----------+     +-----------+
+ D2H over PCIe     pinned buffer     TCP loopback      H2D over PCIe
+                   (extra copy)      (kernel socket)   (extra copy)
+```
+
+Each extra hop adds a real cost: a PCIe device to host copy, a pass through the host network stack (even looped back locally), a host to device copy on the other side, and the pinned staging buffers in between. That is the whole gap between **~0.24–0.27 GB/s** for `nixl_hoststaged` and the **10–40 GB/s** class numbers for `nixl_cudaipc` in the table above. It is not a NIXL weakness, it is a UCX configuration that happens to drop the one transport (`cuda_ipc`) that avoids the host round trip. Treat `nixl_hoststaged` as a misconfigured baseline, not a fair NIXL number, and use `nccl_nop2p` instead as the sane no-P2P reference.
+
+## Planned next steps
+
+1. Run transport progress (`getXferStatus`, `getNotifs`, control messages) off the decode loop, or prioritize it over `Decode`. Busy stall is still dominated by `wait_boundary` and `commit_ack`.
+2. A/B the NIXL agent progress thread (`cfg(false)`) on `balanced_off`. Earlier runs saw NIXL decode ~5–6% slower than NCCL.
+3. Eagerly `loadRemoteMD` after `peers_finalized` and do one warm-up transfer to remove the ~34–40 ms first-migration cost. NCCL pays its equivalent at bootstrap.
+4. Record the UCX version and fix the `nixl_hoststaged` `UCX_TLS`. Compare against `nccl_nop2p` as the no-P2P reference.
+5. Capture or finish reading nsys at bg 32–48: whether decode bars stretch while NCCL `SendRecv` holds SMs, versus NIXL `PtoP memcpy` on the copy engine. Some `results_13/a100_nsys_bg_*` captures exist.
+6. Re-run `rebalance` to completion for all variants, with more than one repeat.
 

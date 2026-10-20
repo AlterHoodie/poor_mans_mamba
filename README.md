@@ -193,22 +193,22 @@ Before: sender-WRITE, destination announces first
 |   Dst worker   |        |     Parent (relay)     |        |   Src worker   |
 +----------------+        +------------------------+        +----------------+
          |                             |                             |
-         | ready to receive                                          | waiting to hear
+         | ready to receive            |                             | waiting to hear
          |                             |                             |   where to send to
-         |  "here is my
-         |   address, send here"
+         |  "here is my                |                             |
+         |   address, send here"       |                             |
          +----------------------------->                             |
-         |                             | already knows who
-         |                             |   this goes to
+         |                             | already knows who           |
+         |                             |   this goes to              |
          |                             +----------------------------->
          |                             |                             | now knows the address
          |                             |                             | starts copying the
          |                             |                             |   slot over
          |                             |                             | keeps checking until
          |                             |                             |   the copy finishes
-         | keeps checking for a                                      | copy is done, sends a
-         |   "done" signal, sent                                     |   "done" signal straight
-         |   straight from src                                       |   to the dst worker
+         | keeps checking for a        |                             | copy is done, sends a
+         |   "done" signal, sent       |                             |   "done" signal straight
+         |   straight from src         |                             |   to the dst worker
          <-----------------------------------------------------------+
          | done                                                      | done
 ```
@@ -292,18 +292,18 @@ nsys shows this directly: NCCL's `ncclDevKernel_SendRecv` holds the SMs for **~1
 ```text
 nixl_cudaipc: one hop, over NVLink
 
-  +---------------+                                        +---------------+
-  |   GPU0 VRAM   |-------------- NVLink P2P ------------->|   GPU1 VRAM   |
-  +---------------+                                        +---------------+
+  +---------------+                                         +---------------+
+  |   GPU0 VRAM   |-------------- NVLink P2P -------------->|   GPU1 VRAM   |
+  +---------------+                                         +---------------+
 
 
 nixl_hoststaged: four hops, bounced through host memory
 
-  +-----------+       +-----------+       +-----------+       +-----------+
-  | GPU0 VRAM |-----> | Host  RAM |-----> | Host  RAM |-----> | GPU1 VRAM |
-  +-----------+       +-----------+       +-----------+       +-----------+
- D2H over PCIe     pinned buffer     TCP loopback      H2D over PCIe
-                   (extra copy)      (kernel socket)   (extra copy)
+   +-----------+       +-----------+       +-----------+       +-----------+
+   | GPU0 VRAM |------>| Host  RAM |------>| Host  RAM |------>| GPU1 VRAM |
+   +-----------+       +-----------+       +-----------+       +-----------+
+    D2H over PCIe      pinned buffer       TCP loopback        H2D over PCIe
+                       (extra copy)        (kernel socket)     (extra copy)
 ```
 
 Each extra hop adds a real cost: a PCIe device to host copy, a pass through the host network stack (even looped back locally), a host to device copy on the other side, and the pinned staging buffers in between. That is the whole gap between **~0.24–0.27 GB/s** for `nixl_hoststaged` and the **10–40 GB/s** class numbers for `nixl_cudaipc` in the table above. It is not a NIXL weakness, it is a UCX configuration that happens to drop the one transport (`cuda_ipc`) that avoids the host round trip. Treat `nixl_hoststaged` as a misconfigured baseline, not a fair NIXL number, and use `nccl_nop2p` instead as the sane no-P2P reference.

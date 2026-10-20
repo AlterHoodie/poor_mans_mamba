@@ -219,9 +219,9 @@ The fix moved two things. First, the `ClusterScheduler` already tracks where eve
 After: receiver-READ, address already known
 
                       +-------------------------------------+
-                      |          ClusterScheduler            |
-                      | Session[7].worker_idx = GPU0         | <- filled in by PrefillEvent,
-                      | Session[7].slot_ptr   = 0x7f00...    |    before any migrate starts
+                      |          ClusterScheduler           |
+                      | Session[7].worker_idx = GPU0        | <- filled in by PrefillEvent,
+                      | Session[7].slot_ptr   = 0x7f00...   |    before any migrate starts
                       +-------------------------------------+
                                          |
                  +-----------------------+-----------------------+
@@ -253,15 +253,15 @@ NCCL's usual GPU to GPU P2P path uses a CUDA kernel (`ncclDevKernel_SendRecv`) t
 ```text
 GPU SM grid (A100, ~108 SMs)
 
-      idle decode                         busy decode (many bg sessions)
-  +----+----+----+----+----+----+     +----+----+----+----+----+----+
-  |    | NC |    |    |    |    |     | de | de | de | de | de | NC |
-  +----+----+----+----+----+----+     +----+----+----+----+----+----+
-  |    |    |    |    |    |    |     | de | de | de | de | de | de |
-  +----+----+----+----+----+----+     +----+----+----+----+----+----+
-   plenty of free SMs for NCCL's        SMs mostly full of decode (de);
-   SendRecv kernel (NC)                 NCCL's SendRecv kernel (NC)
-                                        has to wait its turn
+  idle decode                             busy decode (many bg sessions)
+  +----+----+----+----+----+----+         +----+----+----+----+----+----+
+  |    | NC |    |    |    |    |         | de | de | de | de | de | NC |
+  +----+----+----+----+----+----+         +----+----+----+----+----+----+
+  |    |    |    |    |    |    |         | de | de | de | de | de | de |
+  +----+----+----+----+----+----+         +----+----+----+----+----+----+
+  plenty of free SMs for NCCL's           SMs mostly full of decode (de);
+  SendRecv kernel (NC)                    NCCL's SendRecv kernel (NC)
+                                          has to wait its turn
 ```
 
 That is why idle NCCL xfer is flat at **~1.1 ms** (mostly a fixed launch cost plus the worker's **1 ms** poll tick), but busy stall climbs steadily with background load, from **~10 ms** at bg **4** to **~289 ms** at bg **64**. The transfer kernel is not slower on the wire, it is waiting for SM occupancy the same way any other launched kernel would. `wait_boundary` (waiting for the in-flight decode step to end before the slot is safe to copy) and `commit_ack` (completion handshake) dominate the hitch far more than the few milliseconds the actual copy takes.
@@ -299,9 +299,9 @@ nixl_cudaipc: one hop, over NVLink
 
 nixl_hoststaged: four hops, bounced through host memory
 
-  +-----------+     +-----------+     +-----------+     +-----------+
-  | GPU0 VRAM |---> | Host RAM  |---> | Host RAM  |---> | GPU1 VRAM |
-  +-----------+     +-----------+     +-----------+     +-----------+
+  +-----------+       +-----------+       +-----------+       +-----------+
+  | GPU0 VRAM |-----> | Host  RAM |-----> | Host  RAM |-----> | GPU1 VRAM |
+  +-----------+       +-----------+       +-----------+       +-----------+
  D2H over PCIe     pinned buffer     TCP loopback      H2D over PCIe
                    (extra copy)      (kernel socket)   (extra copy)
 ```
